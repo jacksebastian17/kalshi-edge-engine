@@ -94,6 +94,3 @@ minversion = "7.0"
 addopts = "-v --tb=short"
 testpaths = ["tests"]
 asyncio_mode = "auto"
-
-[tool.pytest.ini_options.pythonpath]
-pythonpath = "src"

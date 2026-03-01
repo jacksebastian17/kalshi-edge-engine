@@ -3,7 +3,7 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from api.main import app
+from kalshi_edge_engine.api.main import app
 
 
 @pytest.fixture
