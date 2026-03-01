@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^python -m mypy src tests$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
