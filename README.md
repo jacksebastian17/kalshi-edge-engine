@@ -199,23 +199,31 @@ Everything is measurable.
 
 # Configuration
 
-Environment variables:
+## Environment Variables
 
+Create a `.env` file in the project root (see `.env.example` for reference):
 
-KALSHI_API_KEY_ID
-KALSHI_PRIVATE_KEY_PATH
-KALSHI_BASE_URL
+```
+KALSHI_API_KEY_ID=your_key_id
+KALSHI_API_KEY_FILE=kalshi-key.pem
+# Optional fallback if you prefer inline secret instead of key file:
+# KALSHI_API_SECRET=-----BEGIN RSA PRIVATE KEY-----...-----END RSA PRIVATE KEY-----
+KALSHI_BASE_URL=https://api.elections.kalshi.com/trade-api/v2  # optional
+```
 
-TRADING_MODE=signals|paper|live
-AUTO_TRADING=true|false
+Get your credentials from: https://dashboard.kalshi.com/settings/api-keys
 
-MAX_ORDER_SIZE
-MAX_POSITION_SIZE
-MAX_DAILY_LOSS
-MIN_SPREAD_AFTER_FEES
-MIN_TOP_LIQUIDITY
-MIN_MINUTES_TO_EXPIRY
+Place `kalshi-key.pem` in the project root (it is gitignored).
 
+Optional trading configuration:
+
+```
+TRADING_MODE=signals          # signals, paper, or live
+AUTO_TRADING=false            # Always start with false
+MIN_SPREAD_AFTER_FEES=0.01
+MIN_TOP_LIQUIDITY=0
+MIN_MINUTES_TO_EXPIRY=1
+```
 
 ---
 
@@ -223,53 +231,134 @@ MIN_MINUTES_TO_EXPIRY
 
 ## Clone repo
 
-
+```bash
 git clone https://github.com/jacksebastian17/kalshi-edge-engine.git
-
 cd kalshi-edge-engine
-
+```
 
 ## Create virtual environment
 
+**Windows:**
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+```
 
+**macOS/Linux:**
+```bash
 python -m venv .venv
 source .venv/bin/activate
-
+```
 
 ## Install dependencies
 
-
+```bash
 pip install -e ".[dev]"
+```
 
+## Set up environment
 
-## Run API
+```bash
+# macOS/Linux
+cp .env.example .env
 
+# Windows PowerShell
+Copy-Item .env.example .env
+```
 
-uvicorn kalshi_edge_engine.api.main:app --reload
+Edit `.env` with your Kalshi API credentials.
 
+## Run API server
 
-Health check:
+```bash
+python -m uvicorn kalshi_edge_engine.api.main:app --reload
+```
 
+Server runs on `http://localhost:8000`
+
+## API Documentation
+
+Visit http://localhost:8000/docs for interactive Swagger documentation
+
+---
+
+# Using the API
+
+## Health Check
+
+```bash
 curl http://localhost:8000/health
+```
 
+Response:
+```json
+{
+  "status": "ok"
+}
+```
 
-Version:
+## Fetch Orderbook (Debug Endpoint)
 
-curl http://localhost:8000/version
+**Endpoint:** `GET /debug/orderbook/{ticker}`
 
+Fetches live orderbook data from Kalshi. Useful for debugging and development.
 
-## Run tests
+**Example:**
 
+```bash
+curl "http://localhost:8000/debug/orderbook/KXNBAGAME-26MAR01SASNYK-SAS"
+```
 
+**Response:**
+```json
+{
+  "ticker": "KXNBAGAME-26MAR01SASNYK-SAS",
+  "orderbook": {
+    "market_ticker": "KXNBAGAME-26MAR01SASNYK-SAS",
+    "yes": [
+      [96, 250],
+      [95, 50]
+    ],
+    "no": [
+      [5, 100],
+      [4, 75]
+    ]
+  },
+  "latency_ms": 125.5,
+  "success": true
+}
+```
+
+**Requirements:**
+- Valid `KALSHI_API_KEY_ID` and either `KALSHI_API_KEY_FILE` or `KALSHI_API_SECRET` in `.env`
+- Ticker must be a valid Kalshi market ticker (not event ticker), e.g. `KXNBAGAME-26MAR01SASNYK-SAS`
+
+**Error Responses:**
+
+- `400`: Invalid ticker (empty or whitespace)
+- `502`: API authentication error or upstream API failure
+
+---
+
+# Running Tests
+
+## Unit Tests
+
+```bash
 pytest -v
+```
 
+All tests use mocked Kalshi API calls — no real API keys required.
 
-## Lint + Type Check
+## Lint & Type Check
 
+```bash
+# Format and lint
+python -m ruff check src tests --fix
 
-ruff format .
-ruff check .
-mypy src
+# Type checking
+python -m mypy src tests
+```
 
 ---
 

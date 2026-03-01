@@ -3,6 +3,30 @@
         "/^python -m mypy src tests$/": {
             "approve": true,
             "matchCommandLine": true
+        },
+        "/^python -m ruff check src tests --fix$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^python -m pytest tests/ -v --tb=short$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^python -m pytest tests/ -v ; python -m ruff check src tests ; python -m mypy src tests$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^uvicorn kalshi_edge_engine\\.api\\.main:app --reload$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^pip show kalshi-edge-engine$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^python -c \"import httpx; import asyncio; r = asyncio\\.run\\(httpx\\.AsyncClient\\(\\)\\.get\\('http://localhost:8000/openapi\\.json'\\)\\); import json; data = r\\.json\\(\\); print\\(json\\.dumps\\(list\\(data\\['paths'\\]\\.keys\\(\\)\\), indent=2\\)\\)\"$/": {
+            "approve": true,
+            "matchCommandLine": true
         }
     }
 }
