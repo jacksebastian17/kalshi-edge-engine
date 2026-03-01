@@ -29,13 +29,18 @@ class TestKalshiClientInit:
 
     def test_init_with_env_vars(self) -> None:
         """Test initialization reads from environment variables."""
-        with patch.dict(
-            os.environ,
-            {
-                "KALSHI_API_KEY_ID": "test_key_id",
-                "KALSHI_API_SECRET": MOCK_PEM_KEY.decode("utf-8"),
-            },
-        ), patch("kalshi_edge_engine.kalshi.client.serialization.load_pem_private_key") as mock_load:
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "KALSHI_API_KEY_ID": "test_key_id",
+                    "KALSHI_API_SECRET": MOCK_PEM_KEY.decode("utf-8"),
+                },
+            ),
+            patch(
+                "kalshi_edge_engine.kalshi.client.serialization.load_pem_private_key"
+            ) as mock_load,
+        ):
             mock_load.return_value = MagicMock()  # Mock private key object
             client = KalshiClient()
             assert client.api_key_id == "test_key_id"
@@ -43,14 +48,19 @@ class TestKalshiClientInit:
 
     def test_init_with_env_base_url(self) -> None:
         """Test initialization reads base URL from environment."""
-        with patch.dict(
-            os.environ,
-            {
-                "KALSHI_API_KEY_ID": "test_key_id",
-                "KALSHI_API_SECRET": MOCK_PEM_KEY.decode("utf-8"),
-                "KALSHI_BASE_URL": "https://test.example.com",
-            },
-        ), patch("kalshi_edge_engine.kalshi.client.serialization.load_pem_private_key") as mock_load:
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "KALSHI_API_KEY_ID": "test_key_id",
+                    "KALSHI_API_SECRET": MOCK_PEM_KEY.decode("utf-8"),
+                    "KALSHI_BASE_URL": "https://test.example.com",
+                },
+            ),
+            patch(
+                "kalshi_edge_engine.kalshi.client.serialization.load_pem_private_key"
+            ) as mock_load,
+        ):
             mock_private_key = MagicMock()
             mock_private_key.sign.return_value = b"mock_signature"
             mock_load.return_value = mock_private_key
@@ -59,7 +69,9 @@ class TestKalshiClientInit:
 
     def test_init_with_explicit_params(self) -> None:
         """Test initialization with explicit parameters."""
-        with patch("kalshi_edge_engine.kalshi.client.serialization.load_pem_private_key") as mock_load:
+        with patch(
+            "kalshi_edge_engine.kalshi.client.serialization.load_pem_private_key"
+        ) as mock_load:
             mock_private_key = MagicMock()
             mock_private_key.sign.return_value = b"mock_signature"
             mock_load.return_value = mock_private_key
@@ -81,13 +93,18 @@ class TestKalshiClientInit:
 
     def test_init_default_base_url(self) -> None:
         """Test initialization uses default base URL."""
-        with patch.dict(
-            os.environ,
-            {
-                "KALSHI_API_KEY_ID": "test_key_id",
-                "KALSHI_API_SECRET": MOCK_PEM_KEY.decode("utf-8"),
-            },
-        ), patch("kalshi_edge_engine.kalshi.client.serialization.load_pem_private_key") as mock_load:
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "KALSHI_API_KEY_ID": "test_key_id",
+                    "KALSHI_API_SECRET": MOCK_PEM_KEY.decode("utf-8"),
+                },
+            ),
+            patch(
+                "kalshi_edge_engine.kalshi.client.serialization.load_pem_private_key"
+            ) as mock_load,
+        ):
             mock_private_key = MagicMock()
             mock_private_key.sign.return_value = b"mock_signature"
             mock_load.return_value = mock_private_key
@@ -101,13 +118,18 @@ class TestKalshiClientGetOrderbook:
     @pytest.mark.asyncio
     async def test_get_orderbook_success(self) -> None:
         """Test successful orderbook fetch."""
-        with patch.dict(
-            os.environ,
-            {
-                "KALSHI_API_KEY_ID": "test_key_id",
-                "KALSHI_API_SECRET": MOCK_PEM_KEY.decode("utf-8"),
-            },
-        ), patch("kalshi_edge_engine.kalshi.client.serialization.load_pem_private_key") as mock_load_key:
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "KALSHI_API_KEY_ID": "test_key_id",
+                    "KALSHI_API_SECRET": MOCK_PEM_KEY.decode("utf-8"),
+                },
+            ),
+            patch(
+                "kalshi_edge_engine.kalshi.client.serialization.load_pem_private_key"
+            ) as mock_load_key,
+        ):
             mock_private_key = MagicMock()
             mock_private_key.sign.return_value = b"mock_signature"
             mock_load_key.return_value = mock_private_key
@@ -150,13 +172,18 @@ class TestKalshiClientGetOrderbook:
     @pytest.mark.asyncio
     async def test_get_orderbook_invalid_ticker_type(self) -> None:
         """Test that invalid ticker type raises ValueError."""
-        with patch.dict(
-            os.environ,
-            {
-                "KALSHI_API_KEY_ID": "test_key_id",
-                "KALSHI_API_SECRET": MOCK_PEM_KEY.decode("utf-8"),
-            },
-        ), patch("kalshi_edge_engine.kalshi.client.serialization.load_pem_private_key") as mock_load:
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "KALSHI_API_KEY_ID": "test_key_id",
+                    "KALSHI_API_SECRET": MOCK_PEM_KEY.decode("utf-8"),
+                },
+            ),
+            patch(
+                "kalshi_edge_engine.kalshi.client.serialization.load_pem_private_key"
+            ) as mock_load,
+        ):
             mock_private_key = MagicMock()
             mock_private_key.sign.return_value = b"mock_signature"
             mock_load.return_value = mock_private_key
@@ -171,13 +198,18 @@ class TestKalshiClientGetOrderbook:
         """Test handling of HTTP status errors."""
         import httpx
 
-        with patch.dict(
-            os.environ,
-            {
-                "KALSHI_API_KEY_ID": "test_key_id",
-                "KALSHI_API_SECRET": MOCK_PEM_KEY.decode("utf-8"),
-            },
-        ), patch("kalshi_edge_engine.kalshi.client.serialization.load_pem_private_key") as mock_load:
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "KALSHI_API_KEY_ID": "test_key_id",
+                    "KALSHI_API_SECRET": MOCK_PEM_KEY.decode("utf-8"),
+                },
+            ),
+            patch(
+                "kalshi_edge_engine.kalshi.client.serialization.load_pem_private_key"
+            ) as mock_load,
+        ):
             mock_private_key = MagicMock()
             mock_private_key.sign.return_value = b"mock_signature"
             mock_load.return_value = mock_private_key
@@ -212,13 +244,18 @@ class TestKalshiClientGetOrderbook:
         """Test handling of network request errors."""
         import httpx
 
-        with patch.dict(
-            os.environ,
-            {
-                "KALSHI_API_KEY_ID": "test_key_id",
-                "KALSHI_API_SECRET": MOCK_PEM_KEY.decode("utf-8"),
-            },
-        ), patch("kalshi_edge_engine.kalshi.client.serialization.load_pem_private_key") as mock_load:
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "KALSHI_API_KEY_ID": "test_key_id",
+                    "KALSHI_API_SECRET": MOCK_PEM_KEY.decode("utf-8"),
+                },
+            ),
+            patch(
+                "kalshi_edge_engine.kalshi.client.serialization.load_pem_private_key"
+            ) as mock_load,
+        ):
             mock_private_key = MagicMock()
             mock_private_key.sign.return_value = b"mock_signature"
             mock_load.return_value = mock_private_key
@@ -226,9 +263,7 @@ class TestKalshiClientGetOrderbook:
 
             with patch("kalshi_edge_engine.kalshi.client.httpx.AsyncClient") as mock_client_class:
                 mock_client = AsyncMock()
-                mock_client.get = AsyncMock(
-                    side_effect=httpx.ConnectError("Connection failed")
-                )
+                mock_client.get = AsyncMock(side_effect=httpx.ConnectError("Connection failed"))
                 mock_client.__aenter__ = AsyncMock(return_value=mock_client)
                 mock_client.__aexit__ = AsyncMock(return_value=None)
 

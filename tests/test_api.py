@@ -52,15 +52,16 @@ class TestDebugOrderbookEndpoint:
             "ask_size": 150,
         }
 
-        with patch.dict(
-            os.environ,
-            {
-                "KALSHI_API_KEY_ID": "test_key_id",
-                "KALSHI_API_SECRET": "test_secret",
-            },
-        ), patch(
-            "kalshi_edge_engine.api.main.KalshiClient"
-        ) as mock_client_class:
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "KALSHI_API_KEY_ID": "test_key_id",
+                    "KALSHI_API_SECRET": "test_secret",
+                },
+            ),
+            patch("kalshi_edge_engine.api.main.KalshiClient") as mock_client_class,
+        ):
             mock_client = AsyncMock()
             mock_client.get_orderbook = AsyncMock(return_value=mock_orderbook)
             mock_client_class.return_value = mock_client
@@ -79,15 +80,16 @@ class TestDebugOrderbookEndpoint:
         """Test that ticker is converted to uppercase."""
         mock_orderbook = {"bid": 0.48, "ask": 0.51}
 
-        with patch.dict(
-            os.environ,
-            {
-                "KALSHI_API_KEY_ID": "test_key_id",
-                "KALSHI_API_SECRET": "test_secret",
-            },
-        ), patch(
-            "kalshi_edge_engine.api.main.KalshiClient"
-        ) as mock_client_class:
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "KALSHI_API_KEY_ID": "test_key_id",
+                    "KALSHI_API_SECRET": "test_secret",
+                },
+            ),
+            patch("kalshi_edge_engine.api.main.KalshiClient") as mock_client_class,
+        ):
             mock_client = AsyncMock()
             mock_client.get_orderbook = AsyncMock(return_value=mock_orderbook)
             mock_client_class.return_value = mock_client
@@ -102,12 +104,11 @@ class TestDebugOrderbookEndpoint:
 
     def test_debug_orderbook_auth_error(self, client: TestClient) -> None:
         """Test handling of authentication errors."""
-        with patch.dict(os.environ, {}, clear=True), patch(
-            "kalshi_edge_engine.api.main.KalshiClient"
-        ) as mock_client_class:
-            mock_client_class.side_effect = KalshiAuthError(
-                "Missing credentials"
-            )
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("kalshi_edge_engine.api.main.KalshiClient") as mock_client_class,
+        ):
+            mock_client_class.side_effect = KalshiAuthError("Missing credentials")
 
             response = client.get("/debug/orderbook/TRUMP-ELECTION")
 
@@ -116,15 +117,16 @@ class TestDebugOrderbookEndpoint:
 
     def test_debug_orderbook_api_error(self, client: TestClient) -> None:
         """Test handling of API errors."""
-        with patch.dict(
-            os.environ,
-            {
-                "KALSHI_API_KEY_ID": "test_key_id",
-                "KALSHI_API_SECRET": "test_secret",
-            },
-        ), patch(
-            "kalshi_edge_engine.api.main.KalshiClient"
-        ) as mock_client_class:
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "KALSHI_API_KEY_ID": "test_key_id",
+                    "KALSHI_API_SECRET": "test_secret",
+                },
+            ),
+            patch("kalshi_edge_engine.api.main.KalshiClient") as mock_client_class,
+        ):
             mock_client = AsyncMock()
             mock_client.get_orderbook = AsyncMock(
                 side_effect=KalshiAPIError("API error: 404 Not Found")

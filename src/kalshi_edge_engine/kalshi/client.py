@@ -69,9 +69,7 @@ class KalshiClient:
         api_key_id_value = api_key_id or os.getenv("KALSHI_API_KEY_ID")
         key_file_path = api_key_file or os.getenv("KALSHI_API_KEY_FILE")
         api_secret_str = api_secret or os.getenv("KALSHI_API_SECRET")
-        base_url_value = base_url or os.getenv(
-            "KALSHI_BASE_URL", self.DEFAULT_BASE_URL
-        )
+        base_url_value = base_url or os.getenv("KALSHI_BASE_URL", self.DEFAULT_BASE_URL)
 
         if not api_key_id_value:
             raise KalshiAuthError(
@@ -113,9 +111,7 @@ class KalshiClient:
                     "Set KALSHI_API_KEY_FILE or KALSHI_API_SECRET environment variable."
                 )
         except Exception as e:
-            raise KalshiAuthError(
-                f"Failed to load RSA private key: {e}"
-            ) from e
+            raise KalshiAuthError(f"Failed to load RSA private key: {e}") from e
 
     def _sign_request(self, timestamp_ms: int, method: str, path: str) -> str:
         """Create RSA-PSS signature for request authentication.
@@ -195,9 +191,7 @@ class KalshiClient:
                     "error": str(e),
                 },
             )
-            raise KalshiAPIError(
-                f"API error for {ticker}: {e.response.status_code}"
-            ) from e
+            raise KalshiAPIError(f"API error for {ticker}: {e.response.status_code}") from e
         except httpx.RequestError as e:
             logger.error(
                 "orderbook_fetch_request_error",
