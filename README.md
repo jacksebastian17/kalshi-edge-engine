@@ -174,14 +174,17 @@ For every signal:
 
 - Timestamp
 - Market ticker
-- Best bid
-- Best ask
-- Spread
+- Best bid (YES and NO)
+- Spread (YES and NO inside widths)
+- Cross prices (computed from opposite side)
+- **Structural metrics:**
+  - Bid sum (best YES bid + best NO bid)
+  - Imbalance gap (100 - bid sum)
 - Fee estimate
-- Net edge
-- Liquidity at top
-- Time to expiration
+- Net edge (YES and NO)
+- Liquidity at top of book
 - Decision reason code
+- All gating stage outcomes (structure, liquidity, spread, edge)
 
 If auto mode is enabled:
 
@@ -282,6 +285,146 @@ Visit http://localhost:8000/docs for interactive Swagger documentation
 
 ---
 
+# Signal Scoring Mechanics
+
+## Structural Metrics
+
+The signal engine uses **structural metrics** to distinguish real opportunities from equilibrium noise (e.g., tight 1-tick symmetric markets).
+
+### Bid Sum
+
+**Definition:**
+```
+bid_sum = best_yes_bid + best_no_bid
+```
+
+**Interpretation:**
+At perfect market equilibrium, if YES and NO contracts each represent 50¢ of value, their sum should equal ~100¢ (the total payout space). 
+
+**Example:**
+- If YES bid = 65¢ and NO bid = 30¢, then `bid_sum = 95¢`
+- The market is slightly YES-biased (imbalanced)
+
+### Imbalance Gap
+
+**Definition:**
+```
+imbalance_gap = 100 - bid_sum
+```
+
+**Interpretation:**
+Measures structural inefficiency. A larger imbalance gap suggests the market is pricing YES or NO unfairly relative to the other, often creating opportunities for resting orders to fill at better prices.
+
+**Example:**
+- If `bid_sum = 95¢`, then `imbalance_gap = 5¢`
+- If `bid_sum = 98¢`, then `imbalance_gap = 2¢` 
+- If `bid_sum = 100¢`, then `imbalance_gap = 0¢` (perfectly balanced—high equilibrium, low opportunity)
+
+**Why it matters:**
+A tight 1-tick symmetric market (YES bid=50, cross=51 on both sides) has:
+- `inside_width_yes = 1.0`, `inside_width_no = 1.0`
+- `bid_sum = 100`, `imbalance_gap = 0`
+- Old logic would accept this as SIGNAL_VALID (mistake)
+- New logic rejects because `imbalance_gap < 1.5¢` threshold (correct)
+
+---
+
+## Reason Code Decision Tree
+
+The signal engine uses a **5-stage eligibility cascade** to emit reason codes:
+
+### Stage A: Structural Validity
+```
+IF best_yes_bid is missing
+   OR best_no_bid is missing
+   OR bid_sum > 100
+   → MARKET_INELIGIBLE
+```
+
+**Why:** Missing bids mean we cannot compute cross prices. `bid_sum > 100` indicates crossed/distorted market structure.
+
+### Stage B: Liquidity Gate
+```
+IF top_liquidity < min_liquidity (default: 10 contracts)
+   → LOW_LIQUIDITY
+```
+
+**Why:** Small book size may not allow for meaningful order fills.
+
+### Stage C/D: Spread & Imbalance Gate
+```
+IF (both inside_width_yes <= 1.0 tick AND inside_width_no <= 1.0 tick)
+   OR (imbalance_gap < 1.5¢)
+   → SPREAD_TOO_SMALL
+```
+
+**Why:** 
+- Symmetric 1-tick spreads are equilibrium noise (reject)
+- Large structural imbalance (gap >= 1.5¢) indicates a real opportunity
+- If either condition fails, no trading opportunity
+
+### Stage E: Edge Gate
+```
+IF at_least_one_side has (net_edge >= min_edge, default 0.1¢)
+   → SIGNAL_VALID
+ELSE
+   → SPREAD_TOO_SMALL
+```
+
+**Why:** After costs and safety buffer, only truly profitable edges are marked valid.
+
+---
+
+## Mathematical Walkthrough: Why Imbalance Gating Works
+
+### Scenario 1: Artificially Tight Market (False Positive Without Gate)
+
+```
+Market State:
+  YES bid: 50.0, cross: 51.0 (inside width = 1.0)
+  NO bid:  50.0, cross: 51.0 (inside width = 1.0)
+  bid_sum: 100.0, imbalance_gap: 0.0
+
+Stage A: ✓ Both bids present, bid_sum = 100 (not crossed)
+Stage B: ✓ Liquidity sufficient
+Stage C: ✗ FAIL
+  Condition 1: Both widths = 1.0 tick (meets tight criteria) ✓
+  Condition 2: imbalance_gap (0.0) < 1.5¢ ✓ Both failed
+  Result: SPREAD_TOO_SMALL ← CORRECT REJECTION
+
+Interpretation:
+This is pure equilibrium. There is no real inefficiency—just natural
+market-making spread at a fair price. The 1-tick reflects normal
+trading friction on a balanced position.
+```
+
+### Scenario 2: Real Opportunity (True Positive)
+
+```
+Market State:
+  YES bid: 48.0, cross: 51.0 (inside width = 3.0)
+  NO bid:  49.0, cross: 52.0 (inside width = 3.0)
+  bid_sum: 97.0, imbalance_gap: 3.0¢
+  top_liquidity: 200 contracts
+
+Stage A: ✓ Both bids present, bid_sum < 100 (not crossed)
+Stage B: ✓ Liquidity (200) >= min (10)
+Stage C: ✓ PASS
+  Condition 1: Both widths > 1.0 tick ✓
+  Condition 2: imbalance_gap (3.0) >= 1.5 ✓ Both passed
+Stage E: ✓ PASS
+  net_edge_yes = 3.0 - 0.5 (fees) - 0.1 (safety) = 2.4¢ >= 0.1¢ ✓
+  net_edge_no = 3.0 - 0.5 - 0.1 = 2.4¢ >= 0.1¢ ✓
+  Result: SIGNAL_VALID ← CORRECT ACCEPTANCE
+
+Interpretation:
+The market is imbalanced (YES side favored) with real room between
+bids and crosses. This is an exploitable inefficiency. Both sides
+have measurable edge after costs.
+```
+
+---
+
 # Using the API
 
 ## Health Check
@@ -301,11 +444,19 @@ Response:
 
 **Endpoint:** `GET /debug/orderbook/{ticker}`
 
+## Run Dashboard Locally
 Fetches live orderbook data from Kalshi. Useful for debugging and development.
 
 **Example:**
-
 ```bash
+cd web
+npm install
+npm run dev
+```
+
+Dashboard runs on `http://localhost:5173`
+```bash
+Backend automatically allows CORS requests from localhost:5173 in development.
 curl "http://localhost:8000/debug/orderbook/KXNBAGAME-26MAR01SASNYK-SAS"
 ```
 
@@ -372,6 +523,8 @@ curl "http://localhost:8000/signals/live?ticker=KXNBAGAME-26MAR01SASNYK-SAS"
   "cross_yes": 85.0,
   "bid_no": 15.0,
   "cross_no": 20.0,
+  "bid_sum": 95.0,
+  "imbalance_gap": 5.0,
   "top_liquidity": 250,
   "timestamp_ms": 1735689123000
 }
@@ -390,6 +543,8 @@ curl "http://localhost:8000/signals/live?ticker=KXNBAGAME-26MAR01SASNYK-SAS"
   "cross_yes": 50.0,
   "bid_no": 50.0,
   "cross_no": 50.0,
+  "bid_sum": 100.0,
+  "imbalance_gap": 0.0,
   "top_liquidity": 100,
   "timestamp_ms": 1735689123000
 }
@@ -397,11 +552,31 @@ curl "http://localhost:8000/signals/live?ticker=KXNBAGAME-26MAR01SASNYK-SAS"
 
 **Reason Codes:**
 
-- `SIGNAL_VALID`: At least one side has `net_edge >= min_edge` (default: 0.1¢) — room to make money
-- `SPREAD_TOO_SMALL`: Inside width exists but `net_edge < min_edge` — not enough room after fees
-- `LOW_LIQUIDITY`: Best bid size < `min_liquidity` (default: 10 contracts) — can't fill size
-- `MARKET_INELIGIBLE`: Missing best bids or one side unavailable — cannot compute cross
-- `DATA_STALE`: Orderbook data older than threshold (future use)
+Emitted by the 5-stage decision cascade:
+
+- `SIGNAL_VALID`: Market passed all gates (Stage A–E)
+  - Best bids present, `bid_sum <= 100`, liquidity sufficient
+  - Both sides have `inside_width > 1.0` tick AND `imbalance_gap >= 1.5¢` 
+  - At least one side has `net_edge >= min_edge` (default: 0.1¢)
+  - **Interpretation:** Real exploitable inefficiency with edge after costs
+
+- `SPREAD_TOO_SMALL`: Market failed the spread/imbalance gate (Stage C)
+  - Either both sides have `inside_width <= 1.0` tick
+  - OR `imbalance_gap < 1.5¢` (insufficient structural imbalance)
+  - OR passed spread gate but both sides have `net_edge < min_edge`
+  - **Interpretation:** No measurable opportunity after costs; likely equilibrium noise
+
+- `LOW_LIQUIDITY`: Market failed the liquidity gate (Stage B)
+  - `top_liquidity < min_liquidity` (default: 10 contracts)
+  - **Interpretation:** Book too thin; order fill uncertain
+
+- `MARKET_INELIGIBLE`: Market failed structural validity (Stage A)
+  - Either best YES bid or best NO bid is missing
+  - OR `bid_sum > 100` (crossed/distorted structure)
+  - **Interpretation:** Cannot compute cross prices; market data invalid
+
+- `DATA_STALE`: Orderbook data exceeds age threshold (future use)
+  - **Interpretation:** Signal too old to act on; data freshness issue
 
 **Query Parameters (optional):**
 - `fee_estimate`: Estimated round-trip fees in cents (default: 0.5)
@@ -417,6 +592,121 @@ curl "http://localhost:8000/signals/live?ticker=KXNBAGAME-26MAR01SASNYK-SAS"
 
 - `400`: Invalid ticker (empty or whitespace)
 - `502`: API authentication error or upstream API failure
+
+---
+
+## Scan Multiple Tickers
+
+**Endpoint:** `GET /signals/scan?tickers=...`
+
+Scans multiple markets in parallel and returns sorted signal opportunities. Useful for screening portfolios or finding best opportunities across a watchlist.
+
+**Key Features:**
+- Scans up to 20 tickers per request
+- Automatic deduplication and normalization
+- Per-ticker best-effort error handling (skips failed tickers, continues with others)
+- Results sorted by strongest edge descending (best opportunity first)
+
+**Example:**
+
+```bash
+curl "http://localhost:8000/signals/scan?tickers=TICKER-A,TICKER-B,TICKER-C"
+```
+
+Query string supports:
+- Comma-separated tickers
+- Whitespace around commas (stripped)
+- Duplicate tickers (deduplicated)
+- Mixed case (normalized to uppercase)
+
+**Response:**
+```json
+[
+  {
+    "ticker": "TICKER-B",
+    "reason_code": "SIGNAL_VALID",
+    "net_edge_yes": 2.3,
+    "net_edge_no": null,
+    "inside_width_yes": 2.8,
+    "inside_width_no": null,
+    "bid_yes": 48.0,
+    "cross_yes": 50.8,
+    "bid_no": null,
+    "cross_no": null,
+    "bid_sum": null,
+    "imbalance_gap": null,
+    "top_liquidity": 150,
+    "timestamp_ms": 1735689200000
+  },
+  {
+    "ticker": "TICKER-A",
+    "reason_code": "SIGNAL_VALID",
+    "net_edge_yes": 1.1,
+    "net_edge_no": 1.1,
+    "inside_width_yes": 1.6,
+    "inside_width_no": 1.6,
+    "bid_yes": 52.0,
+    "cross_yes": 53.6,
+    "bid_no": 48.0,
+    "cross_no": 48.0,
+    "bid_sum": 100.0,
+    "imbalance_gap": 0.0,
+    "top_liquidity": 125,
+    "timestamp_ms": 1735689200000
+  },
+  {
+    "ticker": "TICKER-C",
+    "reason_code": "SPREAD_TOO_SMALL",
+    "net_edge_yes": -0.1,
+    "net_edge_no": -0.1,
+    "inside_width_yes": 0.4,
+    "inside_width_no": 0.4,
+    "bid_yes": 50.0,
+    "cross_yes": 50.4,
+    "bid_no": 50.0,
+    "cross_no": 50.4,
+    "bid_sum": 100.0,
+    "imbalance_gap": 0.0,
+    "top_liquidity": 100,
+    "timestamp_ms": 1735689200000
+  }
+]
+```
+
+**Sorting Behavior:**
+- Computes `max_edge = max(net_edge_yes, net_edge_no)` for each signal
+- Ranks by `max_edge` descending (highest edge first)
+- Treats `null` edges as negative infinity in comparison
+- SIGNAL_VALID candidates naturally rank higher than SPREAD_TOO_SMALL
+
+**Query Parameters (optional):**
+
+All same parameters as `/signals/live`:
+- `fee_estimate`: Estimated round-trip fees in cents (default: 0.5)
+- `min_edge`: Minimum net edge in cents (default: 0.1)
+- `min_liquidity`: Minimum contracts at best bid (default: 10)
+- `safety_buffer`: Safety margin in cents (default: 0.1)
+- `imbalance_threshold`: Minimum structural imbalance gap in cents (default: 1.5)
+
+**Error Handling:**
+
+- `400`: No valid tickers provided OR more than 20 tickers requested
+- `400`: Ticker string is empty or contains only whitespace
+- `502`: Authentication error (hard fail—entire request fails)
+- `502`: All tickers' API calls failed (no results available)
+- **Partial failures:** If 1–N of M tickers fail, those failures are logged and skipped; request still succeeds with results from successful tickers
+
+**Example with partial failure:**
+```bash
+curl "http://localhost:8000/signals/scan?tickers=TICKER-A,INVALID-TICKER,TICKER-B"
+```
+
+If `INVALID-TICKER` fails API call, response includes only `[TICKER-A result, TICKER-B result]` (INVALID-TICKER skipped, logged as "scan_ticker_failed"). Request returns 200, not 502.
+
+**Requirements:**
+- Valid Kalshi API credentials in `.env`
+- At least one valid market ticker
+- Maximum 20 distinct tickers per request
 
 ---
 
@@ -458,19 +748,28 @@ We measure. We do not guess.
 # Roadmap
 
 ## PR #1
-Project foundation + minimal API + CI
+Project foundation + minimal API + CI ✅
 
 ## PR #2
-Database models + snapshot persistence
+Structural imbalance metrics + tightened signal validity ✅
+- Added `bid_sum` and `imbalance_gap` fields to Signal
+- Implemented 1.5¢ imbalance threshold gate
+- Updated reason code cascade to 5-stage eligibility pipeline
+- Rejected artificial 1-tick equilibrium as SPREAD_TOO_SMALL
 
 ## PR #3
-Orderbook poller + daemon loop
+Multi-ticker scan endpoint + safeguards ✅
+- `/signals/scan` with up to 20 tickers per request
+- Automatic deduplication and normalization
+- Per-ticker best-effort error handling
+- Sorted by strongest edge descending
+- Comprehensive test coverage
 
 ## PR #4
-Spread-capture signal engine
+Database models + snapshot persistence
 
 ## PR #5
-API routes for live signals
+Orderbook poller + daemon loop
 
 ## PR #6
 Paper simulator + PnL tracking

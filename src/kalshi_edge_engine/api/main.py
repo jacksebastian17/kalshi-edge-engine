@@ -6,6 +6,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from kalshi_edge_engine.engine.signal import Signal, score_signal
@@ -29,6 +30,17 @@ app = FastAPI(
     title="Kalshi Edge Engine",
     description="Real-time signal generation and dashboard backend",
     version="0.1.0",
+)
+
+# Enable CORS for local development dashboard
+# Allow local Vite dev server origins and GET methods only
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
+    allow_credentials=False,
+    allow_methods=["GET"],
+    allow_headers=["*"],
 )
 
 
