@@ -338,6 +338,86 @@ curl "http://localhost:8000/debug/orderbook/KXNBAGAME-26MAR01SASNYK-SAS"
 - `400`: Invalid ticker (empty or whitespace)
 - `502`: API authentication error or upstream API failure
 
+## Get Live Signal
+
+**Endpoint:** `GET /signals/live?ticker=...`
+
+Fetches orderbook data and scores it using inside-width market-making opportunity detection. Returns reason code and edge estimates.
+
+**Key Concepts:**
+
+- **Best Bid**: Highest price in YES/NO ladder (price people willing to buy at)
+- **Cross Price**: `100 - opposite_side_best_bid` (price you'd immediately pay to sell)
+- **Inside Width**: `cross - bid` (room available to quote between bid and cross)
+- **Net Edge**: `inside_width - fee_estimate - safety_buffer` (profit after costs)
+
+Kalshi markets DO NOT have explicit ask prices. We compute implied "cross" prices from opposite-side best bids.
+
+**Example:**
+
+```bash
+curl "http://localhost:8000/signals/live?ticker=KXNBAGAME-26MAR01SASNYK-SAS"
+```
+
+**Response (SIGNAL_VALID):**
+```json
+{
+  "ticker": "KXNBAGAME-26MAR01SASNYK-SAS",
+  "reason_code": "SIGNAL_VALID",
+  "net_edge_yes": 4.4,
+  "net_edge_no": 4.4,
+  "inside_width_yes": 5.0,
+  "inside_width_no": 5.0,
+  "bid_yes": 80.0,
+  "cross_yes": 85.0,
+  "bid_no": 15.0,
+  "cross_no": 20.0,
+  "top_liquidity": 250,
+  "timestamp_ms": 1735689123000
+}
+```
+
+**Response (SPREAD_TOO_SMALL):**
+```json
+{
+  "ticker": "KXNBAGAME-26MAR01SASNYK-SAS",
+  "reason_code": "SPREAD_TOO_SMALL",
+  "net_edge_yes": -0.5,
+  "net_edge_no": -0.5,
+  "inside_width_yes": 0.0,
+  "inside_width_no": 0.0,
+  "bid_yes": 50.0,
+  "cross_yes": 50.0,
+  "bid_no": 50.0,
+  "cross_no": 50.0,
+  "top_liquidity": 100,
+  "timestamp_ms": 1735689123000
+}
+```
+
+**Reason Codes:**
+
+- `SIGNAL_VALID`: At least one side has `net_edge >= min_edge` (default: 0.1¢) — room to make money
+- `SPREAD_TOO_SMALL`: Inside width exists but `net_edge < min_edge` — not enough room after fees
+- `LOW_LIQUIDITY`: Best bid size < `min_liquidity` (default: 10 contracts) — can't fill size
+- `MARKET_INELIGIBLE`: Missing best bids or one side unavailable — cannot compute cross
+- `DATA_STALE`: Orderbook data older than threshold (future use)
+
+**Query Parameters (optional):**
+- `fee_estimate`: Estimated round-trip fees in cents (default: 0.5)
+- `min_edge`: Minimum net edge in cents to consider signal valid (default: 0.1)
+- `min_liquidity`: Minimum contracts at best bid level (default: 10)
+- `safety_buffer`: Safety margin below inside width (cents) (default: 0.1)
+
+**Requirements:**
+- Valid Kalshi API credentials in `.env`
+- Ticker must be a valid market ticker, e.g. `KXNBAGAME-26MAR01SASNYK-SAS`
+
+**Error Responses:**
+
+- `400`: Invalid ticker (empty or whitespace)
+- `502`: API authentication error or upstream API failure
+
 ---
 
 # Running Tests
