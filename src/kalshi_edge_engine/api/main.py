@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from kalshi_edge_engine.engine.signal import score_signal
+from kalshi_edge_engine.engine.signal import Signal, score_signal
 from kalshi_edge_engine.kalshi.client import (
     KalshiAPIError,
     KalshiAuthError,
@@ -58,8 +58,45 @@ class SignalResponse(BaseModel):
     cross_yes: float | None
     bid_no: float | None
     cross_no: float | None
+    bid_sum: float | None
+    imbalance_gap: float | None
     top_liquidity: int
     timestamp_ms: int
+
+
+def _signal_to_response(signal: Signal) -> dict[str, Any]:
+    """Convert Signal dataclass to API response payload."""
+    return {
+        "ticker": signal.ticker,
+        "reason_code": signal.reason_code,
+        "net_edge_yes": signal.net_edge_yes,
+        "net_edge_no": signal.net_edge_no,
+        "inside_width_yes": signal.inside_width_yes,
+        "inside_width_no": signal.inside_width_no,
+        "bid_yes": signal.bid_yes,
+        "cross_yes": signal.cross_yes,
+        "bid_no": signal.bid_no,
+        "cross_no": signal.cross_no,
+        "bid_sum": signal.bid_sum,
+        "imbalance_gap": signal.imbalance_gap,
+        "top_liquidity": signal.top_liquidity,
+        "timestamp_ms": signal.timestamp_ms,
+    }
+
+
+def _parse_tickers(tickers: str) -> list[str]:
+    """Parse, normalize, filter-empty, and deduplicate a CSV ticker list."""
+    parsed: list[str] = []
+    seen: set[str] = set()
+
+    for raw_ticker in tickers.split(","):
+        normalized = raw_ticker.strip().upper()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        parsed.append(normalized)
+
+    return parsed
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -211,20 +248,7 @@ async def get_live_signal(ticker: str) -> dict[str, Any]:
             },
         )
 
-        return {
-            "ticker": signal.ticker,
-            "reason_code": signal.reason_code,
-            "net_edge_yes": signal.net_edge_yes,
-            "net_edge_no": signal.net_edge_no,
-            "inside_width_yes": signal.inside_width_yes,
-            "inside_width_no": signal.inside_width_no,
-            "bid_yes": signal.bid_yes,
-            "cross_yes": signal.cross_yes,
-            "bid_no": signal.bid_no,
-            "cross_no": signal.cross_no,
-            "top_liquidity": signal.top_liquidity,
-            "timestamp_ms": signal.timestamp_ms,
-        }
+        return _signal_to_response(signal)
 
     except KalshiAuthError as e:
         logger.error(
@@ -260,6 +284,90 @@ async def get_live_signal(ticker: str) -> dict[str, Any]:
             "signal_unexpected_error",
             extra={
                 "ticker": ticker,
+                "error": str(e),
+                "latency_ms": latency_ms,
+            },
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Internal server error",
+        ) from e
+
+
+@app.get("/signals/scan", response_model=list[SignalResponse])
+async def scan_live_signals(tickers: str) -> list[dict[str, Any]]:
+    """Scan multiple tickers and return sorted signal opportunities."""
+    parsed_tickers = _parse_tickers(tickers)
+    if not parsed_tickers:
+        logger.warning("scan_invalid_tickers", extra={"tickers": tickers})
+        raise HTTPException(status_code=400, detail="At least one valid ticker is required")
+    if len(parsed_tickers) > 20:
+        logger.warning("scan_too_many_tickers", extra={"count": len(parsed_tickers)})
+        raise HTTPException(status_code=400, detail="Maximum 20 tickers per request")
+
+    start_time = time.time()
+
+    try:
+        client = KalshiClient()
+        scored_signals: list[Signal] = []
+        for ticker in parsed_tickers:
+            try:
+                orderbook = await client.get_orderbook(ticker)
+                scored_signals.append(score_signal(ticker, orderbook))
+            except KalshiAPIError as e:
+                logger.warning(
+                    "scan_ticker_failed",
+                    extra={
+                        "ticker": ticker,
+                        "error": str(e),
+                    },
+                )
+                continue
+
+        if not scored_signals:
+            raise HTTPException(status_code=502, detail="Upstream API error")
+
+        scored_signals.sort(
+            key=lambda signal: max(
+                signal.net_edge_yes if signal.net_edge_yes is not None else float("-inf"),
+                signal.net_edge_no if signal.net_edge_no is not None else float("-inf"),
+            ),
+            reverse=True,
+        )
+
+        latency_ms = (time.time() - start_time) * 1000
+        logger.info(
+            "scan_computed",
+            extra={
+                "ticker_count": len(parsed_tickers),
+                "latency_ms": latency_ms,
+            },
+        )
+
+        return [_signal_to_response(signal) for signal in scored_signals]
+
+    except KalshiAuthError as e:
+        logger.error(
+            "scan_auth_error",
+            extra={
+                "ticker_count": len(parsed_tickers),
+                "error": str(e),
+            },
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"Auth error: {str(e)}",
+        ) from e
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        latency_ms = (time.time() - start_time) * 1000
+        logger.exception(
+            "scan_unexpected_error",
+            extra={
+                "ticker_count": len(parsed_tickers),
                 "error": str(e),
                 "latency_ms": latency_ms,
             },

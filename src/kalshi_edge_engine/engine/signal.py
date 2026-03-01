@@ -40,6 +40,8 @@ class Signal:
     cross_yes: float | None  # Cross price for YES (100 - best_no_bid)
     bid_no: float | None  # Best NO bid
     cross_no: float | None  # Cross price for NO (100 - best_yes_bid)
+    bid_sum: float | None  # Structural sum of best bids (best_yes_bid + best_no_bid)
+    imbalance_gap: float | None  # Structural gap from par (100 - bid_sum)
     top_liquidity: int  # Size at best bid level (contracts)
     timestamp_ms: int  # When signal was computed
 
@@ -51,18 +53,22 @@ def score_signal(
     min_edge: float = 0.1,  # Minimum net edge (cents) to consider valid
     min_liquidity: int = 10,  # Minimum contracts at best level
     safety_buffer: float = 0.1,  # Safety margin below inside width (cents)
+    imbalance_threshold: float = 1.5,  # Minimum structural imbalance gap (cents)
 ) -> Signal:
     """Score an orderbook snapshot and emit a structured signal with reason code.
 
-    Strategy:
-    1. Parse orderbook to extract best bids and cross prices for YES and NO
-    2. Calculate inside width on each side (cross - bid)
-    3. Compute net edge (inside_width - fee_estimate - safety_buffer)
-    4. Check eligibility:
-       - If both best bids missing: MARKET_INELIGIBLE
-       - If top-of-book liquidity < threshold: LOW_LIQUIDITY
-       - If both inside widths None/invalid: SPREAD_TOO_SMALL (or MARKET_INELIGIBLE)
-       - If any net_edge >= min_edge: SIGNAL_VALID else SPREAD_TOO_SMALL
+     Strategy:
+     1. Parse orderbook to extract best bids and cross prices for YES and NO
+     2. Calculate inside width on each side (cross - bid)
+     3. Compute structural metrics: bid_sum and imbalance_gap
+     4. Compute net edge (inside_width - fee_estimate - safety_buffer)
+     5. Check eligibility:
+         - If either best bid missing: MARKET_INELIGIBLE
+         - If bid_sum > 100: MARKET_INELIGIBLE (crossed/distorted)
+         - If top-of-book liquidity < threshold: LOW_LIQUIDITY
+         - If both inside widths <= 1 tick: SPREAD_TOO_SMALL
+         - If imbalance_gap < imbalance_threshold: SPREAD_TOO_SMALL
+         - If any net_edge >= min_edge: SIGNAL_VALID else SPREAD_TOO_SMALL
 
     Args:
         ticker: Market ticker symbol.
@@ -71,6 +77,7 @@ def score_signal(
         min_edge: Minimum net edge to consider signal valid (cents). Default 0.1¢.
         min_liquidity: Minimum contracts at best bid level. Default 10.
         safety_buffer: Safety margin to subtract from inside width (cents). Default 0.1¢.
+        imbalance_threshold: Minimum structural imbalance gap in cents. Default 1.5¢.
 
     Returns:
         Signal with reason_code and computed edges.
@@ -97,31 +104,44 @@ def score_signal(
     # Default: no edge
     net_edge_yes: float | None = None
     net_edge_no: float | None = None
+    bid_sum: float | None = None
+    imbalance_gap: float | None = None
     reason_code = MARKET_INELIGIBLE
+    one_tick = 1.0
 
-    # Check for missing best bids (invalid market)
-    if bid_yes is None and bid_no is None:
+    # A) If either best bid missing, market is ineligible
+    if bid_yes is None or bid_no is None:
         reason_code = MARKET_INELIGIBLE
-    # Check liquidity
+    else:
+        bid_sum = bid_yes + bid_no
+        imbalance_gap = 100.0 - bid_sum
+
+    # Missing structural metrics or crossed structure is ineligible
+    if bid_sum is None or bid_sum > 100.0:
+        reason_code = MARKET_INELIGIBLE
+    # B) Check liquidity
     elif top_liquidity < min_liquidity:
         reason_code = LOW_LIQUIDITY
-    # Check if any inside width exists and is positive
-    elif inside_width_yes is None and inside_width_no is None:
-        reason_code = SPREAD_TOO_SMALL
     else:
-        # We have at least one usable inside width
         # Calculate net edges where inside widths exist
         if inside_width_yes is not None:
             net_edge_yes = inside_width_yes - fee_estimate - safety_buffer
         if inside_width_no is not None:
             net_edge_no = inside_width_no - fee_estimate - safety_buffer
 
-        # Determine signal validity
-        # Signal is valid if at least one side has net edge >= min_edge
-        valid_yes = net_edge_yes is not None and net_edge_yes >= min_edge
-        valid_no = net_edge_no is not None and net_edge_no >= min_edge
+        usable_width_yes = inside_width_yes is not None and inside_width_yes > one_tick
+        usable_width_no = inside_width_no is not None and inside_width_no > one_tick
 
-        reason_code = SIGNAL_VALID if valid_yes or valid_no else SPREAD_TOO_SMALL
+        # C/D) Require >1-tick width and structural imbalance threshold
+        if (not usable_width_yes and not usable_width_no) or (
+            imbalance_gap is None or imbalance_gap < imbalance_threshold
+        ):
+            reason_code = SPREAD_TOO_SMALL
+        else:
+            # E) Signal valid only when both structural and edge criteria are met
+            valid_yes = net_edge_yes is not None and net_edge_yes >= min_edge
+            valid_no = net_edge_no is not None and net_edge_no >= min_edge
+            reason_code = SIGNAL_VALID if valid_yes or valid_no else SPREAD_TOO_SMALL
 
     return Signal(
         ticker=ticker,
@@ -134,6 +154,8 @@ def score_signal(
         cross_yes=cross_yes,
         bid_no=bid_no,
         cross_no=cross_no,
+        bid_sum=bid_sum,
+        imbalance_gap=imbalance_gap,
         top_liquidity=top_liquidity,
         timestamp_ms=now_ms,
     )

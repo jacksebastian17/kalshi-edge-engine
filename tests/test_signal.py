@@ -160,19 +160,20 @@ class TestSignalScoring(unittest.TestCase):
         """Test that safety buffer is applied to net edge calculation."""
         orderbook = {
             "yes": [[80, 250]],
-            "no": [[19, 250]],
+            "no": [[18, 250]],
         }
-        # inside_width_yes = 100-19-80 = 1.0
-        # net_edge before buffer = 1.0 - 0.5 = 0.5
-        # net_edge with buffer = 1.0 - 0.5 - 0.2 = 0.3 >= 0.1 ✓
+        # inside_width_yes = 100-18-80 = 2.0
+        # net_edge before buffer = 2.0 - 0.5 = 1.5
+        # net_edge with buffer = 2.0 - 0.5 - 0.2 = 1.3 >= 0.1 ✓
+        # imbalance_gap = 100 - (80 + 18) = 2.0 >= 1.5 ✓
 
         signal = score_signal(
             "TEST-TICKER", orderbook, fee_estimate=0.5, min_edge=0.1, safety_buffer=0.2
         )
 
         assert signal.reason_code == SIGNAL_VALID
-        assert signal.inside_width_yes == 1.0
-        assert signal.net_edge_yes == 0.3
+        assert signal.inside_width_yes == 2.0
+        assert signal.net_edge_yes == 1.3
 
     def test_signal_spread_too_small(self) -> None:
         """Test signal where inside width is too narrow."""
@@ -219,8 +220,8 @@ class TestSignalScoring(unittest.TestCase):
 
         signal = score_signal("TEST-TICKER", orderbook, fee_estimate=0.5)
 
-        # Without NO side, can't compute cross_yes, so no inside width available
-        assert signal.reason_code == SPREAD_TOO_SMALL  # No valid widths to trade
+        # Without NO side, market is structurally ineligible
+        assert signal.reason_code == MARKET_INELIGIBLE
         assert signal.bid_yes == 80.0
         assert signal.cross_yes is None
         assert signal.bid_no is None
@@ -231,12 +232,56 @@ class TestSignalScoring(unittest.TestCase):
             "yes": [[60, 500]],
             "no": [[50, 500]],
         }
-        # bid_yes=60, cross_yes=100-50=50, inside_width_yes=negative (invalid)
-        # bid_no=50, cross_no=100-60=40, inside_width_no=negative (invalid)
+        # bid_sum=110 > 100 is crossed/distorted and therefore ineligible
 
         signal = score_signal("TEST-TICKER", orderbook, fee_estimate=0.5, min_edge=0.1)
 
-        assert signal.reason_code == SPREAD_TOO_SMALL  # No valid inside widths
+        assert signal.reason_code == MARKET_INELIGIBLE
+
+    def test_signal_symmetric_one_tick_not_valid(self) -> None:
+        """Symmetric 1-tick structure should be treated as SPREAD_TOO_SMALL."""
+        orderbook = {
+            "yes": [[50, 250]],
+            "no": [[49, 250]],
+        }
+        # bid_sum=99, imbalance_gap=1.0, inside_width=1.0 (one tick)
+
+        signal = score_signal("TEST-TICKER", orderbook)
+
+        assert signal.reason_code == SPREAD_TOO_SMALL
+        assert signal.bid_sum == 99.0
+        assert signal.imbalance_gap == 1.0
+        assert signal.inside_width_yes == 1.0
+        assert signal.inside_width_no == 1.0
+
+    def test_signal_widened_distorted_book_valid(self) -> None:
+        """Wider structurally imbalanced book should be valid when edge is sufficient."""
+        orderbook = {
+            "yes": [[70, 300]],
+            "no": [[27, 300]],
+        }
+        # bid_sum=97, imbalance_gap=3.0, inside_width=3.0, net_edge=2.4
+
+        signal = score_signal("TEST-TICKER", orderbook)
+
+        assert signal.reason_code == SIGNAL_VALID
+        assert signal.bid_sum == 97.0
+        assert signal.imbalance_gap == 3.0
+        assert signal.net_edge_yes == 2.4
+        assert signal.net_edge_no == 2.4
+
+    def test_signal_crossed_book_ineligible(self) -> None:
+        """Crossed structure with bid_sum > 100 should be ineligible."""
+        orderbook = {
+            "yes": [[60, 400]],
+            "no": [[41, 400]],
+        }
+
+        signal = score_signal("TEST-TICKER", orderbook)
+
+        assert signal.reason_code == MARKET_INELIGIBLE
+        assert signal.bid_sum == 101.0
+        assert signal.imbalance_gap == -1.0
 
     def test_signal_reason_codes_valid_set(self) -> None:
         """Test that all emitted reason codes are in valid set."""

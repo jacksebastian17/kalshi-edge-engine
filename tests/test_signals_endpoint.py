@@ -128,6 +128,8 @@ class TestSignalsLiveEndpoint(unittest.TestCase):
             "cross_yes",
             "bid_no",
             "cross_no",
+            "bid_sum",
+            "imbalance_gap",
             "top_liquidity",
             "timestamp_ms",
         ]
@@ -148,3 +150,40 @@ class TestSignalsLiveEndpoint(unittest.TestCase):
         assert data["reason_code"] == "MARKET_INELIGIBLE"
         assert data["bid_yes"] is None
         assert data["bid_no"] is None
+
+    @patch("kalshi_edge_engine.api.main.KalshiClient")
+    def test_signals_scan_sorts_and_dedupes(self, mock_client_class: MagicMock) -> None:
+        """Test scan endpoint sorts by strongest edge and deduplicates tickers."""
+        mock_client = AsyncMock()
+        mock_client_class.return_value = mock_client
+
+        books: dict[str, dict[str, list[list[int]]]] = {
+            "AAA": {"yes": [[70, 100]], "no": [[27, 100]]},  # strongest net edge
+            "BBB": {"yes": [[80, 100]], "no": [[18, 100]]},  # medium net edge
+            "CCC": {"yes": [[50, 100]], "no": [[49, 100]]},  # spread too small
+        }
+
+        async def get_orderbook_for_ticker(ticker: str) -> dict[str, list[list[int]]]:
+            return books[ticker]
+
+        mock_client.get_orderbook.side_effect = get_orderbook_for_ticker
+
+        response = self.client.get("/signals/scan?tickers=ccc,,bbb,AAA,bbb")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 3
+        assert [item["ticker"] for item in data] == ["AAA", "BBB", "CCC"]
+        assert data[0]["reason_code"] == "SIGNAL_VALID"
+        assert data[1]["reason_code"] == "SIGNAL_VALID"
+        assert data[2]["reason_code"] == "SPREAD_TOO_SMALL"
+        assert mock_client.get_orderbook.call_count == 3
+
+    def test_signals_scan_exceeds_max_tickers(self) -> None:
+        """Test scan endpoint rejects requests above 20 deduped tickers."""
+        tickers = ",".join([f"TICKER{i}" for i in range(21)])
+
+        response = self.client.get(f"/signals/scan?tickers={tickers}")
+
+        assert response.status_code == 400
+        assert "Maximum 20 tickers per request" in response.json()["detail"]
