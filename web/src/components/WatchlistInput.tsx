@@ -1,7 +1,7 @@
-import { useState } from 'react'
-
 interface WatchlistInputProps {
-  onScan: (tickers: string[]) => void
+  watchlist: string
+  onWatchlistChange: (watchlist: string) => void
+  onScan: (tickers: string[], watchlist: string) => void
   isLoading: boolean
   pollInterval: number
   onPollIntervalChange: (interval: number) => void
@@ -10,6 +10,8 @@ interface WatchlistInputProps {
 }
 
 export function WatchlistInput({
+  watchlist,
+  onWatchlistChange,
   onScan,
   isLoading,
   pollInterval,
@@ -17,8 +19,6 @@ export function WatchlistInput({
   isPaused,
   onPausedChange,
 }: WatchlistInputProps) {
-  const [watchlist, setWatchlist] = useState('')
-
   const handleScan = () => {
     const tickers = watchlist
       .split(',')
@@ -26,7 +26,7 @@ export function WatchlistInput({
       .filter((t) => t.length > 0)
 
     if (tickers.length > 0) {
-      onScan(tickers)
+      onScan(tickers, watchlist)
     }
   }
 
@@ -44,7 +44,7 @@ export function WatchlistInput({
         </label>
         <textarea
           value={watchlist}
-          onChange={(e) => setWatchlist(e.target.value)}
+          onChange={(e) => onWatchlistChange(e.target.value)}
           onKeyDown={handleKeyDown}
           placeholder="WEATHER_IV_FALL, SENATE_BILL_123, METR_TEMP_JAN"
           className="w-full bg-zinc-900 border border-white/10 rounded px-4 py-2 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:border-white/20 focus:ring-1 focus:ring-white/20"

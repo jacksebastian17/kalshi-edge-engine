@@ -147,16 +147,8 @@ def score_signal(
                 net_edge_no = inside_width_no - fee_estimate - safety_buffer
 
             # Signal valid if any eligible side meets edge threshold
-            valid_yes = (
-                eligible_yes
-                and net_edge_yes is not None
-                and net_edge_yes >= min_edge
-            )
-            valid_no = (
-                eligible_no
-                and net_edge_no is not None
-                and net_edge_no >= min_edge
-            )
+            valid_yes = eligible_yes and net_edge_yes is not None and net_edge_yes >= min_edge
+            valid_no = eligible_no and net_edge_no is not None and net_edge_no >= min_edge
             reason_code = SIGNAL_VALID if (valid_yes or valid_no) else SPREAD_TOO_SMALL
 
     return Signal(

@@ -3,6 +3,7 @@ import { SignalResponse } from '../lib/api'
 interface SignalsTableProps {
   signals: SignalResponse[]
   isLoading: boolean
+  lastUpdated: number | null
   onRowClick: (signal: SignalResponse) => void
 }
 
@@ -51,6 +52,7 @@ function formatLiquidity(value: number): string {
 export function SignalsTable({
   signals,
   isLoading,
+  lastUpdated,
   onRowClick,
 }: SignalsTableProps) {
   return (
@@ -59,6 +61,17 @@ export function SignalsTable({
         <div className="border-b border-white/10 px-6 py-2 bg-zinc-900/60">
           <span className="text-xs text-zinc-400 animate-pulse">
             Loading signals...
+          </span>
+        </div>
+      )}
+
+      {lastUpdated && (
+        <div className="border-b border-white/10 px-6 py-2 bg-zinc-900/60">
+          <span className="text-xs text-zinc-400">
+            Last updated:{' '}
+            <span className="text-zinc-300 tabular-nums">
+              {new Date(lastUpdated).toLocaleTimeString()}
+            </span>
           </span>
         </div>
       )}
