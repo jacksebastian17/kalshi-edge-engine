@@ -272,3 +272,184 @@ class TestKalshiClientGetOrderbook:
                 with pytest.raises(KalshiAPIError) as excinfo:
                     await client.get_orderbook("TRUMP-ELECTION")
                 assert "Request failed" in str(excinfo.value)
+
+
+class TestKalshiClientPersistence:
+    """Test persistent httpx.AsyncClient handling."""
+
+    @pytest.mark.asyncio
+    async def test_client_async_context_manager(self) -> None:
+        """Test that KalshiClient works as async context manager."""
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "KALSHI_API_KEY_ID": "test_key_id",
+                    "KALSHI_API_SECRET": MOCK_PEM_KEY.decode("utf-8"),
+                },
+            ),
+            patch(
+                "kalshi_edge_engine.kalshi.client.serialization.load_pem_private_key"
+            ) as mock_load,
+            patch("kalshi_edge_engine.kalshi.client.httpx.AsyncClient") as mock_client_class,
+        ):
+            mock_private_key = MagicMock()
+            mock_private_key.sign.return_value = b"mock_signature"
+            mock_load.return_value = mock_private_key
+
+            mock_http_client = AsyncMock()
+            mock_http_client.aclose = AsyncMock()
+            mock_client_class.return_value = mock_http_client
+
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.json.return_value = {"test": "data"}
+            mock_response.raise_for_status.return_value = None
+            mock_http_client.get = AsyncMock(return_value=mock_response)
+
+            async with KalshiClient() as client:
+                assert client is not None
+                # Use the client to trigger lazy initialization
+                await client.get_orderbook("TEST")
+
+            # After exiting context, aclose should have been called
+            mock_http_client.aclose.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_client_aclose_method(self) -> None:
+        """Test manual aclose() method."""
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "KALSHI_API_KEY_ID": "test_key_id",
+                    "KALSHI_API_SECRET": MOCK_PEM_KEY.decode("utf-8"),
+                },
+            ),
+            patch(
+                "kalshi_edge_engine.kalshi.client.serialization.load_pem_private_key"
+            ) as mock_load,
+            patch("kalshi_edge_engine.kalshi.client.httpx.AsyncClient") as mock_client_class,
+        ):
+            mock_private_key = MagicMock()
+            mock_private_key.sign.return_value = b"mock_signature"
+            mock_load.return_value = mock_private_key
+
+            mock_http_client = AsyncMock()
+            mock_http_client.aclose = AsyncMock()
+            mock_client_class.return_value = mock_http_client
+
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.json.return_value = {"test": "data"}
+            mock_response.raise_for_status.return_value = None
+            mock_http_client.get = AsyncMock(return_value=mock_response)
+
+            client = KalshiClient()
+
+            # Use client to initialize http client
+            await client.get_orderbook("TEST")
+            assert client._client is not None
+
+            # Manually close
+            await client.aclose()
+            mock_http_client.aclose.assert_called_once()
+
+            # Subsequent calls to aclose() should be safe
+            await client.aclose()
+            mock_http_client.aclose.assert_called_once()  # Still only called once
+
+    @pytest.mark.asyncio
+    async def test_client_reuses_http_client(self) -> None:
+        """Test that KalshiClient reuses the same httpx.AsyncClient across calls."""
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "KALSHI_API_KEY_ID": "test_key_id",
+                    "KALSHI_API_SECRET": MOCK_PEM_KEY.decode("utf-8"),
+                },
+            ),
+            patch(
+                "kalshi_edge_engine.kalshi.client.serialization.load_pem_private_key"
+            ) as mock_load,
+            patch("kalshi_edge_engine.kalshi.client.httpx.AsyncClient") as mock_client_class,
+        ):
+            mock_private_key = MagicMock()
+            mock_private_key.sign.return_value = b"mock_signature"
+            mock_load.return_value = mock_private_key
+
+            # Track how many times AsyncClient is instantiated
+            mock_http_client = AsyncMock()
+            mock_client_class.return_value = mock_http_client
+
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.json.return_value = {"test": "data"}
+            mock_response.raise_for_status.return_value = None
+            mock_http_client.get = AsyncMock(return_value=mock_response)
+
+            client = KalshiClient()
+
+            # Make multiple requests
+            await client.get_orderbook("TEST1")
+            await client.get_orderbook("TEST2")
+            await client.get_orderbook("TEST3")
+
+            # AsyncClient should be instantiated only once
+            mock_client_class.assert_called_once()
+
+
+class TestKalshiClientSignaturePath:
+    """Test request path derivation for signature."""
+
+    @pytest.mark.asyncio
+    async def test_signature_path_derived_from_url(self) -> None:
+        """Test that signature path is derived from URL using urlparse."""
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "KALSHI_API_KEY_ID": "test_key_id",
+                    "KALSHI_API_SECRET": MOCK_PEM_KEY.decode("utf-8"),
+                },
+            ),
+            patch(
+                "kalshi_edge_engine.kalshi.client.serialization.load_pem_private_key"
+            ) as mock_load,
+        ):
+            mock_private_key = MagicMock()
+            mock_private_key.sign.return_value = b"mock_signature"
+            mock_load.return_value = mock_private_key
+
+            client = KalshiClient()
+
+            # Patch the _sign_request to capture what path is used
+            original_sign = client._sign_request
+            captured_paths = []
+
+            def capture_sign(timestamp_ms: int, method: str, path: str) -> str:
+                captured_paths.append(path)
+                return original_sign(timestamp_ms, method, path)
+
+            client._sign_request = capture_sign  # type: ignore
+
+            with patch("kalshi_edge_engine.kalshi.client.httpx.AsyncClient") as mock_client_class:
+                mock_response = MagicMock()
+                mock_response.status_code = 200
+                mock_response.json.return_value = {"test": "data"}
+                mock_response.raise_for_status.return_value = None
+
+                mock_http_client = AsyncMock()
+                mock_http_client.get = AsyncMock(return_value=mock_response)
+                mock_client_class.return_value = mock_http_client
+
+                await client.get_orderbook("TEST-TICKER")
+
+                # Verify path was derived from URL correctly
+                assert len(captured_paths) == 1
+                path = captured_paths[0]
+                # Path should be /trade-api/v2/markets/TEST-TICKER/orderbook (derived from URL)
+                assert "TEST-TICKER" in path
+                assert "orderbook" in path
+                assert path.startswith("/")

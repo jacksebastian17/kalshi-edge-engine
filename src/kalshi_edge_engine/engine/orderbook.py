@@ -57,6 +57,9 @@ def _extract_prices_from(data: dict[str, Any]) -> tuple[list[Any], list[Any]]:
 def _extract_best_bid(prices: list[Any]) -> BestLevel | None:
     """Extract best bid (highest price) from ladder.
 
+    Validates entries: price must be 0-100, size must be >= 0.
+    Skips invalid entries.
+
     Args:
         prices: List of [price, size] entries.
 
@@ -68,7 +71,14 @@ def _extract_best_bid(prices: list[Any]) -> BestLevel | None:
 
     try:
         best_entry = max(
-            (item for item in prices if isinstance(item, (list, tuple)) and len(item) >= 2),
+            (
+                item
+                for item in prices
+                if isinstance(item, (list, tuple))
+                and len(item) >= 2
+                and 0.0 <= float(item[0]) <= 100.0
+                and int(item[1]) >= 0
+            ),
             key=lambda x: float(x[0]),
             default=None,
         )
@@ -93,6 +103,8 @@ def parse_orderbook(orderbook: dict[str, Any]) -> ParsedOrderbook:
     - cross_yes = "best immediate YES buy price implied by NO bids"
     - cross_no = "best immediate NO buy price implied by YES bids"
 
+    Cross prices have size=0 (they do not represent actual liquidity).
+
     Args:
         orderbook: Raw orderbook dict from Kalshi API.
                    Supports both nested shape (orderbook["orderbook"]["yes"])
@@ -115,14 +127,14 @@ def parse_orderbook(orderbook: dict[str, Any]) -> ParsedOrderbook:
         bid_yes = _extract_best_bid(yes_prices)
         bid_no = _extract_best_bid(no_prices)
 
-        # Compute cross prices from opposite-side best bids
+        # Compute cross prices from opposite-side best bids (cross prices have size=0)
         if bid_no and bid_no.price is not None:
             cross_yes_price = 100.0 - bid_no.price
-            cross_yes = BestLevel(price=cross_yes_price, size=bid_no.size)
+            cross_yes = BestLevel(price=cross_yes_price, size=0)
 
         if bid_yes and bid_yes.price is not None:
             cross_no_price = 100.0 - bid_yes.price
-            cross_no = BestLevel(price=cross_no_price, size=bid_yes.size)
+            cross_no = BestLevel(price=cross_no_price, size=0)
 
     except (ValueError, TypeError, AttributeError, KeyError):
         # If any parsing fails, return what we have (prefer partial data over crash)

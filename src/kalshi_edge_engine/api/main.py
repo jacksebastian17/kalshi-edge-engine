@@ -1,11 +1,13 @@
 """FastAPI application for Kalshi Edge Engine."""
 
+import asyncio
 import logging
 import time
+from contextlib import asynccontextmanager
 from typing import Any
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -26,24 +28,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(
-    title="Kalshi Edge Engine",
-    description="Real-time signal generation and dashboard backend",
-    version="0.1.0",
-)
 
-# Enable CORS for local development dashboard
-# Allow local Vite dev server origins and GET methods only
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
-    allow_credentials=False,
-    allow_methods=["GET"],
-    allow_headers=["*"],
-)
-
-
+# Pydantic models
 class HealthResponse(BaseModel):
     """Health check response."""
 
@@ -72,10 +58,13 @@ class SignalResponse(BaseModel):
     cross_no: float | None
     bid_sum: float | None
     imbalance_gap: float | None
+    liq_yes: int
+    liq_no: int
     top_liquidity: int
     timestamp_ms: int
 
 
+# Helper functions
 def _signal_to_response(signal: Signal) -> dict[str, Any]:
     """Convert Signal dataclass to API response payload."""
     return {
@@ -91,6 +80,8 @@ def _signal_to_response(signal: Signal) -> dict[str, Any]:
         "cross_no": signal.cross_no,
         "bid_sum": signal.bid_sum,
         "imbalance_gap": signal.imbalance_gap,
+        "liq_yes": signal.liq_yes,
+        "liq_no": signal.liq_no,
         "top_liquidity": signal.top_liquidity,
         "timestamp_ms": signal.timestamp_ms,
     }
@@ -111,13 +102,12 @@ def _parse_tickers(tickers: str) -> list[str]:
     return parsed
 
 
-@app.get("/health", response_model=HealthResponse)
+# Route handlers (defined as regular functions)
 async def health() -> dict[str, Any]:
     """Health check endpoint."""
     return {"status": "ok"}
 
 
-@app.get("/version", response_model=VersionResponse)
 async def version() -> dict[str, Any]:
     """Version information endpoint."""
     return {
@@ -126,8 +116,7 @@ async def version() -> dict[str, Any]:
     }
 
 
-@app.get("/debug/orderbook/{ticker}")
-async def debug_orderbook(ticker: str) -> dict[str, Any]:
+async def debug_orderbook(ticker: str, request: Request) -> dict[str, Any]:
     """Fetch and return raw orderbook data for debugging.
 
     Args:
@@ -148,8 +137,8 @@ async def debug_orderbook(ticker: str) -> dict[str, Any]:
     start_time = time.time()
 
     try:
-        # Initialize client (will read env vars)
-        client = KalshiClient()
+        # Use singleton client from app state
+        client = request.app.state.kalshi_client
 
         # Fetch orderbook
         orderbook = await client.get_orderbook(ticker)
@@ -214,8 +203,7 @@ async def debug_orderbook(ticker: str) -> dict[str, Any]:
         ) from e
 
 
-@app.get("/signals/live", response_model=SignalResponse)
-async def get_live_signal(ticker: str) -> dict[str, Any]:
+async def get_live_signal(ticker: str, request: Request) -> dict[str, Any]:
     """Get live signal for a market.
 
     Fetches the current orderbook and scores it to emit a structured signal
@@ -239,8 +227,8 @@ async def get_live_signal(ticker: str) -> dict[str, Any]:
     start_time = time.time()
 
     try:
-        # Initialize client (will read env vars)
-        client = KalshiClient()
+        # Use singleton client from app state
+        client = request.app.state.kalshi_client
 
         # Fetch orderbook
         orderbook = await client.get_orderbook(ticker)
@@ -306,9 +294,12 @@ async def get_live_signal(ticker: str) -> dict[str, Any]:
         ) from e
 
 
-@app.get("/signals/scan", response_model=list[SignalResponse])
-async def scan_live_signals(tickers: str) -> list[dict[str, Any]]:
-    """Scan multiple tickers and return sorted signal opportunities."""
+async def scan_live_signals(tickers: str, request: Request) -> list[dict[str, Any]]:
+    """Scan multiple tickers and return sorted signal opportunities.
+
+    Uses parallel requests with concurrency limit to improve performance.
+    Automatically retries failed tickers gracefully.
+    """
     parsed_tickers = _parse_tickers(tickers)
     if not parsed_tickers:
         logger.warning("scan_invalid_tickers", extra={"tickers": tickers})
@@ -320,31 +311,48 @@ async def scan_live_signals(tickers: str) -> list[dict[str, Any]]:
     start_time = time.time()
 
     try:
-        client = KalshiClient()
-        scored_signals: list[Signal] = []
-        for ticker in parsed_tickers:
-            try:
-                orderbook = await client.get_orderbook(ticker)
-                scored_signals.append(score_signal(ticker, orderbook))
-            except KalshiAPIError as e:
-                logger.warning(
-                    "scan_ticker_failed",
-                    extra={
-                        "ticker": ticker,
-                        "error": str(e),
-                    },
-                )
-                continue
+        client = request.app.state.kalshi_client
+
+        # Semaphore to limit concurrent requests (max 5)
+        semaphore = asyncio.Semaphore(5)
+
+        async def fetch_and_score(ticker: str) -> Signal | None:
+            """Fetch orderbook and score signal for a ticker.
+
+            Returns None if fetch fails (KalshiAPIError).
+            """
+            async with semaphore:
+                try:
+                    orderbook = await client.get_orderbook(ticker)
+                    return score_signal(ticker, orderbook)
+                except KalshiAPIError as e:
+                    logger.warning(
+                        "scan_ticker_failed",
+                        extra={
+                            "ticker": ticker,
+                            "error": str(e),
+                        },
+                    )
+                    return None
+
+        # Fetch all tickers in parallel
+        results = await asyncio.gather(*[fetch_and_score(t) for t in parsed_tickers])
+
+        # Filter out failed tickers (None results)
+        scored_signals: list[Signal] = [r for r in results if r is not None]
 
         if not scored_signals:
             raise HTTPException(status_code=502, detail="Upstream API error")
 
+        # Sort by best net edge (descending), then by ticker (ascending) for deterministic ordering
         scored_signals.sort(
-            key=lambda signal: max(
-                signal.net_edge_yes if signal.net_edge_yes is not None else float("-inf"),
-                signal.net_edge_no if signal.net_edge_no is not None else float("-inf"),
-            ),
-            reverse=True,
+            key=lambda signal: (
+                -max(
+                    signal.net_edge_yes if signal.net_edge_yes is not None else float("-inf"),
+                    signal.net_edge_no if signal.net_edge_no is not None else float("-inf"),
+                ),
+                signal.ticker,
+            )
         )
 
         latency_ms = (time.time() - start_time) * 1000
@@ -390,6 +398,79 @@ async def scan_live_signals(tickers: str) -> list[dict[str, Any]]:
         ) from e
 
 
+# Lifespan managers
+@asynccontextmanager
+async def lifespan_production(app: FastAPI) -> Any:
+    """Manage app lifecycle: initialize singleton client on startup, close on shutdown."""
+    # Startup
+    try:
+        client = KalshiClient()
+        app.state.kalshi_client = client
+        logger.info("KalshiClient initialized and stored on app.state")
+    except Exception as e:
+        logger.exception("Failed to initialize KalshiClient on startup", extra={"error": str(e)})
+        raise
+
+    yield
+
+    # Shutdown
+    try:
+        if hasattr(app.state, "kalshi_client"):
+            await app.state.kalshi_client.aclose()
+            logger.info("KalshiClient closed on shutdown")
+    except Exception as e:
+        logger.exception("Error closing KalshiClient on shutdown", extra={"error": str(e)})
+
+
+@asynccontextmanager
+async def lifespan_testing(_app: FastAPI) -> Any:
+    """Testing lifespan: skip KalshiClient initialization."""
+    yield
+
+
+# App factory
+def create_app(testing: bool = False) -> FastAPI:
+    """Create and configure FastAPI application.
+
+    Args:
+        testing: If True, skip KalshiClient initialization (for testing).
+
+    Returns:
+        Configured FastAPI application instance.
+    """
+    app_instance = FastAPI(
+        title="Kalshi Edge Engine",
+        description="Real-time signal generation and dashboard backend",
+        version="0.1.0",
+        lifespan=lifespan_testing if testing else lifespan_production,
+    )
+
+    # Enable CORS for local development dashboard
+    # Allow local Vite dev server origins and GET methods only
+    app_instance.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+        allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
+        allow_credentials=False,
+        allow_methods=["GET"],
+        allow_headers=["*"],
+    )
+
+    # Register routes
+    app_instance.get("/health", response_model=HealthResponse)(health)
+    app_instance.get("/version", response_model=VersionResponse)(version)
+    app_instance.get("/debug/orderbook/{ticker}")(debug_orderbook)
+    app_instance.get("/signals/live", response_model=SignalResponse)(get_live_signal)
+    app_instance.get("/signals/scan", response_model=list[SignalResponse])(scan_live_signals)
+
+    return app_instance
+
+
+# Create default app instance for production use
+app = create_app()
+
+
+# Development server entry point
 if __name__ == "__main__":
     import uvicorn
 

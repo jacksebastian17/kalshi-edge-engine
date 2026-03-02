@@ -308,3 +308,151 @@ class TestSignalScoring(unittest.TestCase):
         after_ms = int(time.time() * 1000)
 
         assert before_ms <= signal.timestamp_ms <= after_ms
+
+
+class TestOrderbookPriceValidation(unittest.TestCase):
+    """Test price validation in orderbook parsing."""
+
+    def test_parse_orderbook_invalid_prices_ignored(self) -> None:
+        """Test that prices outside 0-100 range are ignored."""
+        orderbook = {
+            "yes": [[96, 250], [101, 100], [-1, 50]],  # 101 and -1 invalid
+            "no": [[5, 100], [150, 75]],  # 150 invalid
+        }
+
+        parsed = parse_orderbook(orderbook)
+
+        # Should use 96 (valid), not 101 or -1
+        assert parsed.bid_yes is not None
+        assert parsed.bid_yes.price == 96.0
+
+        # Should use 5 (valid), not 150
+        assert parsed.bid_no is not None
+        assert parsed.bid_no.price == 5.0
+
+    def test_parse_orderbook_invalid_sizes_ignored(self) -> None:
+        """Test that negative sizes are ignored."""
+        orderbook = {
+            "yes": [[96, 250], [95, -100]],  # -100 invalid
+            "no": [[5, 100]],
+        }
+
+        parsed = parse_orderbook(orderbook)
+
+        # Should use 96 (valid), not 95 with negative size
+        assert parsed.bid_yes is not None
+        assert parsed.bid_yes.price == 96.0
+
+
+class TestCrossPriceSize(unittest.TestCase):
+    """Test that cross prices have size=0."""
+
+    def test_cross_price_size_zero(self) -> None:
+        """Test that cross prices are marked with size=0 (not inherited from bids)."""
+        orderbook = {
+            "yes": [[80, 250]],
+            "no": [[15, 500]],  # Different sizes
+        }
+
+        parsed = parse_orderbook(orderbook)
+
+        # Cross prices should have size=0, not inherit from bid sizes
+        assert parsed.cross_yes is not None
+        assert parsed.cross_yes.price == 85.0  # 100 - 15
+        assert parsed.cross_yes.size == 0
+
+        assert parsed.cross_no is not None
+        assert parsed.cross_no.price == 20.0  # 100 - 80
+        assert parsed.cross_no.size == 0
+
+
+class TestSideLiquidityGating(unittest.TestCase):
+    """Test side-specific liquidity gating."""
+
+    def test_signal_tracks_liq_yes_liq_no_separately(self) -> None:
+        """Test that signal tracks liq_yes and liq_no separately."""
+        orderbook = {
+            "yes": [[80, 250]],
+            "no": [[15, 500]],
+        }
+
+        signal = score_signal("TEST-TICKER", orderbook)
+
+        assert signal.liq_yes == 250
+        assert signal.liq_no == 500
+        assert signal.top_liquidity == 500
+
+    def test_signal_low_liquidity_yes_side_only(self) -> None:
+        """Test SIGNAL_VALID when YES side is illiquid but NO side is eligible+valid."""
+        orderbook = {
+            "yes": [[80, 5]],  # Only 5 contracts - fails min_liquidity=10
+            "no": [[15, 250]],  # Good liquidity
+        }
+        # inside_width_yes = 100-15-80 = 5 (>1 tick, usable but illiquid)
+        # inside_width_no = 100-80-15 = 5 (>1 tick, usable and liquid)
+        # NO side eligible: net_edge_no = 5 - 0.5 - 0.1 = 4.4 >= 0.1 ✓
+        # Should be SIGNAL_VALID (NO side valid despite YES side being illiquid)
+
+        signal = score_signal("TEST-TICKER", orderbook, min_liquidity=10, fee_estimate=0.5)
+
+        assert signal.reason_code == SIGNAL_VALID
+        assert signal.liq_yes == 5
+        assert signal.liq_no == 250
+        # NO side should have positive net edge
+        assert signal.net_edge_no is not None
+        assert signal.net_edge_no >= 0.1
+
+    def test_signal_low_liquidity_no_side_only(self) -> None:
+        """Test SIGNAL_VALID when NO side is illiquid but YES side is eligible+valid."""
+        orderbook = {
+            "yes": [[80, 250]],
+            "no": [[15, 5]],  # Only 5 contracts - fails min_liquidity=10
+        }
+        # inside_width_yes = 100-15-80 = 5 (>1 tick, usable and liquid)
+        # inside_width_no = 100-80-15 = 5 (>1 tick, usable but illiquid)
+        # YES side eligible: net_edge_yes = 5 - 0.5 - 0.1 = 4.4 >= 0.1 ✓
+        # Should be SIGNAL_VALID (YES side valid despite NO side being illiquid)
+
+        signal = score_signal("TEST-TICKER", orderbook, min_liquidity=10, fee_estimate=0.5)
+
+        assert signal.reason_code == SIGNAL_VALID
+        assert signal.liq_yes == 250
+        assert signal.liq_no == 5
+        # YES side should have positive net edge
+        assert signal.net_edge_yes is not None
+        assert signal.net_edge_yes >= 0.1
+
+    def test_signal_valid_ignores_liquidity_on_unusable_side(self) -> None:
+        """Test that liquidity is only required for usable sides."""
+        orderbook2 = {
+            "yes": [[50, 250]],
+            "no": [[49.5, 5]],  # Narrow NO side (not usable), low liquidity
+        }
+        # yes: bid_yes=50, cross_yes=100-49.5=50.5, width=0.5 (not usable, <1 tick)
+        # no:  bid_no=49.5, cross_no=100-50=50, width=0.5 (not usable, <1 tick)
+        # Both sides not usable → SPREAD_TOO_SMALL, liquidity ignored
+
+        signal = score_signal("TEST-TICKER", orderbook2, min_liquidity=10, fee_estimate=0.5)
+
+        # With <1 tick on both sides, should be SPREAD_TOO_SMALL
+        assert signal.reason_code == SPREAD_TOO_SMALL
+        # But let's verify liquidity doesn't block when side is narrow
+        assert signal.liq_no == 5
+
+    def test_signal_both_sides_sufficient_liquidity(self) -> None:
+        """Test SIGNAL_VALID when both sides have sufficient liquidity."""
+        orderbook = {
+            "yes": [[75, 100]],
+            "no": [[20, 150]],
+        }
+        # yes: bid_yes=75, cross_yes=100-20=80, width=5 (usable)
+        # no:  bid_no=20, cross_no=100-75=25, width=5 (usable)
+        # liq_yes=100 >= 10, liq_no=150 >= 10 ✓
+        # bid_sum=95, imbalance=5 >= 1.5 ✓
+        # net_edges: 5-0.5-0.1=4.4 >= 0.1 ✓
+
+        signal = score_signal("TEST-TICKER", orderbook, min_liquidity=10, fee_estimate=0.5)
+
+        assert signal.reason_code == SIGNAL_VALID
+        assert signal.liq_yes == 100
+        assert signal.liq_no == 150
