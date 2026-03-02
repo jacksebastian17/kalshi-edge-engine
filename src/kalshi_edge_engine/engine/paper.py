@@ -194,10 +194,10 @@ async def simulate_fill(
     - NO intent considered filled if best_no_bid >= quote_price
     - On fill:
         - record PaperFill
-        - compute exit mark using cross price at fill
-        - compute fees using existing fee model
-        - compute pnl: pnl_cents = (exit_price - entry_price) * size - total_fees
-        - record PaperOutcome
+        - compute mark price using cross price at fill
+        - compute entry fee using existing fee model
+        - compute unrealized mark-to-market pnl
+        - record PaperOutcome (API-compatible fields)
         - stop loop
     - If horizon ends without fill:
         - record PaperFill with filled=False
@@ -240,7 +240,7 @@ async def simulate_fill(
 
                     # Check for fill based on side
                     is_filled = False
-                    exit_price = None
+                    mark_price = None
                     entry_price = intent.quote_price_cents
 
                     if (
@@ -249,7 +249,7 @@ async def simulate_fill(
                         and best_yes_bid >= intent.quote_price_cents
                     ):
                         is_filled = True
-                        exit_price = cross_yes  # Use cross for mark-to-market
+                        mark_price = cross_yes  # Use cross for mark-to-market
 
                     elif (
                         intent.side == "NO"
@@ -257,9 +257,9 @@ async def simulate_fill(
                         and best_no_bid >= intent.quote_price_cents
                     ):
                         is_filled = True
-                        exit_price = cross_no  # Use cross for mark-to-market
+                        mark_price = cross_no  # Use cross for mark-to-market
 
-                    if is_filled and exit_price is not None:
+                    if is_filled and mark_price is not None:
                         fill_ts_ms = int(time.time() * 1000)
                         time_to_fill_ms = fill_ts_ms - start_ts_ms
 
@@ -286,23 +286,20 @@ async def simulate_fill(
                         )
                         entry_fee = fee_func(entry_price, intent.size_contracts)
 
-                        # Exit fee (always taker at cross price if round_trip)
-                        exit_fee = 0.0
-                        if intent.round_trip:
-                            exit_fee = estimate_taker_fee_cents(exit_price, intent.size_contracts)
-
-                        total_fees = entry_fee + exit_fee
-                        pnl_cents = (exit_price - entry_price) * intent.size_contracts - total_fees
+                        total_fees = entry_fee
+                        unrealized_pnl_cents = (
+                            mark_price - entry_price
+                        ) * intent.size_contracts - total_fees
 
                         # Record outcome
                         exit_ts_ms = fill_ts_ms
                         outcome = PaperOutcome(
                             intent_id=intent.id,
                             exit_ts_ms=exit_ts_ms,
-                            exit_price_cents=exit_price,
+                            exit_price_cents=mark_price,
                             total_fees_cents=total_fees,
-                            pnl_cents=pnl_cents,
-                            pnl_dollars=pnl_cents / 100.0,
+                            pnl_cents=unrealized_pnl_cents,
+                            pnl_dollars=unrealized_pnl_cents / 100.0,
                             note="filled",
                         )
 
@@ -313,9 +310,9 @@ async def simulate_fill(
                                 "ticker": intent.ticker,
                                 "side": intent.side,
                                 "entry_price": entry_price,
-                                "exit_price": exit_price,
+                                "mark_price": mark_price,
                                 "time_to_fill_ms": time_to_fill_ms,
-                                "pnl_cents": pnl_cents,
+                                "unrealized_pnl_cents": unrealized_pnl_cents,
                             },
                         )
 

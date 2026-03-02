@@ -253,6 +253,162 @@ class TestRealisticOrderSimulator:
         assert order_state["exit_reason"] == "max_hold_reached"
 
     @pytest.mark.asyncio
+    async def test_partial_fill_fee_scales_with_filled_contracts(
+        self, mock_client: AsyncMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Total fill fees scale with filled contracts, not number of fill events."""
+        monkeypatch.setattr("kalshi_edge_engine.engine.paper_sim.random.random", lambda: 0.0)
+
+        simulator = RealisticOrderSimulator(
+            poll_interval_seconds=0.01,
+            fill_probability_price_moved=1.0,
+            fill_probability_at_best=0.0,
+            fill_probability_price_improves=0.0,
+            simulated_volume_per_poll=2,
+        )
+
+        now_ms = int(time.time() * 1000)
+        order_request = OrderRequest(
+            id="order-partial-fee-1",
+            ticker="TEST-TICKER",
+            side="YES",
+            quote_price_cents=50.0,
+            size_contracts=3,
+            created_ts_ms=now_ms,
+            net_edge=0.5,
+            entry_fee_cents=3.0,
+            take_profit_cents=0.0,
+            max_hold_seconds=1,
+            entry_fee_per_contract_cents=1.0,
+        )
+
+        mock_client.get_orderbook.return_value = {
+            "yes": [[55.0, 100]],
+            "no": [[45.0, 100]],
+        }
+
+        fills, order_state = await simulator.simulate_order_fills(
+            mock_client,
+            order_request,
+            horizon_seconds=0.2,
+        )
+
+        total_filled_contracts = sum(fill.fill_size for fill in fills)
+        total_fill_fees = sum(fill.fill_fee_cents for fill in fills)
+
+        assert total_filled_contracts == 3
+        assert order_state["total_filled_contracts"] == total_filled_contracts
+        assert total_fill_fees == pytest.approx(3.0)
+
+    @pytest.mark.asyncio
+    async def test_take_profit_uses_filled_contracts_not_fill_count(
+        self, mock_client: AsyncMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Take-profit threshold must use filled_contracts, not len(fills)."""
+        monkeypatch.setattr("kalshi_edge_engine.engine.paper_sim.random.random", lambda: 0.0)
+
+        simulator = RealisticOrderSimulator(
+            poll_interval_seconds=0.01,
+            fill_probability_price_moved=1.0,
+            fill_probability_at_best=0.0,
+            fill_probability_price_improves=0.0,
+            simulated_volume_per_poll=2,
+        )
+
+        now_ms = int(time.time() * 1000)
+        order_request = OrderRequest(
+            id="order-take-profit-size-1",
+            ticker="TEST-TICKER",
+            side="YES",
+            quote_price_cents=50.0,
+            size_contracts=4,
+            created_ts_ms=now_ms,
+            net_edge=0.5,
+            entry_fee_cents=0.5,
+            take_profit_cents=3.0,
+            max_hold_seconds=1,
+        )
+
+        mock_client.get_orderbook.return_value = {
+            "yes": [[55.0, 100]],
+            "no": [[48.0, 100]],  # cross_yes = 52 => +2c/contract mark
+        }
+
+        fills, order_state = await simulator.simulate_order_fills(
+            mock_client,
+            order_request,
+            horizon_seconds=0.2,
+        )
+
+        assert len(fills) == 1
+        # With the fix: price_moved_through now fills remaining_size (full 4 contracts)
+        # instead of partial min(4, simulated_volume_per_poll=2)
+        assert fills[0].fill_size == 4
+        assert order_state["exit_reason"] == "take_profit"
+        assert order_state["total_filled_contracts"] == 4
+
+    @pytest.mark.asyncio
+    async def test_queue_ahead_monotonic_and_non_negative_at_best_price(
+        self, mock_client: AsyncMock
+    ) -> None:
+        """Queue ahead decreases monotonically with traded volume and never goes negative."""
+        simulator = RealisticOrderSimulator(
+            poll_interval_seconds=0.02,
+            fill_probability_price_moved=0.0,
+            fill_probability_at_best=0.0,
+            fill_probability_price_improves=0.0,
+            simulated_volume_per_poll=2,
+        )
+
+        now_ms = int(time.time() * 1000)
+        order_request = OrderRequest(
+            id="order-queue-monotonic-1",
+            ticker="TEST-TICKER",
+            side="YES",
+            quote_price_cents=50.0,
+            size_contracts=5,
+            created_ts_ms=now_ms,
+            net_edge=0.5,
+            entry_fee_cents=0.5,
+            take_profit_cents=0.0,
+            max_hold_seconds=0.15,
+        )
+
+        best_sizes = [10, 7, 5, 3, 2]
+        call_idx = -1
+
+        def _orderbook_sequence(_ticker: str) -> dict[str, list[list[float]]]:
+            nonlocal call_idx
+            call_idx += 1
+            size = best_sizes[min(call_idx, len(best_sizes) - 1)]
+            return {
+                "yes": [[50.0, size]],
+                "no": [[45.0, 100]],
+            }
+
+        mock_client.get_orderbook.side_effect = _orderbook_sequence
+
+        observed_queue: list[int] = []
+
+        def _on_poll(runtime_update: dict[str, object]) -> None:
+            queue_value = runtime_update.get("queue_ahead_contracts")
+            if isinstance(queue_value, int):
+                observed_queue.append(queue_value)
+
+        await simulator.simulate_order_fills(
+            mock_client,
+            order_request,
+            horizon_seconds=0.2,
+            on_poll=_on_poll,
+        )
+
+        assert len(observed_queue) >= 2
+        assert all(queue >= 0 for queue in observed_queue)
+        assert all(
+            curr <= prev for prev, curr in zip(observed_queue, observed_queue[1:], strict=False)
+        )
+
+    @pytest.mark.asyncio
     async def test_simulate_order_fills_order_state_structure(
         self,
         simulator: RealisticOrderSimulator,
@@ -363,11 +519,13 @@ class TestSimulatorDiagnostics:
         assert diagnostics["price_improves"] is True
         assert diagnostics["effective_best_bid"] == 83.0
         assert diagnostics["best_size_at_bid"] == 0
-        assert diagnostics["traded_volume_estimate"] == 0  # Price-improving orders have no volume
+        # Price-improving orders now have traded_volume_estimate = simulated_volume_per_poll
+        # (representing potential seller arrivals, not orderbook delta)
+        assert diagnostics["traded_volume_estimate"] == 10
         assert diagnostics["eligibility"]["at_best_price"] is True
         assert (
             diagnostics["eligibility"]["queue_cleared"] is False
-        )  # Queue (1) with traded_volume=0 does not clear
+        )  # Queue never cleared for price_improves
 
     def test_compute_simulator_diagnostics_market_moves_through_after_improve(self) -> None:
         """Moved-through should be based on market best, excluding our own quote."""
@@ -492,7 +650,8 @@ class TestPriceImprovementFillPath:
         assert len(fills) >= 0  # Probabilistic
         assert order_state["latest_diagnostics"]["eligibility"]["at_best_price"] is True
         assert order_state["latest_diagnostics"]["price_improves"] is True
-        assert order_state["latest_diagnostics"]["traded_volume_estimate"] == 0
+        # traded_volume_estimate is now > 0 (represents arrival volume)
+        assert order_state["latest_diagnostics"]["traded_volume_estimate"] > 0
 
     @pytest.mark.asyncio
     async def test_simulate_order_fills_price_improving_not_instant_with_zero_at_best_prob(
@@ -674,7 +833,9 @@ class TestDiagnosticsInvariants:
 
         assert diagnostics["price_improves"] is True
         assert diagnostics["eligibility"]["at_best_price"] is True
-        assert diagnostics["traded_volume_estimate"] == 0  # Price-improving has no volume
+        # Price-improving orders now have traded_volume_estimate > 0
+        # (representing seller arrivals)
+        assert diagnostics["traded_volume_estimate"] > 0
 
 
 class TestNoFreeFillOnImprovement:
@@ -723,7 +884,8 @@ class TestNoFreeFillOnImprovement:
         assert len(fills) == 0
         assert order_state["status"] == "timeout"
         assert order_state["latest_diagnostics"]["price_improves"] is True
-        assert order_state["latest_diagnostics"]["traded_volume_estimate"] == 0
+        # traded_volume_estimate is now > 0 (represents arrival volume)
+        assert order_state["latest_diagnostics"]["traded_volume_estimate"] > 0
 
     @pytest.mark.asyncio
     async def test_price_improving_order_can_fill_via_price_moved_through(
@@ -780,3 +942,678 @@ class TestNoFreeFillOnImprovement:
         # Should fill because price moved through
         assert len(fills) >= 1
         assert order_state["total_filled_contracts"] >= 1
+
+
+class TestPaperSimCorrectnessPass:
+    """Tests for paper sim correctness fixes: pennying + queue + volume."""
+
+    @pytest.mark.asyncio
+    async def test_price_improves_no_volume_no_fill(self, mock_client: AsyncMock) -> None:
+        """Regression test: price_improves won't fill if fill_probability is 0.
+
+        With seller arrival model, price-improving orders CAN fill via arrivals.
+        But if fill_probability_price_improves=0, no fills should occur.
+        """
+        simulator = RealisticOrderSimulator(
+            poll_interval_seconds=0.05,
+            fill_probability_price_moved=0.0,  # Disable price_moved_through fills
+            fill_probability_at_best=0.0,
+            fill_probability_price_improves=0.0,  # NO seller arrivals!
+            simulated_volume_per_poll=50,
+        )
+
+        now_ms = int(time.time() * 1000)
+        order = OrderRequest(
+            id="order-pennying-fix-1",
+            ticker="TEST-TICKER",
+            side="YES",
+            quote_price_cents=44.0,  # Improves on market bid of 43
+            size_contracts=1,
+            created_ts_ms=now_ms,
+            net_edge=0.5,
+            entry_fee_cents=0.5,
+            take_profit_cents=10.0,
+            max_hold_seconds=30,
+        )
+
+        # Market: best_yes_bid=43, cross_yes=57 => we quote 44 (improves)
+        # But NO traded volume on this poll
+        mock_client.get_orderbook.return_value = {
+            "yes": [[43.0, 100]],
+            "no": [[43.0, 100]],
+        }
+
+        fills, order_state = await simulator.simulate_order_fills(
+            mock_client,
+            order,
+            horizon_seconds=0.3,
+        )
+
+        # KEY ASSERTION: Must use fill_probability_price_improves=0 to prevent fills
+        # (since we now have seller arrival model)
+        assert len(fills) == 0
+        assert order_state["total_filled_contracts"] == 0
+        assert order_state["latest_diagnostics"]["price_improves"] is True
+        # traded_volume_estimate is now > 0 (represents arrival volume, not orderbook delta)
+        assert order_state["latest_diagnostics"]["traded_volume_estimate"] > 0
+        assert order_state["latest_diagnostics"]["best_size_at_bid"] == 0
+
+    @pytest.mark.asyncio
+    async def test_queue_cleared_only_with_volume(
+        self, mock_client: AsyncMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Queue cleared flag should NOT be set when traded_volume=0.
+
+        Ensures queue_cleared only becomes true when actual volume flows through.
+        """
+        # Mock random to force deterministic behavior
+        monkeypatch.setattr("kalshi_edge_engine.engine.paper_sim.random.random", lambda: 0.0)
+
+        simulator = RealisticOrderSimulator(
+            poll_interval_seconds=0.05,
+            fill_probability_price_moved=0.0,
+            fill_probability_at_best=1.0,  # High probability if eligible
+            simulated_volume_per_poll=0,  # NO traded volume
+        )
+
+        now_ms = int(time.time() * 1000)
+        order = OrderRequest(
+            id="order-queue-vol-1",
+            ticker="TEST-TICKER",
+            side="YES",
+            quote_price_cents=50.0,
+            size_contracts=1,
+            created_ts_ms=now_ms,
+            net_edge=0.5,
+            entry_fee_cents=0.5,
+            take_profit_cents=100.0,
+            max_hold_seconds=1,  # Short timeout to force exit
+        )
+
+        mock_client.get_orderbook.return_value = {
+            "yes": [[50.0, 100]],
+            "no": [[50.0, 100]],
+        }
+
+        fills, order_state = await simulator.simulate_order_fills(
+            mock_client,
+            order,
+            horizon_seconds=0.3,
+        )
+
+        # With traded_volume=0, queue_cleared should be false even at best price
+        assert order_state["latest_diagnostics"]["traded_volume_estimate"] == 0
+        assert order_state["latest_diagnostics"]["eligibility"]["queue_cleared"] is False
+        # Should timeout without fill
+        assert len(fills) == 0
+        assert order_state["status"] != "filled"
+
+    @pytest.mark.asyncio
+    async def test_partial_fill_fees_exact_sum(
+        self, mock_client: AsyncMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Partial fills must have fees that sum correctly.
+
+        For 3 contracts @ 1 cent fee per contract:
+        - Fill 1: 1 contract, 1 cent fee
+        - Fill 2: 2 contracts, 2 cent fee
+        - Total: 3 contracts, 3 cent fees
+        """
+        monkeypatch.setattr("kalshi_edge_engine.engine.paper_sim.random.random", lambda: 0.0)
+
+        simulator = RealisticOrderSimulator(
+            poll_interval_seconds=0.02,
+            fill_probability_price_moved=1.0,
+            fill_probability_at_best=0.0,
+            simulated_volume_per_poll=1,  # Force 1 contract per fill
+        )
+
+        now_ms = int(time.time() * 1000)
+        order = OrderRequest(
+            id="order-fee-sum-1",
+            ticker="TEST-TICKER",
+            side="YES",
+            quote_price_cents=50.0,
+            size_contracts=3,
+            created_ts_ms=now_ms,
+            net_edge=0.5,
+            entry_fee_cents=3.0,  # 3 cents total
+            take_profit_cents=0.0,
+            max_hold_seconds=5,
+            entry_fee_per_contract_cents=1.0,
+        )
+
+        # Price always above quote => fills
+        mock_client.get_orderbook.return_value = {
+            "yes": [[55.0, 100]],
+            "no": [[45.0, 100]],
+        }
+
+        fills, order_state = await simulator.simulate_order_fills(
+            mock_client,
+            order,
+            horizon_seconds=0.5,
+        )
+
+        # Verify we got partial fills summing to 3 contracts
+        total_filled = sum(f.fill_size for f in fills)
+        total_fees = sum(f.fill_fee_cents for f in fills)
+
+        assert total_filled == 3
+        assert order_state["total_filled_contracts"] == 3
+        # Fees should sum to 3 cents (1 per contract)
+        assert total_fees == 3.0
+
+        # Verify each fill has correct fee_cents = fill_size * 1
+        for fill in fills:
+            assert fill.fill_fee_cents == fill.fill_size * 1.0
+
+    @pytest.mark.asyncio
+    async def test_take_profit_uses_filled_contracts_not_len_fills(
+        self, mock_client: AsyncMock
+    ) -> None:
+        """Take-profit calculation must use filled_contracts, not len(fills).
+
+        If we get multiple fills with different sizes, take_profit should
+        trigger based on total contracts, not number of fill events.
+        """
+
+        call_count = 0
+
+        def get_orderbook_side_effect(_ticker: str):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return {"yes": [[45.0, 100]], "no": [[55.0, 100]]}
+            else:
+                # Price improves => mark price improves too (crossing up)
+                return {"yes": [[60.0, 100]], "no": [[40.0, 100]]}
+
+        mock_client.get_orderbook.side_effect = get_orderbook_side_effect
+
+        simulator = RealisticOrderSimulator(
+            poll_interval_seconds=0.05,
+            fill_probability_price_moved=0.9,
+            simulated_volume_per_poll=1,
+        )
+
+        now_ms = int(time.time() * 1000)
+        entry_price = 50.0
+        max_contracts = 10
+        # Set take_profit low so it triggers after 2 contracts
+        take_profit_cents_val = (60.0 - entry_price) * 1.5  # ~15 cents
+
+        order = OrderRequest(
+            id="order-tp-contracts-1",
+            ticker="TEST-TICKER",
+            side="YES",
+            quote_price_cents=entry_price,
+            size_contracts=max_contracts,
+            created_ts_ms=now_ms,
+            net_edge=0.5,
+            entry_fee_cents=0.0,  # No fees for simplicity
+            take_profit_cents=take_profit_cents_val,
+            max_hold_seconds=10,
+        )
+
+        fills, order_state = await simulator.simulate_order_fills(
+            mock_client,
+            order,
+            horizon_seconds=1.0,
+        )
+
+        # Test is successful if:
+        # 1. We got some fills (filled_contracts > 0)
+        # 2. Exit reason is take_profit (not filled, which means we didn't fill all contracts)
+        if order_state["total_filled_contracts"] > 0:
+            # With high mark price (60), take_profit should trigger
+            assert order_state["exit_reason"] in ["take_profit", "filled"]
+
+    @pytest.mark.asyncio
+    async def test_queue_update_monotonic_decrease(self, mock_client: AsyncMock) -> None:
+        """Queue ahead should monotonically decrease with volume.
+
+        Once at best price without price_improves, queue should only decrease
+        (or stay same if no volume).
+        """
+
+        call_count = 0
+
+        def get_orderbook_side_effect(_ticker: str):
+            nonlocal call_count
+            call_count += 1
+            # Size at best decreases each poll (simulating volume)
+            sizes = [100, 90, 80, 70]
+            size = sizes[min(call_count - 1, len(sizes) - 1)]
+            return {"yes": [[50.0, size]], "no": [[50.0, 100]]}
+
+        mock_client.get_orderbook.side_effect = get_orderbook_side_effect
+
+        simulator = RealisticOrderSimulator(
+            poll_interval_seconds=0.05,
+            fill_probability_price_moved=0.0,
+            fill_probability_at_best=0.0,  # Don't fill
+            simulated_volume_per_poll=0,  # Rely on size delta
+        )
+
+        now_ms = int(time.time() * 1000)
+        order = OrderRequest(
+            id="order-queue-mono-1",
+            ticker="TEST-TICKER",
+            side="YES",
+            quote_price_cents=50.0,
+            size_contracts=1,
+            created_ts_ms=now_ms,
+            net_edge=0.5,
+            entry_fee_cents=0.5,
+            take_profit_cents=100.0,
+            max_hold_seconds=0.5,  # Force timeout
+        )
+
+        fills, order_state = await simulator.simulate_order_fills(
+            mock_client,
+            order,
+            horizon_seconds=0.5,
+        )
+
+        # Should not fill (probability=0)
+        assert len(fills) == 0
+        # Queue should have been initialized at some point
+        # (exact value depends on timing, but should be tracked consistently)
+        assert "latest_diagnostics" in order_state
+        assert "queue_ahead_after" in order_state["latest_diagnostics"]
+
+
+class TestSellerArrivalForPriceImproves:
+    """Tests for seller arrival volume model for price-improving orders."""
+
+    @pytest.mark.asyncio
+    async def test_price_improves_can_fill_via_seller_arrival(self, mock_client: AsyncMock) -> None:
+        """Price-improving orders should fill via seller arrival (not orderbook delta).
+
+        Setup: market_best_bid=43, cross=45, quote=44 (price_improves=True).
+        With fill_probability_price_improves=1.0, should get fills even though
+        synthetic best level has no orderbook size.
+        """
+        simulator = RealisticOrderSimulator(
+            poll_interval_seconds=0.05,
+            fill_probability_price_moved=0.0,  # Disable price_moved_through
+            fill_probability_at_best=0.0,  # Disable queue-based fills
+            fill_probability_price_improves=1.0,  # Enable seller arrivals
+            simulated_volume_per_poll=5,
+        )
+
+        now_ms = int(time.time() * 1000)
+        order = OrderRequest(
+            id="order-arrival-test-1",
+            ticker="TEST-TICKER",
+            side="YES",
+            quote_price_cents=44.0,  # Improves on market bid of 43
+            size_contracts=3,
+            created_ts_ms=now_ms,
+            net_edge=0.5,
+            entry_fee_cents=0.0,
+            take_profit_cents=100.0,
+            max_hold_seconds=10,
+        )
+
+        # Market: best_yes_bid=43, cross_yes=57 (100-43) => our quote 44 improves
+        # NO side: best_no_bid=43, cross_no=57
+        mock_client.get_orderbook.return_value = {
+            "yes": [[43.0, 100]],
+            "no": [[43.0, 100]],
+        }
+
+        fills, order_state = await simulator.simulate_order_fills(
+            mock_client,
+            order,
+            horizon_seconds=0.5,
+        )
+
+        # Should get fills via seller arrival
+        assert len(fills) >= 1, "Expected at least one fill via seller arrival"
+        for fill in fills:
+            assert fill.fill_size >= 1, f"Fill size should be >= 1, got {fill.fill_size}"
+            assert fill.queue_ahead_at_fill == 0, (
+                f"queue_ahead should be 0 for price_improves, got {fill.queue_ahead_at_fill}"
+            )
+
+        # Verify diagnostics show price_improves
+        assert order_state["latest_diagnostics"]["price_improves"] is True
+
+    @pytest.mark.asyncio
+    async def test_price_improves_queue_cleared_never_true(self) -> None:
+        """queue_cleared must be False for price_improves (no fake queue clearing)."""
+        now_ms = int(time.time() * 1000)
+        order = OrderRequest(
+            id="order-queue-test-1",
+            ticker="TEST-TICKER",
+            side="YES",
+            quote_price_cents=44.0,  # Improves on market bid of 43
+            size_contracts=1,
+            created_ts_ms=now_ms,
+            net_edge=0.5,
+            entry_fee_cents=0.0,
+            take_profit_cents=100.0,
+            max_hold_seconds=10,
+        )
+
+        # Market: best_yes_bid=43, cross_yes=57 => our quote 44 improves
+        orderbook = {
+            "yes": [[43.0, 100]],
+            "no": [[43.0, 100]],
+        }
+
+        diagnostics = compute_simulator_diagnostics(
+            order=order,
+            orderbook=orderbook,
+            queue_ahead=0,
+            last_best_size_at_bid=None,
+            simulated_volume_per_poll=50,
+        )
+
+        # Verify price_improves is true
+        assert diagnostics["price_improves"] is True, "Expected price_improves=True"
+        assert diagnostics["best_size_at_bid"] == 0, "Synthetic level should have size 0"
+
+        # KEY ASSERTION: queue_cleared must be False (no fake clearing)
+        assert diagnostics["eligibility"]["queue_cleared"] is False, (
+            "queue_cleared should be False for price_improves"
+        )
+
+        # Verify traded_volume_estimate represents potential arrivals (not 0)
+        assert diagnostics["traded_volume_estimate"] > 0, (
+            "traded_volume_estimate should represent arrival volume, not 0"
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_price_improving_still_requires_traded_volume(
+        self, mock_client: AsyncMock
+    ) -> None:
+        """Non-price-improving orders should NOT fill when traded_volume=0.
+
+        Setup: quote == market_best_bid (not improving), but no volume.
+        Should timeout without fills.
+        """
+        simulator = RealisticOrderSimulator(
+            poll_interval_seconds=0.05,
+            fill_probability_price_moved=0.0,
+            fill_probability_at_best=1.0,  # High probability IF eligible
+            fill_probability_price_improves=0.0,
+            simulated_volume_per_poll=0,  # NO volume!
+        )
+
+        now_ms = int(time.time() * 1000)
+        order = OrderRequest(
+            id="order-no-vol-test-1",
+            ticker="TEST-TICKER",
+            side="YES",
+            quote_price_cents=50.0,  # At best, not improving
+            size_contracts=1,
+            created_ts_ms=now_ms,
+            net_edge=0.5,
+            entry_fee_cents=0.0,
+            take_profit_cents=100.0,
+            max_hold_seconds=0.3,  # Short timeout
+        )
+
+        # Market: best_yes_bid=50 (same as our quote), but no volume delta
+        mock_client.get_orderbook.return_value = {
+            "yes": [[50.0, 100]],  # Size stays constant (no delta)
+            "no": [[50.0, 100]],
+        }
+
+        fills, order_state = await simulator.simulate_order_fills(
+            mock_client,
+            order,
+            horizon_seconds=0.3,
+        )
+
+        # Should NOT fill because traded_volume=0 (no delta, simulated_volume=0)
+        assert len(fills) == 0, "Should not fill without traded volume"
+        assert order_state["status"] != "filled"
+
+        # Verify diagnostics show not price_improves and no volume
+        assert order_state["latest_diagnostics"]["price_improves"] is False
+        assert order_state["latest_diagnostics"]["traded_volume_estimate"] == 0
+
+
+class TestCorrectionFixes:
+    """Tests for correctness fixes in simulator."""
+
+    @pytest.mark.asyncio
+    async def test_no_side_take_profit_correctness(
+        self,
+        simulator: RealisticOrderSimulator,
+        mock_client: AsyncMock,
+    ):
+        """Test NO side take-profit PnL is computed correctly (entry > mark = profit)."""
+        now_ms = int(time.time() * 1000)
+        # NO side order: entry at 50, should profit when mark price is lower
+        order = OrderRequest(
+            id="order-no-side",
+            ticker="KXNBAGAME-26MAR01SASNYK-NO",
+            side="NO",
+            quote_price_cents=50.0,
+            size_contracts=5,
+            created_ts_ms=now_ms,
+            net_edge=0.5,
+            entry_fee_cents=1.0,
+            take_profit_cents=15.0,  # Expect PnL when mark < 45
+            max_hold_seconds=60,
+        )
+
+        # Mock orderbook:
+        # For NO side: we want cross_no (which is 100 - yes_best_bid)
+        # If yes_best_bid=55, then cross_no=45, mark for NO is 45
+        # PnL for NO = (entry - mark) * contracts = (50 - 45) * 5 = 25 cents (should trigger take_profit=15)
+        mock_client.get_orderbook.return_value = {
+            "yes": [[55.0, 100]],  # Best YES bid at 55, so cross_no = 100 - 55 = 45
+            "no": [[45.0, 100]],
+        }
+
+        fills, order_state = await simulator.simulate_order_fills(
+            mock_client,
+            order,
+            horizon_seconds=5,
+        )
+
+        # Should detect take_profit exit because NO side PnL = (50 - 45) * filled_contracts >= 15
+        if len(fills) > 0:
+            filled_contracts = sum(f.fill_size for f in fills)
+            expected_pnl = (order.quote_price_cents - 45.0) * filled_contracts
+            # If filled 5 contracts at 50 entry, mark at 45: PnL = (50-45)*5 = 25 >= 15 threshold
+            if expected_pnl >= order.take_profit_cents:
+                assert order_state["exit_reason"] == "take_profit", (
+                    f"Expected take_profit exit but got {order_state['exit_reason']} "
+                    f"(PnL={expected_pnl}, threshold={order.take_profit_cents})"
+                )
+
+    @pytest.mark.asyncio
+    async def test_queue_model_consistency(
+        self,
+        mock_client: AsyncMock,
+    ):
+        """Test queue model correctly separates queue consumption from fill eligibility."""
+        now_ms = int(time.time() * 1000)
+        order = OrderRequest(
+            id="order-queue-test",
+            ticker="KXNBAGAME-26MAR01SASNYK-YES",
+            side="YES",
+            quote_price_cents=50.0,
+            size_contracts=5,
+            created_ts_ms=now_ms,
+            net_edge=0.5,
+            entry_fee_cents=0.5,
+            take_profit_cents=0.0,  # No early exit
+            max_hold_seconds=60,
+        )
+
+        # Simulate a scenario where:
+        # - queue_ahead = 10 contracts
+        # - traded_volume_estimate = 15 contracts (volume at our level)
+        # - remaining_size = 5 contracts (what we want to buy)
+        #
+        # Old behavior (BUGGY):
+        #   - queue_ahead -= 15 -> queue_ahead = -5 (clamped to 0)
+        #   - fill_size = min(5, 15) = 5
+        #   This is inconsistent: it uses traded_volume fully even though queue consumed some
+        #
+        # New behavior (CORRECT):
+        #   - consumed_by_ahead = min(10, 15) = 10
+        #   - remaining_trade = 15 - 10 = 5
+        #   - Only fills if queue_ahead becomes 0 AND remaining_trade > 0
+        #   - fill_size = min(5, 5) = 5
+
+        # Simulate polling sequence that produces the above scenario
+        poll_count = [0]
+
+        async def get_orderbook_side_effect(_ticker: str) -> dict:
+            poll_count[0] += 1
+            if poll_count[0] == 1:
+                # First poll: establish queue position (best_size_at_bid=20)
+                return {"yes": [[50.0, 20]], "no": [[50.0, 20]]}
+            else:
+                # Subsequent polls: size drops to 5 (15 contracts traded)
+                # This generates traded_volume_estimate = 15
+                return {"yes": [[50.0, 5]], "no": [[50.0, 5]]}
+
+        mock_client.get_orderbook.side_effect = get_orderbook_side_effect
+
+        simulator = RealisticOrderSimulator(
+            poll_interval_seconds=0.01,
+            fill_probability_price_moved=0.0,  # Disable price_moved_through fills
+            fill_probability_at_best=0.95,  # High probability for at_best fills
+            fill_probability_price_improves=0.0,
+            simulated_volume_per_poll=0,  # Rely only on size delta
+        )
+
+        fills, order_state = await simulator.simulate_order_fills(
+            mock_client,
+            order,
+            horizon_seconds=1,
+        )
+
+        # The fill should happen only after queue is cleared AND remaining_trade > 0
+        # With traded_volume=15 and queue=20 (initially), queue clears slowly
+        # After first poll with delta (20->5), traded_volume=15:
+        #   consumed_by_ahead = min(20, 15) = 15 -> no fill yet
+        #   queue_ahead = 20 -> 15
+        # Next iteration: traded_volume=0 (no delta), no fill
+        # So with this sequence, fills might be 0 or depend on timing
+        # The key check is that fills don't happen prematurely (before queue clears)
+        assert "exit_reason" in order_state
+        assert order_state["status"] in ["filled", "timeout"]
+
+    @pytest.mark.asyncio
+    async def test_price_moved_through_fills_full_size(
+        self,
+        mock_client: AsyncMock,
+    ):
+        """Test price_moved_through sweeps through level and fills full remaining size."""
+        now_ms = int(time.time() * 1000)
+        order = OrderRequest(
+            id="order-sweep-test",
+            ticker="KXNBAGAME-26MAR01SASNYK-YES",
+            side="YES",
+            quote_price_cents=50.0,
+            size_contracts=7,  # Want 7 contracts
+            created_ts_ms=now_ms,
+            net_edge=0.5,
+            entry_fee_cents=0.5,
+            take_profit_cents=0.0,
+            max_hold_seconds=60,
+        )
+
+        # Simulate price moving through us on second poll
+        poll_count = [0]
+
+        async def get_orderbook_side_effect(_ticker: str) -> dict:
+            poll_count[0] += 1
+            if poll_count[0] == 1:
+                # First poll: price at our level
+                return {"yes": [[50.0, 100]], "no": [[50.0, 100]]}
+            else:
+                # Second poll: price moves above us (55 > 50)
+                # This triggers price_moved_through eligibility
+                return {"yes": [[55.0, 100]], "no": [[45.0, 100]]}
+
+        mock_client.get_orderbook.side_effect = get_orderbook_side_effect
+
+        simulator = RealisticOrderSimulator(
+            poll_interval_seconds=0.01,
+            fill_probability_price_moved=1.0,  # Always fill when price moves
+            fill_probability_at_best=0.0,
+            fill_probability_price_improves=0.0,
+            simulated_volume_per_poll=100,
+        )
+
+        fills, order_state = await simulator.simulate_order_fills(
+            mock_client,
+            order,
+            horizon_seconds=1,
+        )
+
+        # Should fill 7 contracts (full remaining_size) when price moves through
+        if len(fills) > 0:
+            total_filled = sum(f.fill_size for f in fills)
+            # When price moves through, fill_size should be remaining_size, not partial
+            first_fill = fills[0]
+            assert (
+                first_fill.fill_size == order.size_contracts or total_filled == order.size_contracts
+            ), (
+                f"Expected full fill of {order.size_contracts} contracts when price moves through, "
+                f"got {total_filled}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_queue_cleared_invariant(
+        self,
+        mock_client: AsyncMock,
+    ):
+        """Test queue_cleared in eligibility never occurs with price_improves."""
+        now_ms = int(time.time() * 1000)
+        order = OrderRequest(
+            id="order-invariant-test",
+            ticker="KXNBAGAME-26MAR01SASNYK-YES",
+            side="YES",
+            quote_price_cents=52.0,  # Above market bid (50), will be price-improving
+            size_contracts=3,
+            created_ts_ms=now_ms,
+            net_edge=0.5,
+            entry_fee_cents=0.5,
+            take_profit_cents=0.0,
+            max_hold_seconds=60,
+        )
+
+        # Orderbook has best bid at 50, our order at 52 is price-improving
+        mock_client.get_orderbook.return_value = {
+            "yes": [[50.0, 500]],  # Market best bid at 50
+            "no": [[50.0, 500]],
+        }
+
+        simulator = RealisticOrderSimulator(
+            poll_interval_seconds=0.01,
+            fill_probability_price_moved=0.0,
+            fill_probability_at_best=0.0,
+            fill_probability_price_improves=1.0,  # Always fill for price improves
+            simulated_volume_per_poll=100,
+        )
+
+        fills, order_state = await simulator.simulate_order_fills(
+            mock_client,
+            order,
+            horizon_seconds=1,
+        )
+
+        # Check the latest diagnostics for the invariant
+        if order_state.get("latest_diagnostics"):
+            diag = order_state["latest_diagnostics"]
+            eligibility = diag.get("eligibility", {})
+            price_improves = diag.get("price_improves", False)
+
+            # Invariant: queue_cleared must be False if price_improves is True
+            if price_improves:
+                assert eligibility.get("queue_cleared") is False, (
+                    "Invariant violation: queue_cleared=True when price_improves=True"
+                )

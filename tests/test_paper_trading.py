@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from kalshi_edge_engine.engine.fees import estimate_maker_fee_cents
 from kalshi_edge_engine.engine.paper import (
     QuoteIntent,
     build_quote_intents,
@@ -312,3 +313,37 @@ class TestSimulateFill:
         # Outcome note could be either "timeout" or contain "error" - just check it's not successful
         assert outcome.note in ("timeout", "error: API error")
         assert outcome.pnl_cents == 0.0
+
+    @pytest.mark.asyncio
+    async def test_mark_to_market_outcome_charges_entry_fee_only(
+        self, sample_valid_signal: Signal
+    ) -> None:
+        """Round-trip flag should not add synthetic exit fee without an exit trade."""
+        intent = QuoteIntent(
+            id="test-intent-6",
+            ticker=sample_valid_signal.ticker,
+            side="YES",
+            quote_price_cents=50.0,
+            size_contracts=1,
+            created_ts_ms=int(time.time() * 1000),
+            net_edge=0.5,
+            inside_width=1.5,
+            imbalance_gap=5.0,
+            fee_mode="maker",
+            round_trip=True,
+        )
+
+        mock_client = AsyncMock()
+        mock_client.get_orderbook = AsyncMock(
+            return_value={
+                "yes": [[51.0, 100]],
+                "no": [[45.0, 100]],
+            }
+        )
+
+        _fill, outcome = await simulate_fill(mock_client, intent, horizon_seconds=5)
+
+        expected_entry_fee = estimate_maker_fee_cents(
+            intent.quote_price_cents, intent.size_contracts
+        )
+        assert outcome.total_fees_cents == pytest.approx(expected_entry_fee)

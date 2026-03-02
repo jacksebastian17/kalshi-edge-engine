@@ -86,7 +86,8 @@ def compute_simulator_diagnostics(
 
     best_size_at_bid: int | None = None
     if price_improves:
-        # We are alone at the improved price level.
+        # We are alone at the improved price level (synthetic, doesn't exist in orderbook).
+        # Setting best_size_at_bid=0 is correct, but this is NOT the real book level.
         best_size_at_bid = 0
     elif order.side == "YES" and parsed.bid_yes:
         best_size_at_bid = parsed.bid_yes.size
@@ -124,10 +125,13 @@ def compute_simulator_diagnostics(
     # Estimate traded volume
     if at_best_price:
         if price_improves:
-            # Price-improving orders have no actual volume to trade against
-            traded_volume = 0
+            # Price-improving orders have no actual orderbook volume to trade against.
+            # But they CAN fill via seller arrivals hitting our bid.
+            # traded_volume_estimate represents potential arrival volume, not book delta.
+            # We use simulated_volume_per_poll as a proxy for arrival rate.
+            traded_volume = simulated_volume_per_poll
         elif last_best_size_at_bid is not None and best_size_at_bid is not None:
-            # Use size delta if available
+            # Use size delta if available (from real book level)
             traded_volume = max(0, last_best_size_at_bid - best_size_at_bid)
         else:
             # Fall back to simulated volume only when no size delta available
@@ -135,7 +139,7 @@ def compute_simulator_diagnostics(
     else:
         traded_volume = 0
 
-    queue_ahead_after = max(0, queue_ahead - traded_volume) if at_best_price else queue_ahead
+    queue_ahead_after = queue_ahead
 
     return {
         "chosen_side": order.side,
@@ -158,7 +162,7 @@ def compute_simulator_diagnostics(
             "price_moved_through": price_moved_through,
             "at_best_price": at_best_price,
             "price_moved_away": price_moved_away,
-            "queue_cleared": at_best_price and queue_ahead_after <= 0,
+            "queue_cleared": at_best_price and not price_improves and queue_ahead <= 0,
         },
     }
 
@@ -177,6 +181,16 @@ class OrderRequest:
     entry_fee_cents: float
     take_profit_cents: float
     max_hold_seconds: int
+    entry_fee_per_contract_cents: float | None = None
+
+    @property
+    def effective_entry_fee_per_contract_cents(self) -> float:
+        """Entry fee per contract, with backward-compatible fallback."""
+        if self.entry_fee_per_contract_cents is not None:
+            return self.entry_fee_per_contract_cents
+        if self.size_contracts <= 0:
+            return 0.0
+        return self.entry_fee_cents / self.size_contracts
 
 
 @dataclass
@@ -296,7 +310,26 @@ class RealisticOrderSimulator:
                 cross_yes = diagnostics["cross_yes"]
                 cross_no = diagnostics["cross_no"]
                 eligibility = diagnostics["eligibility"]
-                queue_ahead = diagnostics["queue_ahead_after"]
+                price_improves = diagnostics["price_improves"]
+                traded_volume = diagnostics["traded_volume_estimate"]
+
+                # Queue model: only update when at best price AND order not price-improving
+                # Queue decreases when we have traded volume at our price level
+                if eligibility["at_best_price"] and not price_improves:
+                    # Initialize queue on first time seeing this price level
+                    if (
+                        queue_ahead == 0
+                        and best_size_at_bid is not None
+                        and last_best_size_at_bid is None
+                    ):
+                        queue_ahead = best_size_at_bid
+                    # Queue decreases with traded volume
+                    queue_ahead = max(0, queue_ahead - traded_volume)
+
+                diagnostics["queue_ahead_after"] = queue_ahead
+                diagnostics["eligibility"]["queue_cleared"] = (
+                    eligibility["at_best_price"] and not price_improves and queue_ahead <= 0
+                )
 
                 now_ms = int(time.time() * 1000)
                 last_update_ts_ms = now_ms
@@ -351,9 +384,10 @@ class RealisticOrderSimulator:
                 # Check for fill
                 if eligibility["has_best_bid"]:
                     if eligibility["price_moved_through"]:
-                        # Price moved through us - high probability fill (with probability)
+                        # Price moved through us - high probability fill (with probability).
+                        # Sweep through our level: fill full remaining size.
                         if random.random() < self.fill_probability_price_moved:
-                            fill_size = min(remaining_size, 1)
+                            fill_size = remaining_size
                             fill_ts_ms = now_ms
                             fill = Fill(
                                 id=str(uuid.uuid4()),
@@ -363,7 +397,8 @@ class RealisticOrderSimulator:
                                 fill_size=fill_size,
                                 remaining_size=remaining_size - fill_size,
                                 queue_ahead_at_fill=queue_ahead,
-                                fill_fee_cents=order.entry_fee_cents * fill_size,
+                                fill_fee_cents=order.effective_entry_fee_per_contract_cents
+                                * fill_size,
                             )
                             fills.append(fill)
                             remaining_size = fill.remaining_size
@@ -379,16 +414,19 @@ class RealisticOrderSimulator:
                             )
 
                     elif eligibility["at_best_price"]:
-                        price_improves = diagnostics["price_improves"]
-                        traded_volume = diagnostics["traded_volume_estimate"]
-
                         if price_improves:
-                            # Price-improving order: probabilistic seller arrival fill path
+                            # Price-improving order: explicit seller arrival fill path.
+                            # We're alone at improved price; fills happen when aggressive seller arrives.
+                            # No orderbook delta volume, but we simulate arrival events.
                             if (
                                 remaining_size > 0
                                 and random.random() < self.fill_probability_price_improves
                             ):
-                                fill_size = min(remaining_size, 1)
+                                # Seller arrival! Simulate arrival volume.
+                                arrival_volume = max(
+                                    1, min(remaining_size, self.simulated_volume_per_poll)
+                                )
+                                fill_size = min(remaining_size, arrival_volume)
                                 fill_ts_ms = now_ms
                                 fill = Fill(
                                     id=str(uuid.uuid4()),
@@ -398,38 +436,39 @@ class RealisticOrderSimulator:
                                     fill_size=fill_size,
                                     remaining_size=remaining_size - fill_size,
                                     queue_ahead_at_fill=0,
-                                    fill_fee_cents=order.entry_fee_cents * fill_size,
+                                    fill_fee_cents=order.effective_entry_fee_per_contract_cents
+                                    * fill_size,
                                 )
                                 fills.append(fill)
                                 remaining_size = fill.remaining_size
                                 logger.info(
-                                    "paper_realistic_fill_price_improves",
+                                    "paper_realistic_fill_price_improves_arrival",
                                     extra={
                                         "intent_id": order.id,
                                         "ticker": order.ticker,
                                         "side": order.side,
                                         "fill_price": order.quote_price_cents,
+                                        "fill_size": fill_size,
+                                        "arrival_volume": arrival_volume,
                                         "remaining": remaining_size,
                                     },
                                 )
                         else:
-                            # Non-price-improving order: queue model fill path
-                            # Initialize queue_ahead if first time at best and not set
-                            if queue_ahead == 0 and best_size_at_bid is not None:
-                                queue_ahead = best_size_at_bid
+                            # Non-price-improving order: queue model fill path.
+                            # Separate queue consumption from our fill eligibility:
+                            # traded_volume is first consumed by queue ahead, remaining goes to us.
+                            consumed_by_ahead = min(queue_ahead, traded_volume)
+                            remaining_trade = traded_volume - consumed_by_ahead
 
-                            # Recompute queue_cleared with initialized queue_ahead
-                            queue_ahead_after = max(0, queue_ahead - traded_volume)
-                            queue_cleared = queue_ahead_after <= 0
-
+                            # Only fill if queue is cleared AND we have remaining trade volume
                             if (
-                                queue_cleared
-                                and traded_volume > 0
+                                queue_ahead <= 0
+                                and remaining_trade > 0
                                 and remaining_size > 0
                                 and random.random() < self.fill_probability_at_best
                             ):
                                 # We're at front of queue, fill is probabilistic
-                                fill_size = min(remaining_size, 1)
+                                fill_size = min(remaining_size, max(1, remaining_trade))
                                 fill_ts_ms = now_ms
                                 fill = Fill(
                                     id=str(uuid.uuid4()),
@@ -438,12 +477,12 @@ class RealisticOrderSimulator:
                                     fill_price_cents=order.quote_price_cents,
                                     fill_size=fill_size,
                                     remaining_size=remaining_size - fill_size,
-                                    queue_ahead_at_fill=queue_ahead_after,
-                                    fill_fee_cents=order.entry_fee_cents * fill_size,
+                                    queue_ahead_at_fill=queue_ahead,
+                                    fill_fee_cents=order.effective_entry_fee_per_contract_cents
+                                    * fill_size,
                                 )
                                 fills.append(fill)
                                 remaining_size = fill.remaining_size
-                                queue_ahead = queue_ahead_after
                                 logger.info(
                                     "paper_realistic_fill_queue_cleared",
                                     extra={
@@ -453,12 +492,9 @@ class RealisticOrderSimulator:
                                         "fill_price": order.quote_price_cents,
                                         "remaining": remaining_size,
                                         "traded_volume": traded_volume,
-                                        "queue_ahead_at_fill": queue_ahead_after,
+                                        "queue_ahead_at_fill": queue_ahead,
                                     },
                                 )
-                            else:
-                                # Update queue for next iteration
-                                queue_ahead = queue_ahead_after
 
                     elif eligibility["price_moved_away"]:
                         # Price moved away - no fill
@@ -468,9 +504,8 @@ class RealisticOrderSimulator:
                     last_best_size_at_bid = best_size_at_bid
 
                 # Check exit conditions
-                if remaining_size == 0:
-                    exit_reason = "filled"
-                    break
+                # Note: Check take_profit before "filled" to allow take_profit to trigger
+                # even when order is fully filled
 
                 time_held_seconds = (now_ms - order.created_ts_ms) / 1000.0
                 if time_held_seconds >= order.max_hold_seconds:
@@ -481,14 +516,26 @@ class RealisticOrderSimulator:
                 if order.take_profit_cents > 0.0:
                     exit_mark = cross_yes if order.side == "YES" else cross_no
                     if exit_mark is not None:
-                        unrealized_pnl = (
-                            (exit_mark - order.quote_price_cents) * len(fills)
-                            if len(fills) > 0
-                            else 0.0
-                        )
+                        filled_contracts = sum(fill.fill_size for fill in fills)
+                        if filled_contracts > 0:
+                            # Side-aware PnL: YES profits when mark > entry, NO profits when entry > mark
+                            if order.side == "YES":
+                                unrealized_pnl = (
+                                    exit_mark - order.quote_price_cents
+                                ) * filled_contracts
+                            else:
+                                unrealized_pnl = (
+                                    order.quote_price_cents - exit_mark
+                                ) * filled_contracts
+                        else:
+                            unrealized_pnl = 0.0
                         if unrealized_pnl >= order.take_profit_cents:
                             exit_reason = "take_profit"
                             break
+
+                if remaining_size == 0:
+                    exit_reason = "filled"
+                    break
 
             except Exception as e:
                 logger.debug(

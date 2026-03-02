@@ -463,6 +463,11 @@ async def _process_paper_intents(
                     entry_fee_cents=entry_fee_cents,
                     take_profit_cents=_PAPER_TAKE_PROFIT_CENTS,
                     max_hold_seconds=_PAPER_MAX_HOLD_SECONDS,
+                    entry_fee_per_contract_cents=(
+                        entry_fee_cents / intent_param.size_contracts
+                        if intent_param.size_contracts > 0
+                        else 0.0
+                    ),
                 )
 
                 # Run realistic fill simulation
@@ -1530,9 +1535,22 @@ async def get_paper_summary() -> dict[str, Any]:
 
 
 async def get_paper_config() -> dict[str, Any]:
-    """Return current paper trading configuration."""
+    """Return current paper trading configuration.
+
+    Returns:
+        Configuration dict with:
+        - configured: Whether paper trading is enabled in env (ENABLE_PAPER_TRADING)
+        - enabled: Runtime enabled flag (can be toggled by POST /paper/start/stop)
+        - active: Whether paper trading is actually processing fills right now
+                  (enabled=true AND has running simulation tasks)
+    """
+    # Check if there are active simulation tasks
+    active = len(_paper_simulation_tasks) > 0 and _paper_enabled
+
     return {
+        "configured": _ENABLE_PAPER_TRADING,
         "enabled": _paper_enabled,
+        "active": active,
         "min_edge_cents": _PAPER_MIN_EDGE_CENTS,
         "fill_horizon_seconds": _PAPER_FILL_HORIZON_SECONDS,
         "poll_interval_seconds": _PAPER_POLL_INTERVAL_SECONDS,
@@ -1574,6 +1592,11 @@ async def get_paper_debug_intent(intent_id: str, request: Request) -> dict[str, 
         entry_fee_cents=float(intent["entry_fee_cents"] or 0.0),
         take_profit_cents=float(intent["take_profit_cents"] or _PAPER_TAKE_PROFIT_CENTS),
         max_hold_seconds=int(intent["max_hold_seconds"] or _PAPER_MAX_HOLD_SECONDS),
+        entry_fee_per_contract_cents=(
+            float(intent["entry_fee_cents"] or 0.0) / int(intent["size_contracts"])
+            if int(intent["size_contracts"]) > 0
+            else 0.0
+        ),
     )
 
     diagnostics = compute_simulator_diagnostics(
