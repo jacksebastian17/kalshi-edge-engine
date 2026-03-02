@@ -109,34 +109,17 @@ class TestNBAUniverseEndpoint:
     """Test /universe/nba endpoint."""
 
     def test_nba_universe_success(self, client: TestClient) -> None:
-        """Test successful NBA universe retrieval."""
+        """Test successful NBA universe retrieval with KXNBAGAME series."""
         # Reset cache before test
         import kalshi_edge_engine.engine.universe as universe_module
 
         universe_module._nba_universe_cache = None
 
         mock_client = AsyncMock()
-        mock_client.get_series = AsyncMock(
-            return_value={
-                "series": [
-                    {"ticker": "KXNBA", "category": "sports", "title": "NBA Games"},
-                ],
-                "cursor": None,
-            }
-        )
-        mock_client.get_events = AsyncMock(
-            return_value={
-                "events": [
-                    {"event_ticker": "kxnbagame-26mar01"},
-                    {"event_ticker": "KXNBAGAME-26MAR02"},
-                ],
-                "cursor": None,
-            }
-        )
         mock_client.get_markets = AsyncMock(
             return_value={
                 "markets": [
-                    {"ticker": "kxnbagame-26mar01-t1"},
+                    {"ticker": "KXNBAGAME-26MAR01-T1"},
                     {"ticker": "KXNBAGAME-26MAR01-T2"},
                     {"ticker": "KXNBAGAME-26MAR02-T1"},
                 ],
@@ -149,8 +132,8 @@ class TestNBAUniverseEndpoint:
 
         assert response.status_code == 200
         data = response.json()
-        assert data["series_ticker"] == "KXNBA"
-        assert data["event_tickers"] == ["KXNBAGAME-26MAR01", "KXNBAGAME-26MAR02"]
+        assert data["series_ticker"] == "KXNBAGAME"
+        assert data["event_tickers"] == []  # Not used in new approach
         assert data["market_tickers"] == [
             "KXNBAGAME-26MAR01-T1",
             "KXNBAGAME-26MAR01-T2",
@@ -158,35 +141,18 @@ class TestNBAUniverseEndpoint:
         ]
 
     def test_nba_universe_uppercase_dedup(self, client: TestClient) -> None:
-        """Test that tickers are uppercased and deduplicated."""
+        """Test that tickers are deduplicated."""
         # Reset cache before test
         import kalshi_edge_engine.engine.universe as universe_module
 
         universe_module._nba_universe_cache = None
 
         mock_client = AsyncMock()
-        mock_client.get_series = AsyncMock(
-            return_value={
-                "series": [
-                    {"ticker": "KXNBA", "category": "sports", "title": "NBA Games"},
-                ],
-                "cursor": None,
-            }
-        )
-        mock_client.get_events = AsyncMock(
-            return_value={
-                "events": [
-                    {"event_ticker": "kxnbagame-26mar01"},
-                    {"event_ticker": "KXNBAGAME-26MAR01"},  # Duplicate different case
-                ],
-                "cursor": None,
-            }
-        )
         mock_client.get_markets = AsyncMock(
             return_value={
                 "markets": [
-                    {"ticker": "kxnbagame-26mar01-t1"},
-                    {"ticker": "KXNBAGAME-26MAR01-T1"},  # Duplicate different case
+                    {"ticker": "KXNBAGAME-26MAR01-T1"},
+                    {"ticker": "KXNBAGAME-26MAR01-T1"},  # Duplicate
                 ],
                 "cursor": None,
             }
@@ -198,7 +164,7 @@ class TestNBAUniverseEndpoint:
         assert response.status_code == 200
         data = response.json()
         # Should be deduplicated
-        assert data["event_tickers"] == ["KXNBAGAME-26MAR01"]
+        assert data["event_tickers"] == []  # Not used in new approach
         assert data["market_tickers"] == ["KXNBAGAME-26MAR01-T1"]
 
     def test_nba_universe_stable_ordering(self, client: TestClient) -> None:
@@ -209,24 +175,6 @@ class TestNBAUniverseEndpoint:
         universe_module._nba_universe_cache = None
 
         mock_client = AsyncMock()
-        mock_client.get_series = AsyncMock(
-            return_value={
-                "series": [
-                    {"ticker": "KXNBA", "category": "sports", "title": "NBA Games"},
-                ],
-                "cursor": None,
-            }
-        )
-        mock_client.get_events = AsyncMock(
-            return_value={
-                "events": [
-                    {"event_ticker": "KXNBAGAME-26MAR03"},
-                    {"event_ticker": "KXNBAGAME-26MAR01"},
-                    {"event_ticker": "KXNBAGAME-26MAR02"},
-                ],
-                "cursor": None,
-            }
-        )
         mock_client.get_markets = AsyncMock(
             return_value={
                 "markets": [
@@ -244,11 +192,7 @@ class TestNBAUniverseEndpoint:
         assert response.status_code == 200
         data = response.json()
         # Should be sorted
-        assert data["event_tickers"] == [
-            "KXNBAGAME-26MAR01",
-            "KXNBAGAME-26MAR02",
-            "KXNBAGAME-26MAR03",
-        ]
+        assert data["event_tickers"] == []  # Not used in new approach
         assert data["market_tickers"] == [
             "KXNBAGAME-26MAR01-T1",
             "KXNBAGAME-26MAR01-T2",
@@ -263,7 +207,7 @@ class TestNBAUniverseEndpoint:
         universe_module._nba_universe_cache = None
 
         mock_client = AsyncMock()
-        mock_client.get_series = AsyncMock(side_effect=KalshiAuthError("Missing credentials"))
+        mock_client.get_markets = AsyncMock(side_effect=KalshiAuthError("Missing credentials"))
         client.app.state.kalshi_client = mock_client
 
         response = client.get("/universe/nba")
@@ -279,7 +223,7 @@ class TestNBAUniverseEndpoint:
         universe_module._nba_universe_cache = None
 
         mock_client = AsyncMock()
-        mock_client.get_series = AsyncMock(
+        mock_client.get_markets = AsyncMock(
             side_effect=KalshiAPIError("API error: 500 Server Error")
         )
         client.app.state.kalshi_client = mock_client
