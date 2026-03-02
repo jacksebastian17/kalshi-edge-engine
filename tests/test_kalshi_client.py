@@ -453,3 +453,53 @@ class TestKalshiClientSignaturePath:
                 assert "TEST-TICKER" in path
                 assert "orderbook" in path
                 assert path.startswith("/")
+
+    @pytest.mark.asyncio
+    async def test_authenticated_request_signature_path(self) -> None:
+        """Test that _authenticated_request signs the full URL path including base_url prefix."""
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "KALSHI_API_KEY_ID": "test_key_id",
+                    "KALSHI_API_SECRET": MOCK_PEM_KEY.decode("utf-8"),
+                    "KALSHI_BASE_URL": "https://api.example.com/trade-api/v2",
+                },
+            ),
+            patch(
+                "kalshi_edge_engine.kalshi.client.serialization.load_pem_private_key"
+            ) as mock_load,
+        ):
+            mock_private_key = MagicMock()
+            mock_private_key.sign.return_value = b"mock_signature"
+            mock_load.return_value = mock_private_key
+
+            client = KalshiClient()
+
+            # Capture what path is signed
+            captured_paths: list[str] = []
+            original_sign = client._sign_request
+
+            def capture_sign(timestamp_ms: int, method: str, path: str) -> str:
+                captured_paths.append(path)
+                return original_sign(timestamp_ms, method, path)
+
+            client._sign_request = capture_sign  # type: ignore
+
+            with patch("kalshi_edge_engine.kalshi.client.httpx.AsyncClient") as mock_client_class:
+                mock_response = MagicMock()
+                mock_response.status_code = 200
+                mock_response.json.return_value = {"series": []}
+                mock_response.raise_for_status.return_value = None
+
+                mock_http_client = AsyncMock()
+                mock_http_client.request = AsyncMock(return_value=mock_response)
+                mock_client_class.return_value = mock_http_client
+
+                await client.get_series()
+
+                # Verify path was derived from full URL
+                assert len(captured_paths) == 1
+                path = captured_paths[0]
+                # Path should be /trade-api/v2/series (not just /series)
+                assert path == "/trade-api/v2/series"

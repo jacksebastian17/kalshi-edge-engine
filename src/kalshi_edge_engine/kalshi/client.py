@@ -236,3 +236,173 @@ class KalshiClient:
                 },
             )
             raise KalshiAPIError(f"Request failed for {ticker}: {str(e)}") from e
+
+    async def _authenticated_request(
+        self,
+        method: str,
+        path: str,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Make an authenticated request to Kalshi API.
+
+        Args:
+            method: HTTP method (GET, POST, etc.).
+            path: Request path (e.g., /series).
+            params: Optional query parameters.
+
+        Returns:
+            JSON response from Kalshi API.
+
+        Raises:
+            KalshiAPIError: If the API request fails.
+        """
+        url = f"{self.base_url}{path}"
+        # Derive path from URL to ensure signature matches actual request
+        parsed_url = urlparse(url)
+        sign_path = parsed_url.path
+        timestamp_ms = int(time.time() * 1000)
+        signature = self._sign_request(timestamp_ms, method, sign_path)
+
+        headers: dict[str, str] = {
+            "KALSHI-ACCESS-KEY": self.api_key_id,
+            "KALSHI-ACCESS-TIMESTAMP": str(timestamp_ms),
+            "KALSHI-ACCESS-SIGNATURE": signature,
+        }
+
+        try:
+            client = await self._get_client()
+            response = await client.request(
+                method,
+                url,
+                headers=headers,
+                params=params,
+                timeout=10.0,
+            )
+            response.raise_for_status()
+            data: dict[str, Any] = response.json()
+            return data
+        except httpx.HTTPStatusError as e:
+            logger.error(
+                "api_request_status_error",
+                extra={
+                    "method": method,
+                    "path": path,
+                    "status_code": e.response.status_code,
+                    "error": str(e),
+                },
+            )
+            raise KalshiAPIError(f"API error {method} {path}: {e.response.status_code}") from e
+        except httpx.RequestError as e:
+            logger.error(
+                "api_request_error",
+                extra={
+                    "method": method,
+                    "path": path,
+                    "error": str(e),
+                },
+            )
+            raise KalshiAPIError(f"Request failed {method} {path}: {str(e)}") from e
+
+    async def get_series(
+        self,
+        limit: int = 200,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        """Fetch series (event groups) from Kalshi API.
+
+        Args:
+            limit: Maximum number of series to return (default 200).
+            cursor: Pagination cursor from previous response (optional).
+
+        Returns:
+            Response containing series list and optional cursor.
+            Format: {"series": [...], "cursor": "..."}
+
+        Raises:
+            KalshiAPIError: If the API request fails.
+        """
+        params: dict[str, Any] = {"limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+
+        return await self._authenticated_request("GET", "/series", params)
+
+    async def get_events(
+        self,
+        series_ticker: str | None = None,
+        status: str | None = None,
+        with_nested_markets: bool = False,
+        limit: int = 200,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        """Fetch events from Kalshi API.
+
+        Args:
+            series_ticker: Filter by series ticker (optional).
+            status: Filter by status (e.g., 'open') (optional).
+            with_nested_markets: Include nested market data (optional).
+            limit: Maximum number of events to return (default 200).
+            cursor: Pagination cursor from previous response (optional).
+
+        Returns:
+            Response containing events list and optional cursor.
+            Format: {"events": [...], "cursor": "..."}
+
+        Raises:
+            KalshiAPIError: If the API request fails.
+        """
+        params: dict[str, Any] = {"limit": limit}
+        if series_ticker:
+            params["series_ticker"] = series_ticker
+        if status:
+            params["status"] = status
+        if with_nested_markets:
+            params["with_nested_markets"] = "true"
+        if cursor:
+            params["cursor"] = cursor
+
+        return await self._authenticated_request("GET", "/events", params)
+
+    async def get_markets(
+        self,
+        series_ticker: str | None = None,
+        event_ticker: str | None = None,
+        status: str | None = None,
+        min_close_ts: int | None = None,
+        max_close_ts: int | None = None,
+        limit: int = 200,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        """Fetch markets from Kalshi API.
+
+        Args:
+            series_ticker: Filter by series ticker (optional).
+            event_ticker: Filter by event ticker (optional).
+            status: Filter by status (e.g., 'open') (optional).
+            min_close_ts: Minimum close timestamp filter (optional).
+            max_close_ts: Maximum close timestamp filter (optional).
+            limit: Maximum number of markets to return (default 200).
+            cursor: Pagination cursor from previous response (optional).
+
+        Returns:
+            Response containing markets list and optional cursor.
+            Format: {"markets": [...], "cursor": "..."}
+
+        Raises:
+            KalshiAPIError: If the API request fails.
+        """
+        params: dict[str, Any] = {"limit": limit}
+        if series_ticker:
+            params["series_ticker"] = series_ticker
+        if event_ticker:
+            params["event_ticker"] = event_ticker
+        if status:
+            params["status"] = status
+        if min_close_ts is not None:
+            params["min_close_ts"] = min_close_ts
+        if max_close_ts is not None:
+            params["max_close_ts"] = max_close_ts
+        if cursor:
+            params["cursor"] = cursor
+
+        return await self._authenticated_request("GET", "/markets", params)

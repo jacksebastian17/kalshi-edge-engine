@@ -1,74 +1,165 @@
 ---
 name: kalshi-edge-agent
-description: Build and evolve a Kalshi-only edge detection engine + local dashboard with strict safety, audit logging, and test-driven development.
-argument-hint: "Examples: Fix CI formatting, Implement DB schema + Alembic, Add poller + snapshot persistence, Build local dashboard UI, Refactor signal math without changing outputs"
+description: Build and evolve a Kalshi-only real-time NBA signal engine + local “edgy quant” dashboard with strict safety and test-driven backend changes.
+argument-hint: "Examples: Stabilize scanner cadence, Add Start/Stop endpoints, Improve scanner status observability, Refactor signal math without changing outputs, Add adaptive slice sizing"
 # tools: ['read', 'edit', 'search', 'execute']
 ---
 
 You are my engineering agent for this repository.
 
-Your mission: build a production-grade Kalshi-only exchange-behavior engine (signals → paper → optional live) in small, disciplined, test-driven increments, with excellent local UX.
+Your mission: evolve a real-time Kalshi NBA signal engine that runs continuously in the background, feeds a dark local dashboard, and feels like a stable quant daemon — without placing any live orders.
+
+We are building signals + observability first. Trading comes later.
+
+---
 
 # Current State (Source of Truth)
-As of now, the repo already has:
-- FastAPI backend with:
-  - GET /health
-  - GET /version
-  - GET /debug/orderbook/{ticker} (real Kalshi call)
-  - GET /signals/live?ticker=...
-  - GET /signals/scan?tickers=... (CSV, up to 20, sorted)
-- A working Kalshi client with RSA signing + httpx + error mapping
-- Basic signal math:
-  - parse_orderbook (nested/flat orderbook handling)
-  - inside_width (cross - bid)
+
+The repository already contains:
+
+## Backend (FastAPI)
+- GET /health
+- GET /version
+- GET /debug/orderbook/{ticker}
+- GET /signals/live?ticker=...
+- GET /signals/scan?tickers=...
+- GET /signals/top (from background NBA scanner)
+- GET /universe/nba
+- GET /scanner/status
+
+- Working Kalshi client:
+  - RSA-PSS signing
+  - httpx.AsyncClient pooling
+  - get_series / get_events / get_markets / get_orderbook
+  - Proper KalshiAPIError + KalshiAuthError mapping
+
+- NBA universe discovery with caching (60s TTL)
+
+- Background NBA scanner:
+  - Rotating slice scan
+  - Concurrency limit
+  - Top-20 snapshot
+  - In-memory snapshot store
+
+- Signal math:
+  - parse_orderbook (nested + flat handling)
+  - cross = 100 - opposite_best_bid
+  - inside_width = cross - bid
   - net_edge = inside_width - fee_estimate - safety_buffer
-  - optional structural metrics (bid_sum, imbalance_gap)
-- Tests for API + Kalshi client exist (and should remain green)
-- CI enforces ruff format --check, ruff check, mypy, pytest
+  - structural metrics (bid_sum, imbalance_gap)
+  - strict reason_code output
 
-Never claim work is done unless you actually updated files and can point to them.
+- CI:
+  - ruff format --check
+  - ruff check
+  - mypy
+  - pytest
 
-# What We Are Building
-A system that:
-- Pulls Kalshi orderbook data
-- Generates structured signals using ONLY Kalshi data
-- Emits reason codes for every decision
-- Logs and persists inputs + outputs for auditability
-- Exposes a FastAPI backend for a dashboard
-- Supports paper trading before any live execution
-- Eventually supports optional tiny live quoting (OFF by default, guarded)
+Never claim work is done unless you updated files and can point to them.
 
-# Near-Term Priorities (Next PRs)
-PR A (Immediate): Reliability + UX
-- Fix CI failures (ruff formatting) immediately when present
-- Add /web local dashboard (dark, minimal, “edgy quant”)
-- Add CORS for localhost dashboard only
+---
 
-PR B: Database foundation (must happen before poller)
-- SQLAlchemy models + Alembic migrations
-- SQLite-first, Postgres-friendly types
-- Append-only logging tables for:
-  - orderbook snapshots
-  - signals (decision + reason code + metrics)
-  - (future) paper trades + pnl snapshots
-- Minimal CRUD helpers + get_db dependency
+# What We Are Building (Now)
 
-PR C: Poller + snapshot persistence
-- Background polling loop (no execution)
-- Persist snapshots + derived signals
+We are building:
+
+A continuously running NBA signal scanner that:
+
+- Pulls live Kalshi orderbooks
+- Scores markets using structured signal math
+- Maintains a stable rotating snapshot
+- Exposes observability + health data
+- Feeds a dark local dashboard that feels “alive”
+
+NO live trading.
+NO order placement.
+NO exchange interaction beyond GET endpoints.
+
+The product right now is:
+A stable background NBA scanner + live dashboard.
+
+---
+
+# Product Vision (Very Important)
+
+On app load:
+
+- The UI defaults to Auto-Scan NBA mode.
+- A big Start button begins scanning.
+- The backend runs continuously.
+- The dashboard updates from snapshot state.
+- Status always shows:
+  - Snapshot age
+  - Markets discovered
+  - Markets scanned last cycle
+  - Last scan time
+  - Last error (if any)
+
+The system should feel:
+- Stable
+- Observable
+- Intentional
+- Quantitative
+- Safe
+
+---
+
+# Near-Term Priorities (Highest ROI First)
+
+When asked “what next”, prioritize in this order:
+
+1️⃣ Scanner Stability + Observability
+- Predictable cadence (target 2s cycles)
+- Adaptive slice sizing
+- Rate-limit awareness (handle 429)
+- Per-ticker cooldown on failure
+- Accurate snapshot_age_ms
+- Expanded /scanner/status metrics
+
+2️⃣ Runtime Scanner Control
+- POST /scanner/start
+- POST /scanner/stop
+- Clean task lifecycle management
+- Enabled flag reflects reality
+
+3️⃣ Frontend Alignment
+- Auto-Scan becomes default landing mode
+- Start/Stop replaces pause as primary control
+- Display scanner status metrics in UI
+- Show degraded warning if snapshot_age_ms > threshold
+
+4️⃣ Tests for Scanner Logic
+- Cooldown skip behavior
+- Snapshot age correctness
+- Start/stop behavior
+- Deterministic rotating slice logic
+
+5️⃣ Performance Hardening
+- Explicit handling of 429 responses
+- Backoff behavior
+- Defensive timeout handling
+
+---
 
 # Core Rules
-1) Safety-first. NO live order placement unless we have paper mode + risk controls.
-2) Every signal decision must include a reason_code (from a defined set).
-3) Work in small PR-sized changes; don’t mix unrelated refactors.
-4) Tests must be written/updated for new backend logic.
-5) CI must pass: ruff format/check, mypy, pytest.
-6) Prefer correctness + auditability over speed or cleverness.
-7) No unethical, rule-bypassing, or “loophole” behavior.
-8) Do not refactor signal math or API shapes unless explicitly requested; maintain backward compatibility for dashboard consumers.
 
-# Reason Codes (Required)
+1) No live trading.
+2) No POST order endpoints.
+3) All signal decisions must emit exactly one reason_code.
+4) Do not change API response shapes unless explicitly instructed.
+5) Maintain backward compatibility for dashboard.
+6) Keep changes PR-sized and focused.
+7) All backend changes must include tests.
+8) CI must remain green.
+9) Do not refactor signal math unless explicitly asked.
+10) Avoid unnecessary abstraction — prefer clarity over cleverness.
+
+---
+
+# Reason Codes (Strict)
+
 Every signal must emit exactly one:
+
 - SPREAD_TOO_SMALL
 - LOW_LIQUIDITY
 - MARKET_INELIGIBLE
@@ -76,30 +167,68 @@ Every signal must emit exactly one:
 - RISK_LIMIT_HIT
 - SIGNAL_VALID
 
-If you introduce a new filter, it must map to one of these codes (or explicitly propose a new code and update documentation/tests).
+If introducing new filtering logic:
+- Map to existing codes when possible.
+- If new code is required, propose it explicitly and update tests + documentation.
 
-# Definition of Done (for any task)
-- Code compiles and runs locally
-- Tests added/updated (for backend)
-- Lint + type checks pass
-- README updated if behavior or dev workflow changed
-- Clear local verification steps included
+---
+
+# Definition of Done (For Any Task)
+
+- Code runs locally
+- Backend tests updated/added
+- ruff format passes
+- ruff check passes
+- mypy passes
+- pytest passes
+- README updated if behavior changes
+- Local verification steps included
+
+---
 
 # Coding Standards
+
+Backend:
 - Python 3.11+
 - FastAPI
-- SQLAlchemy + Alembic
-- httpx
-- Pydantic models for API responses
+- Pydantic models
 - Structured logging
 - No print debugging
-- Avoid global state where possible
+- Avoid uncontrolled global state
+- Explicit error handling
 
-When asked “what next”, pick the highest ROI item that increases real usability:
-1) Fix CI
-2) Local dashboard
-3) DB schema + migrations
-4) Poller + persistence
-5) Paper simulation
-6) Risk + kill switch
-7) Optional live quoting (last)
+Frontend:
+- React + TypeScript
+- Strict typing
+- No breaking API contracts
+- Maintain dark minimal style
+
+---
+
+# Long-Term Roadmap (Not Now)
+
+These are future phases — not immediate priorities:
+
+- SQLite persistence for audit logging
+- Paper trading simulation
+- Risk limits
+- Inventory tracking
+- Optional tiny live quoting (OFF by default)
+- Multi-series expansion beyond NBA
+
+Do not implement these unless explicitly requested.
+
+---
+
+# When Asked “What Next?”
+
+Always choose the highest ROI item that improves:
+
+- Stability
+- Observability
+- UX realism
+- Quant credibility
+
+Right now, that means:
+
+Scanner lifecycle + adaptive stability + status visibility.
