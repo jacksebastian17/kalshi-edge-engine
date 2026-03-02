@@ -212,3 +212,7 @@ __marimo__/
 web/node_modules/
 web/dist/
 web/.vite/
+
+# Local paper trading database
+paper_trading.db
+*.db

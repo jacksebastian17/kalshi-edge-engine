@@ -1,11 +1,18 @@
 """Tests for API endpoints."""
 
+import contextlib
+import gc
+import os
+import tempfile
+import time
 from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
 
 from kalshi_edge_engine.api.main import create_app
+from kalshi_edge_engine.db.paper_store import PaperStore
+from kalshi_edge_engine.engine.paper import QuoteIntent
 from kalshi_edge_engine.kalshi.client import KalshiAPIError, KalshiAuthError
 
 
@@ -334,6 +341,101 @@ class TestTopSignalsEndpoint:
         # First signal should be TICKER-0 (highest edge)
         assert data["signals"][0]["ticker"] == "TICKER-0"
 
+
+class TestPaperDebugEndpoints:
+    """Test paper debug endpoints for simulator diagnostics and force-fill."""
+
+    def test_paper_debug_intent_returns_diagnostics(self, client: TestClient) -> None:
+        """GET /paper/debug/intent/{id} returns computed simulator diagnostics."""
+        import kalshi_edge_engine.api.main as main_module
+
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            store = PaperStore(db_path=db_path)
+            intent = QuoteIntent(
+                id="intent-debug-1",
+                ticker="KXNBAGAME-26MAR01SASNYK-SAS",
+                side="YES",
+                quote_price_cents=50.0,
+                size_contracts=1,
+                created_ts_ms=int(time.time() * 1000),
+                net_edge=1.0,
+                inside_width=2.0,
+                imbalance_gap=0.0,
+                fee_mode="maker",
+                round_trip=True,
+            )
+            store.insert_intent(intent)
+            store.update_intent_status(intent.id, "OPEN", last_seen_best_bid=49.0, queue_ahead=2)
+            main_module._paper_store = store
+
+            mock_client = AsyncMock()
+            mock_client.get_orderbook = AsyncMock(
+                return_value={"yes": [[51.0, 100]], "no": [[45.0, 80]]}
+            )
+            client.app.state.kalshi_client = mock_client
+
+            response = client.get(f"/paper/debug/intent/{intent.id}")
+            assert response.status_code == 200
+            data = response.json()
+            assert data["intent"]["id"] == intent.id
+            assert data["top_of_book"]["yes"]["best_bid_price"] == 51.0
+            assert data["simulator"]["eligibility"]["has_best_bid"] is True
+        finally:
+            main_module._paper_store = None
+            gc.collect()
+            if os.path.exists(db_path):
+                with contextlib.suppress(OSError):
+                    os.unlink(db_path)
+
+    def test_paper_debug_force_fill_writes_fill_and_position(self, client: TestClient) -> None:
+        """POST /paper/debug/force-fill inserts synthetic fill and upserts position."""
+        import kalshi_edge_engine.api.main as main_module
+
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            store = PaperStore(db_path=db_path)
+            intent = QuoteIntent(
+                id="intent-force-1",
+                ticker="KXNBAGAME-26MAR01SASNYK-SAS",
+                side="YES",
+                quote_price_cents=53.0,
+                size_contracts=1,
+                created_ts_ms=int(time.time() * 1000),
+                net_edge=1.2,
+                inside_width=2.2,
+                imbalance_gap=0.0,
+                fee_mode="maker",
+                round_trip=True,
+            )
+            store.insert_intent(intent)
+            store.update_intent_status(intent.id, "OPEN")
+            main_module._paper_store = store
+
+            response = client.post(f"/paper/debug/force-fill?intent_id={intent.id}&fill_size=1")
+            assert response.status_code == 200
+            data = response.json()
+            assert data["intent_id"] == intent.id
+            assert data["filled_size"] == 1
+            assert data["status"] == "FILLED"
+
+            fills = store.get_recent_fills(limit=10)
+            assert len(fills) == 1
+            assert fills[0]["intent_id"] == intent.id
+
+            positions = store.get_positions()
+            assert len(positions) == 1
+            assert positions[0]["ticker"] == intent.ticker
+            assert positions[0]["side"] == intent.side
+        finally:
+            main_module._paper_store = None
+            gc.collect()
+            if os.path.exists(db_path):
+                with contextlib.suppress(OSError):
+                    os.unlink(db_path)
+
     def test_signals_top_respects_limit(self, client: TestClient) -> None:
         """Test that endpoint respects n parameter."""
         import kalshi_edge_engine.api.main as main_module
@@ -413,3 +515,120 @@ class TestTopSignalsEndpoint:
         data = response.json()
         # Should return only 5 signals
         assert len(data["signals"]) == 5
+
+
+class TestPaperTradingControl:
+    """Tests for paper trading start/stop endpoints."""
+
+    def test_paper_start_succeeds_when_enabled(self, client: TestClient) -> None:
+        """POST /paper/start should succeed when paper trading is enabled."""
+        import kalshi_edge_engine.api.main as main_module
+
+        # Setup: Initialize paper store and enable trading
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            store = PaperStore(db_path=db_path)
+            main_module._paper_store = store
+            main_module._ENABLE_PAPER_TRADING = True
+            main_module._paper_enabled = False
+
+            response = client.post("/paper/start")
+
+            assert response.status_code == 200
+            data = response.json()
+            assert data["started"] is True
+            assert main_module._paper_enabled is True
+        finally:
+            main_module._paper_store = None
+            main_module._ENABLE_PAPER_TRADING = False
+            main_module._paper_enabled = False
+            gc.collect()
+            if os.path.exists(db_path):
+                with contextlib.suppress(OSError):
+                    os.unlink(db_path)
+
+    def test_paper_start_fails_when_disabled(self, client: TestClient) -> None:
+        """POST /paper/start should fail when paper trading is not enabled."""
+        import kalshi_edge_engine.api.main as main_module
+
+        # Ensure paper trading is disabled
+        main_module._ENABLE_PAPER_TRADING = False
+        main_module._paper_store = None
+
+        response = client.post("/paper/start")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["started"] is False
+        assert data["reason"] == "not_available"
+
+    def test_paper_start_already_running(self, client: TestClient) -> None:
+        """POST /paper/start should return already_running if already started."""
+        import kalshi_edge_engine.api.main as main_module
+
+        # Setup
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            store = PaperStore(db_path=db_path)
+            main_module._paper_store = store
+            main_module._ENABLE_PAPER_TRADING = True
+            main_module._paper_enabled = True  # Already running
+
+            response = client.post("/paper/start")
+
+            assert response.status_code == 200
+            data = response.json()
+            assert data["started"] is False
+            assert data["reason"] == "already_running"
+        finally:
+            main_module._paper_store = None
+            main_module._ENABLE_PAPER_TRADING = False
+            main_module._paper_enabled = False
+            gc.collect()
+            if os.path.exists(db_path):
+                with contextlib.suppress(OSError):
+                    os.unlink(db_path)
+
+    def test_paper_stop_succeeds(self, client: TestClient) -> None:
+        """POST /paper/stop should succeed when paper trading is running."""
+        import kalshi_edge_engine.api.main as main_module
+
+        # Setup
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            store = PaperStore(db_path=db_path)
+            main_module._paper_store = store
+            main_module._ENABLE_PAPER_TRADING = True
+            main_module._paper_enabled = True
+
+            response = client.post("/paper/stop")
+
+            assert response.status_code == 200
+            data = response.json()
+            assert data["stopped"] is True
+            assert main_module._paper_enabled is False
+        finally:
+            main_module._paper_store = None
+            main_module._ENABLE_PAPER_TRADING = False
+            main_module._paper_enabled = False
+            gc.collect()
+            if os.path.exists(db_path):
+                with contextlib.suppress(OSError):
+                    os.unlink(db_path)
+
+    def test_paper_stop_not_running(self, client: TestClient) -> None:
+        """POST /paper/stop should return not_running if not started."""
+        import kalshi_edge_engine.api.main as main_module
+
+        # Ensure paper trading is stopped
+        main_module._paper_enabled = False
+
+        response = client.post("/paper/stop")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["stopped"] is False
+        assert data["reason"] == "not_running"

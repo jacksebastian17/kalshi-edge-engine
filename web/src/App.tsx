@@ -18,6 +18,7 @@ type EdgePoint = {
 
 type UIMode = 'landing' | 'scanner' | 'manual'
 type ScannerState = 'stopped' | 'starting' | 'running' | 'stopping' | 'error'
+type PaperTradingState = 'stopped' | 'starting' | 'running' | 'stopping' | 'error'
 
 function getMaxEdge(signal: SignalResponse): number {
   const yes = signal.net_edge_yes ?? Number.NEGATIVE_INFINITY
@@ -85,6 +86,7 @@ export default function App() {
   const [uiMode, setUiMode] = useState<UIMode>('landing')
   const [preferredMode, setPreferredMode] = useState<'scanner' | 'manual'>('scanner')
   const [scannerState, setScannerState] = useState<ScannerState>('stopped')
+  const [paperTradingState, setPaperTradingState] = useState<PaperTradingState>('stopped')
   const [scannerStatus, setScannerStatus] = useState<ScannerStatusResponse | null>(null)
   const [scannerInfoMessage, setScannerInfoMessage] = useState<string | null>(null)
   const [selectedTicker, setSelectedTicker] = useState<string | null>(null)
@@ -428,6 +430,49 @@ export default function App() {
     }
   }, [scannerState, clearScannerPolling])
 
+  const handleStartPaperTrading = useCallback(async () => {
+    if (paperTradingState === 'running' || paperTradingState === 'starting' || paperTradingState === 'stopping') {
+      return
+    }
+    setPaperTradingState('starting')
+    setApiError(null)
+
+    try {
+      const response = await api.startPaperTrading()
+      if (response.reason === 'already_running') {
+        // Already running, just show running state
+      } else if (response.reason === 'not_available') {
+        setApiError('Paper trading not available (not enabled or not initialized)')
+        setPaperTradingState('stopped')
+        return
+      }
+      setPaperTradingState('running')
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to start paper trading'
+      setApiError(message)
+      setPaperTradingState('error')
+    }
+  }, [paperTradingState])
+
+  const handleStopPaperTrading = useCallback(async () => {
+    if (paperTradingState === 'stopping') return
+
+    setPaperTradingState('stopping')
+    setApiError(null)
+
+    try {
+      const response = await api.stopPaperTrading()
+      if (response.reason === 'not_running') {
+        // Not running, just show stopped state
+      }
+      setPaperTradingState('stopped')
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to stop paper trading'
+      setApiError(message)
+      setPaperTradingState('error')
+    }
+  }, [paperTradingState])
+
   const handleSwitchToManual = useCallback(() => {
     clearScannerPolling()
     setPreferredMode('manual')
@@ -548,6 +593,45 @@ export default function App() {
               {scannerInfoMessage && (
                 <p className="text-xs text-amber-300">{scannerInfoMessage}</p>
               )}
+            </div>
+
+            <div className="border-b border-white/10 bg-zinc-900/40 p-6 space-y-3">
+              <div>
+                <h3 className="text-sm font-semibold text-zinc-100">Paper Trading</h3>
+                <p className="text-xs text-zinc-400 mt-1">
+                  Start/stop automated order simulation and filled order tracking
+                </p>
+              </div>
+
+              <div className="flex items-center justify-between gap-3 flex-wrap">
+                <div className="text-xs text-zinc-300">
+                  State:{' '}
+                  <span className="font-semibold text-zinc-100 uppercase tracking-wide">
+                    {paperTradingState}
+                  </span>
+                </div>
+
+                <div className="flex gap-2">
+                  {(paperTradingState === 'stopped' || paperTradingState === 'error') && (
+                    <button
+                      onClick={handleStartPaperTrading}
+                      className="px-4 py-2 bg-blue-700 hover:bg-blue-600 border border-blue-500/30 rounded text-sm text-white transition"
+                    >
+                      Start Paper Trading
+                    </button>
+                  )}
+
+                  {(paperTradingState === 'running' || paperTradingState === 'starting' || paperTradingState === 'stopping') && (
+                    <button
+                      onClick={handleStopPaperTrading}
+                      disabled={paperTradingState === 'stopping'}
+                      className="px-4 py-2 bg-red-900/50 hover:bg-red-900/70 disabled:bg-zinc-700 border border-red-700/40 rounded text-sm text-red-100 transition"
+                    >
+                      {paperTradingState === 'stopping' ? 'Stopping...' : 'Stop Paper Trading'}
+                    </button>
+                  )}
+                </div>
+              </div>
             </div>
 
             <SignalsTable
