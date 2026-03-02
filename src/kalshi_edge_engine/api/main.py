@@ -60,6 +60,14 @@ class SignalResponse(BaseModel):
     cross_no: float | None
     bid_sum: float | None
     imbalance_gap: float | None
+    fee_yes: float | None
+    fee_no: float | None
+    fee_exit_yes: float | None
+    fee_exit_no: float | None
+    total_fee_yes: float | None
+    total_fee_no: float | None
+    fee_mode: str
+    round_trip: bool
     liq_yes: int
     liq_no: int
     top_liquidity: int
@@ -348,6 +356,14 @@ def _signal_to_response(signal: Signal) -> dict[str, Any]:
         "cross_no": signal.cross_no,
         "bid_sum": signal.bid_sum,
         "imbalance_gap": signal.imbalance_gap,
+        "fee_yes": signal.fee_yes,
+        "fee_no": signal.fee_no,
+        "fee_exit_yes": signal.fee_exit_yes,
+        "fee_exit_no": signal.fee_exit_no,
+        "total_fee_yes": signal.total_fee_yes,
+        "total_fee_no": signal.total_fee_no,
+        "fee_mode": signal.fee_mode,
+        "round_trip": signal.round_trip,
         "liq_yes": signal.liq_yes,
         "liq_no": signal.liq_no,
         "top_liquidity": signal.top_liquidity,

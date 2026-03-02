@@ -1,23 +1,46 @@
 # Kalshi Edge Engine
 
-A Kalshi-only live signal engine and optional auto-quoting daemon designed to exploit exchange behavior — not predict outcomes.
+A real-time Kalshi NBA signal scanner that continuously monitors markets to detect structural inefficiencies and spread opportunities — without placing any trades.
 
-This project builds a quant-style trading system using **only Kalshi API data**.
+This is a **signals-only research system** using only Kalshi API data.
 
 No external sportsbooks.  
 No prediction models.  
-No magic probability oracle.
+No live trading (yet).
 
-Instead, we exploit:
+Instead, we:
 
-- Spread inefficiencies  
-- Impatient order flow  
-- Thin liquidity  
-- Market structure behavior  
+- Monitor live NBA market orderbooks continuously
+- Detect spread inefficiencies and structural imbalances
+- Score signals using quantitative edge calculations
+- Expose live data via FastAPI backend
+- Feed a dark local dashboard that updates in real time
 
-The goal is to build a measurable, auditable, disciplined trading system that can run continuously and prove whether edge exists.
+The goal is to build a stable, observable quant daemon that proves whether detectable edge exists through measurement and data.
 
-> ⚠️ Auto mode is OFF by default and guarded by strict risk controls.
+---
+
+# Current Status
+
+**What's Built:**
+- ✅ Kalshi API client (RSA-PSS signing, async operations)
+- ✅ NBA market universe discovery with caching
+- ✅ Background NBA scanner with rotating slices
+- ✅ Signal scoring with structural imbalance detection
+- ✅ FastAPI backend with 10 endpoints
+- ✅ React dashboard with auto-scan + manual modes
+- ✅ Scanner lifecycle controls (start/stop)
+- ✅ Full CI pipeline (ruff + mypy + pytest)
+
+**What's NOT Built (Yet):**
+- ❌ Database persistence
+- ❌ Paper trading simulator
+- ❌ Live order placement
+- ❌ Auto-trading mode
+- ❌ PnL tracking
+- ❌ Inventory management
+
+This is a signals + observability system first. Trading comes later.
 
 ---
 
@@ -37,10 +60,10 @@ That means:
 
 - We measure spreads.
 - We measure liquidity.
-- We measure volatility.
-- We measure fill behavior.
-- We measure realized PnL.
+- We measure structural imbalances.
 - We log everything.
+- We run continuously in the background.
+- We make the system observable.
 
 If edge exists, we prove it with data.
 
@@ -60,71 +83,63 @@ This is a legitimate exchange-behavior research engine.
 
 ---
 
-# Operating Modes
+# Signal Strategy — Spread Capture Detection
 
-## Signals Mode
-- No trading
-- Live signal detection
-- Full audit logging
-- Research-only
+The signal scoring logic is designed to detect spread capture opportunities.
 
-## Paper Mode
-- Simulated fills
-- Simulated PnL
-- Inventory tracking
-- Strategy validation
+**Current Implementation:** Detection only (no trading).
 
-## Auto Mode (Optional)
-- Real orders
-- Very small size
-- Hard risk limits
-- Kill switch enforced
-- Explicit enable required
+**Strategy Concept:**
 
-Auto mode is disabled by default.
+If a market has:
+- Best YES bid = 48¢
+- Best NO bid = 52¢ (implies YES cross = 48¢)
+- Inside width = 0¢ (no room)
 
----
+→ **SPREAD_TOO_SMALL**
 
-# Strategy v0 — Spread Capture
+But if:
+- Best YES bid = 48¢  
+- Best NO bid = 49¢ (implies YES cross = 51¢)
+- Inside width = 3¢
+- After fees + safety = 2.4¢ net edge
 
-The first strategy implemented is spread capture.
+→ **SIGNAL_VALID**
 
-Example:
+**Target opportunities:**
+- Structural imbalances (`bid_sum < 100`, `imbalance_gap >= 1.5¢`)
+- Wide inside spreads (both sides > 1 tick)
+- Measurable net edge after costs
 
-If:
-- Best bid = 0.48
-- Best ask = 0.51
-
-Spread = 0.03
-
-If spread exceeds:
-- Entry fees
-- Exit fees
-- Safety buffer
-
-The engine may place resting orders inside the spread.
-
-Goal:
-- Buy slightly cheaper
-- Sell slightly higher
+**Future implementation (paper/live mode):**
+- Place resting orders inside the spread
+- Buy slightly cheaper, sell slightly higher
 - Capture small edges repeatedly
+
+**Current focus:**
+- Prove detectable opportunities exist
+- Measure frequency and edge magnitude
+- Build observability infrastructure
 
 No outcome prediction required.
 
 ---
 
-# What We Are Exploiting
+# What We Are Detecting
 
-We exploit:
+We look for:
 
-1. **Impatience**
-   Traders who cross the spread for immediate execution.
+1. **Structural Imbalances**
+   Market pricing where YES + NO bids don't sum to 100¢, indicating inefficiency.
 
-2. **Thin liquidity**
-   Small books create temporary inefficiencies.
+2. **Wide Spreads**
+   Enough room between bid and cross to place profitable resting orders.
 
-3. **Behavioral movement**
-   Retail-heavy markets can move unevenly.
+3. **Thin Liquidity**
+   Small books where our orders could get filled without moving the market significantly.
+
+4. **Impatient Flow**
+   (Future) Traders who cross the spread, potentially filling our resting orders.
 
 We do not exploit illegal or unethical behavior.
 
@@ -132,71 +147,139 @@ We do not exploit illegal or unethical behavior.
 
 # Architecture Overview
 
+```
+Kalshi API (GET only)
+↓
+NBA Universe Discovery (cached 60s)
+↓
+Background Scanner Loop
+├─ Rotating slice (100 tickers/cycle)
+├─ Concurrent fetch (semaphore limit)
+├─ Per-ticker cooldown on failure
+└─ Top-20 snapshot (updated each cycle)
+↓
+In-Memory Snapshot Store
+↓
+FastAPI Backend (10 endpoints)
+├─ GET /signals/top
+├─ GET /scanner/status
+├─ POST /scanner/start
+├─ POST /scanner/stop
+└─ Manual scan endpoints
+↓
+React Dashboard (dark minimal UI)
+├─ Auto-Scan NBA (default mode)
+├─ Manual Watchlist mode
+└─ Orderbook drawer with charts
+```
 
-Kalshi API
-↓
-Orderbook Poller
-↓
-Signal Engine
-↓
-Database (snapshots + signals + orders + fills)
-↓
-FastAPI Backend
-↓
-React Dashboard
+**Key Design Choices:**
+- No database yet (pure in-memory state)
+- No trading calls (GET-only Kalshi API usage)
+- Rotating slice scan for predictable cadence (~2s target)
+- Adaptive sizing to maintain slice size despite cooldowns
+- Structured logging throughout
+- Strict reason code taxonomy
 
+---
+
+# NBA Scanner Architecture
+
+The background NBA scanner is the heart of the system.
+
+## How It Works
+
+1. **Universe Discovery** (every 300s)
+   - Fetches all open KXNBAGAME markets
+   - Caches market ticker list
+   - Tracks discovered market count
+
+2. **Rotating Slice Scan** (every ~2s)
+   - Selects next 100 tickers from universe
+   - Skips tickers currently in cooldown
+   - Fetches orderbooks concurrently (max 5 parallel)
+   - Scores each market using signal math
+   - Updates top-20 snapshot by max edge
+
+3. **Failure Handling**
+   - Failed tickers enter 60s cooldown
+   - Cooldown prevents retry spam
+   - Expired cooldowns auto-cleaned each cycle
+
+4. **Observability**
+   - `/scanner/status` exposes all metrics
+   - Snapshot age tracked in milliseconds
+   - Cycle duration measured
+   - Failed/skipped tickers logged
+
+## Scanner Lifecycle
+
+**Auto-start (optional):**
+```bash
+ENABLE_NBA_SCANNER=true
+```
+
+**Manual control:**
+```bash
+POST /scanner/start   # Idempotent, returns already_running if active
+POST /scanner/stop    # Cancels task, clears snapshot
+```
+
+**Status check:**
+```bash
+GET /scanner/status   # Returns enabled, metrics, snapshot age
+```
 
 ---
 
 # Project Structure
 
+```
+/src/kalshi_edge_engine
+  /kalshi          # Kalshi API client (RSA-PSS signing, async operations)
+  /engine          # Signal scoring, orderbook parsing, NBA universe discovery
+  /api             # FastAPI application (10 endpoints, background scanner)
+  /db              # Database models (not implemented yet)
+  /execution       # Order placement (not implemented yet)
+  /risk            # Risk limits (not implemented yet)
+  /utils           # Shared utilities
 
-/src
-/kalshi # API client + auth + types
-/engine # Polling, signal generation, persistence
-/risk # Eligibility filters, limits, kill switch
-/execution # Order placement + inventory (after paper mode)
-/api # FastAPI application
-/db # Database models + migrations
-/utils # Shared utilities
+/tests             # Unit and integration tests (pytest)
+/web               # React dashboard (TypeScript + Vite)
+/.github/workflows # CI configuration (ruff + mypy + pytest)
+```
 
-/tests # Unit and integration tests
-.github/workflows # CI configuration
-
+**Core modules currently implemented:**
+- `kalshi/client.py`: KalshiClient with httpx.AsyncClient, RSA-PSS auth
+- `engine/signal.py`: Signal scoring with 5-stage cascade
+- `engine/orderbook.py`: Orderbook parsing (nested + flat handling)
+- `engine/universe.py`: NBA market discovery with caching
+- `api/main.py`: FastAPI app + background scanner loop
 
 ---
 
-# Data Logging (Critical)
+# Signal Scoring Mechanics
 
-Every decision must be auditable.
+Every market is scored using a 5-stage decision cascade that emits exactly one reason code.
 
-For every signal:
+## Data Captured Per Signal
 
-- Timestamp
+For every signal generated:
+
+- Timestamp (milliseconds)
 - Market ticker
 - Best bid (YES and NO)
-- Spread (YES and NO inside widths)
-- Cross prices (computed from opposite side)
+- Cross prices (computed from opposite-side best bids)
+- Inside width (YES and NO)
 - **Structural metrics:**
-  - Bid sum (best YES bid + best NO bid)
-  - Imbalance gap (100 - bid sum)
+  - `bid_sum` = best_yes_bid + best_no_bid
+  - `imbalance_gap` = 100 - bid_sum
 - Fee estimate
-- Net edge (YES and NO)
-- Liquidity at top of book
+- Net edge (YES and NO) after costs
+- Liquidity at top of book (YES and NO)
 - Decision reason code
-- All gating stage outcomes (structure, liquidity, spread, edge)
 
-If auto mode is enabled:
-
-- Order submission
-- Order cancellation
-- Fills
-- Inventory change
-- Realized PnL
-- Risk events
-
-Nothing is hidden.  
-Everything is measurable.
+**Current state:** All data captured in structured logs. No database persistence yet.
 
 ---
 
@@ -212,21 +295,16 @@ KALSHI_API_KEY_FILE=kalshi-key.pem
 # Optional fallback if you prefer inline secret instead of key file:
 # KALSHI_API_SECRET=-----BEGIN RSA PRIVATE KEY-----...-----END RSA PRIVATE KEY-----
 KALSHI_BASE_URL=https://api.elections.kalshi.com/trade-api/v2  # optional
+
+# Scanner Configuration
+ENABLE_NBA_SCANNER=false  # Set to true for auto-start on app launch
 ```
 
 Get your credentials from: https://dashboard.kalshi.com/settings/api-keys
 
 Place `kalshi-key.pem` in the project root (it is gitignored).
 
-Optional trading configuration:
-
-```
-TRADING_MODE=signals          # signals, paper, or live
-AUTO_TRADING=false            # Always start with false
-MIN_SPREAD_AFTER_FEES=0.01
-MIN_TOP_LIQUIDITY=0
-MIN_MINUTES_TO_EXPIRY=1
-```
+**Note:** Trading configuration variables (`TRADING_MODE`, `AUTO_TRADING`, etc.) exist in `.env.example` for future use but are not implemented yet.
 
 ---
 
@@ -427,6 +505,28 @@ have measurable edge after costs.
 
 # Using the API
 
+All endpoints are read-only operations except scanner controls.
+
+## Endpoints Summary
+
+**Health & Debug:**
+- `GET /health` - Health check
+- `GET /version` - Version info
+- `GET /debug/orderbook/{ticker}` - Raw orderbook data
+
+**Signal Endpoints:**
+- `GET /signals/live?ticker=...` - Score single market
+- `GET /signals/scan?tickers=...` - Scan multiple markets (max 20)
+- `GET /signals/top?n=20` - Top signals from scanner snapshot
+
+**Universe & Scanner:**
+- `GET /universe/nba` - All open NBA markets (cached 60s)
+- `GET /scanner/status` - Scanner health metrics
+- `POST /scanner/start` - Start background scanner
+- `POST /scanner/stop` - Stop background scanner
+
+---
+
 ## Health Check
 
 ```bash
@@ -440,23 +540,16 @@ Response:
 }
 ```
 
+---
+
 ## Fetch Orderbook (Debug Endpoint)
 
 **Endpoint:** `GET /debug/orderbook/{ticker}`
 
-## Run Dashboard Locally
 Fetches live orderbook data from Kalshi. Useful for debugging and development.
 
 **Example:**
 ```bash
-cd web
-npm install
-npm run dev
-```
-
-Dashboard runs on `http://localhost:5173`
-```bash
-Backend automatically allows CORS requests from localhost:5173 in development.
 curl "http://localhost:8000/debug/orderbook/KXNBAGAME-26MAR01SASNYK-SAS"
 ```
 
@@ -710,6 +803,261 @@ If `INVALID-TICKER` fails API call, response includes only `[TICKER-A result, TI
 
 ---
 
+## Get Top Signals from Scanner
+
+**Endpoint:** `GET /signals/top?n=20`
+
+Retrieves the top signals from the background NBA scanner's latest snapshot.
+
+**Key Features:**
+- Returns signals sorted by max edge descending
+- Snapshot updated every ~2s by scanner
+- Includes snapshot timestamp and age
+- Returns market count from universe
+
+**Example:**
+
+```bash
+curl "http://localhost:8000/signals/top?n=10"
+```
+
+**Response:**
+```json
+{
+  "timestamp_ms": 1735690000000,
+  "signals": [
+    {
+      "ticker": "KXNBAGAME-01MAR26-BRK-NOP-BRK",
+      "reason_code": "SIGNAL_VALID",
+      "net_edge_yes": 3.2,
+      "net_edge_no": null,
+      "inside_width_yes": 4.0,
+      "inside_width_no": null,
+      "bid_yes": 62.0,
+      "cross_yes": 66.0,
+      "bid_no": 34.0,
+      "cross_no": 38.0,
+      "bid_sum": 96.0,
+      "imbalance_gap": 4.0,
+      "liq_yes": 150,
+      "liq_no": 200,
+      "top_liquidity": 200,
+      "timestamp_ms": 1735690000000
+    }
+  ],
+  "market_count": 187
+}
+```
+
+**Query Parameters:**
+- `n`: Maximum number of signals to return (default: 20)
+
+**Error Responses:**
+- `503`: Scanner snapshot not available yet (scanner starting up or stopped)
+
+**Requirements:**
+- NBA scanner must be running (via `ENABLE_NBA_SCANNER=true` or `POST /scanner/start`)
+
+---
+
+## Get NBA Universe
+
+**Endpoint:** `GET /universe/nba`
+
+Fetches all open NBA markets from Kalshi. Cached for 60 seconds.
+
+**Example:**
+
+```bash
+curl "http://localhost:8000/universe/nba"
+```
+
+**Response:**
+```json
+{
+  "series_ticker": "KXNBAGAME",
+  "event_tickers": [],
+  "market_tickers": [
+    "KXNBAGAME-01MAR26-BRK-NOP-BRK",
+    "KXNBAGAME-01MAR26-BRK-NOP-NOP",
+    "KXNBAGAME-01MAR26-CHI-POR-CHI"
+  ]
+}
+```
+
+**Fields:**
+- `series_ticker`: Always "KXNBAGAME"
+- `event_tickers`: Empty (not used in current implementation)
+- `market_tickers`: List of all open market tickers, sorted
+
+**Requirements:**
+- Valid Kalshi API credentials in `.env`
+
+---
+
+## Scanner Status
+
+**Endpoint:** `GET /scanner/status`
+
+Returns detailed status of the background NBA scanner.
+
+**Example:**
+
+```bash
+curl "http://localhost:8000/scanner/status"
+```
+
+**Response:**
+```json
+{
+  "enabled": true,
+  "last_scan_ms": 1735690123456,
+  "markets_discovered": 187,
+  "markets_scanned_last_cycle": 100,
+  "last_cycle_duration_ms": 1842,
+  "tickers_failed_last_cycle": ["KXNBAGAME-01MAR26-INVALID"],
+  "tickers_skipped_cooldown_last_cycle": ["KXNBAGAME-01MAR26-FAILED"],
+  "snapshot_timestamp_ms": 1735690123456,
+  "snapshot_age_ms": 543,
+  "last_error": null
+}
+```
+
+**Fields:**
+- `enabled`: Boolean indicating if scanner task is running
+- `last_scan_ms`: Timestamp of last completed scan cycle
+- `markets_discovered`: Total markets in NBA universe
+- `markets_scanned_last_cycle`: Number of tickers scanned in last cycle
+- `last_cycle_duration_ms`: How long the last cycle took
+- `tickers_failed_last_cycle`: Tickers that failed API calls
+- `tickers_skipped_cooldown_last_cycle`: Tickers skipped due to cooldown
+- `snapshot_timestamp_ms`: When current snapshot was created
+- `snapshot_age_ms`: How old the snapshot is (current time - snapshot time)
+- `last_error`: Last error message (if any)
+
+**Use Cases:**
+- Monitor scanner health
+- Check if snapshot is stale
+- Debug market discovery issues
+- Track failure rates
+
+---
+
+## Start Scanner
+
+**Endpoint:** `POST /scanner/start`
+
+Starts the background NBA scanner if not already running.
+
+**Example:**
+
+```bash
+curl -X POST "http://localhost:8000/scanner/start"
+```
+
+**Response (started):**
+```json
+{
+  "started": true
+}
+```
+
+**Response (already running):**
+```json
+{
+  "started": false,
+  "reason": "already_running"
+}
+```
+
+**Behavior:**
+- Idempotent: Safe to call multiple times
+- Creates background asyncio task
+- Scanner begins universe discovery and scanning
+- Sets `enabled` flag to true
+
+---
+
+## Stop Scanner
+
+**Endpoint:** `POST /scanner/stop`
+
+Stops the background NBA scanner cleanly.
+
+**Example:**
+
+```bash
+curl -X POST "http://localhost:8000/scanner/stop"
+```
+
+**Response (stopped):**
+```json
+{
+  "stopped": true
+}
+```
+
+**Response (not running):**
+```json
+{
+  "stopped": false,
+  "reason": "not_running"
+}
+```
+
+**Behavior:**
+- Cancels scanner task
+- Clears top signals snapshot
+- Sets `enabled` flag to false
+- Safe to call even if scanner not running
+
+---
+
+# Run Dashboard Locally
+
+The React dashboard provides a dark minimal UI for monitoring signals in real time.
+
+## Setup
+
+```bash
+cd web
+npm install
+npm run dev
+```
+
+Dashboard runs on `http://localhost:5173`
+
+Backend automatically allows CORS requests from localhost:5173 in development.
+
+## Features
+
+**Auto-Scan NBA Mode (Default):**
+- Displays top signals from background scanner
+- Start/Stop controls for scanner lifecycle
+- Real-time status metrics (snapshot age, cycle duration, failures)
+- Updates every 2 seconds from snapshot
+- Signal table with sorting by edge/liquidity
+
+**Manual Watchlist Mode:**
+- Enter comma-separated market tickers
+- Scan on-demand with configurable poll interval
+- Pause/resume polling
+- Same signal table and sorting
+
+**Shared Features:**
+- Click any ticker to open orderbook drawer
+- Live orderbook display (YES/NO ladders)
+- Edge time-series chart for selected ticker
+- Structured metrics (bid sum, imbalance gap)
+- Reason code badges
+- Responsive dark design
+
+## Screenshots
+
+*(Consider adding screenshots here)*
+
+---
+
 # Running Tests
 
 ## Unit Tests
@@ -732,7 +1080,95 @@ python -m mypy src tests
 
 ---
 
-# Metrics That Matter
+# Roadmap
+
+## Phase 1: Signals + Scanner (Completed) ✅
+
+**PR #1: Project foundation + minimal API + CI**
+- Kalshi client with RSA-PSS signing
+- FastAPI backend structure
+- Basic signal endpoints
+- GitHub Actions CI (ruff + mypy + pytest)
+
+**PR #2: Structural imbalance metrics**
+- Added `bid_sum` and `imbalance_gap` fields
+- Implemented 1.5¢ imbalance threshold gate
+- 5-stage eligibility cascade with reason codes
+- Rejects artificial 1-tick equilibrium
+
+**PR #3: Multi-ticker scan endpoint**
+- `/signals/scan` with up to 20 tickers per request
+- Automatic deduplication and normalization
+- Per-ticker best-effort error handling
+- Sorted by strongest edge descending
+
+**PR #4: NBA Scanner + Dashboard**
+- Background rotating slice scanner
+- Universe discovery with caching
+- Cooldown on failures
+- Top-20 snapshot endpoint
+- Scanner lifecycle controls (start/stop/status)
+- React dashboard with Auto-Scan and Manual modes
+- Orderbook drawer with charts
+
+## Phase 2: Persistence + Paper Trading (Next)
+
+**Database persistence:**
+- SQLite for audit logging
+- Signal history storage
+- Scanner metrics tracking
+- Query interface for analysis
+
+**Paper trading simulator:**
+- Simulated order placement
+- Fill simulation based on orderbook
+- Inventory tracking
+- Simulated PnL calculation
+- Risk limits (position size, daily loss)
+
+## Phase 3: Live Trading (Future)
+
+**Optional live quoting (OFF by default):**
+- Real order placement via Kalshi API
+- Very small size
+- Hard risk limits
+- Kill switch
+- Explicit enable required
+- Full audit trail
+
+**Note:** Live trading is a research feature, not a production money-making system. Use extreme caution.
+
+---
+
+# What to Build Next
+
+Based on mode instructions, highest ROI next steps:
+
+1. **Scanner stability improvements**
+   - Rate-limit detection (handle 429 responses)
+   - Adaptive backoff behavior
+   - More granular metrics
+
+2. **SQLite persistence**
+   - Signal history for analysis
+   - Scanner performance metrics
+   - Ability to replay/analyze past signals
+
+3. **Paper trading mode**
+   - Prove strategy works with simulated fills
+   - Build inventory tracking
+   - Measure simulated PnL
+
+4. **Multi-series expansion**
+   - Beyond NBA to other YES/NO markets
+   - Generic series scanner
+   - Series selection UI
+
+---
+
+# Metrics That Matter (When Trading Enabled)
+
+Future metrics to track once trading is implemented:
 
 - Fill rate
 - Captured spread
@@ -741,48 +1177,16 @@ python -m mypy src tests
 - Slippage
 - Risk triggers
 
-We measure. We do not guess.
-
----
-
-# Roadmap
-
-## PR #1
-Project foundation + minimal API + CI ✅
-
-## PR #2
-Structural imbalance metrics + tightened signal validity ✅
-- Added `bid_sum` and `imbalance_gap` fields to Signal
-- Implemented 1.5¢ imbalance threshold gate
-- Updated reason code cascade to 5-stage eligibility pipeline
-- Rejected artificial 1-tick equilibrium as SPREAD_TOO_SMALL
-
-## PR #3
-Multi-ticker scan endpoint + safeguards ✅
-- `/signals/scan` with up to 20 tickers per request
-- Automatic deduplication and normalization
-- Per-ticker best-effort error handling
-- Sorted by strongest edge descending
-- Comprehensive test coverage
-
-## PR #4
-Database models + snapshot persistence
-
-## PR #5
-Orderbook poller + daemon loop
-
-## PR #6
-Paper simulator + PnL tracking
-
-## PR #7
-Optional live quoting with strict guardrails
+We will measure everything. No guessing.
 
 ---
 
 # Disclaimer
 
-Trading involves risk.
+This is a research and educational project.
 
-Auto mode should only be enabled with tiny size and strict safeguards.
+**Current state:** Signals only. No live trading implemented.
 
-This project is for research and educational purposes.
+**Future state:** If live trading is added, it will involve risk. Use extremely small size and strict safeguards.
+
+This project is for research purposes to study exchange behavior and market microstructure.
