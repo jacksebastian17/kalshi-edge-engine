@@ -43,7 +43,7 @@ class PaperStore:
                         quote_price_cents REAL NOT NULL,
                         size_contracts INTEGER NOT NULL,
                         created_ts_ms INTEGER NOT NULL,
-                        status TEXT NOT NULL DEFAULT 'NEW',
+                        status TEXT NOT NULL DEFAULT 'OPEN',
                         last_seen_best_bid REAL,
                         last_update_ts_ms INTEGER,
                         queue_ahead_contracts INTEGER,
@@ -56,12 +56,15 @@ class PaperStore:
                         exit_ts_ms INTEGER,
                         mark_price_cents REAL,
                         take_profit_cents REAL,
-                        max_hold_seconds INTEGER
+                        max_hold_seconds INTEGER,
+                        best_bid_at_submit_cents REAL,
+                        cross_at_submit_cents REAL
                     )
                     """
                 )
 
-                # paper_fills table - individual fill events (can be partial)
+                # paper_fills table - individual fill events
+                # Intent status: OPEN (partially filled or unfilled) -> FILLED (when remaining_size reaches 0)
                 cursor.execute(
                     """
                     CREATE TABLE IF NOT EXISTS paper_fills (
@@ -74,6 +77,10 @@ class PaperStore:
                         queue_ahead_at_fill INTEGER,
                         fill_fee_cents REAL,
                         note TEXT,
+                        best_bid_at_fill_cents REAL,
+                        cross_at_fill_cents REAL,
+                        mark_30s_after_fill_cents REAL,
+                        pnl_30s_after_fill_cents REAL,
                         FOREIGN KEY (intent_id) REFERENCES quote_intents(id)
                     )
                     """
@@ -150,8 +157,13 @@ class PaperStore:
                     "CREATE INDEX IF NOT EXISTS idx_pnl_snapshots_ts ON pnl_snapshots(ts_ms DESC)"
                 )
 
+                # Migrate existing tables by adding new columns if they don't exist
+                # Safe to call multiple times: we PRAGMA-check columns before ALTER TABLE ADD COLUMN
+                self._migrate_schema(cursor)
+
                 conn.commit()
                 logger.info("paper_store_schema_initialized", extra={"db_path": self.db_path})
+                logger.info("paper_store_ready", extra={"db_path": self.db_path})
         except sqlite3.Error as e:
             logger.exception(
                 "paper_store_schema_error",
@@ -159,12 +171,75 @@ class PaperStore:
             )
             raise
 
+    def _migrate_schema(self, cursor: sqlite3.Cursor) -> None:
+        """Add new columns to existing tables if they don't exist.
+
+        Safe to call multiple times - checks columns via PRAGMA before running ALTER TABLE.
+        """
+        migrations = [
+            # Add telemetry columns to quote_intents
+            (
+                "quote_intents",
+                "best_bid_at_submit_cents",
+                "ALTER TABLE quote_intents ADD COLUMN best_bid_at_submit_cents REAL",
+            ),
+            (
+                "quote_intents",
+                "cross_at_submit_cents",
+                "ALTER TABLE quote_intents ADD COLUMN cross_at_submit_cents REAL",
+            ),
+            # Add telemetry columns to paper_fills
+            (
+                "paper_fills",
+                "best_bid_at_fill_cents",
+                "ALTER TABLE paper_fills ADD COLUMN best_bid_at_fill_cents REAL",
+            ),
+            (
+                "paper_fills",
+                "cross_at_fill_cents",
+                "ALTER TABLE paper_fills ADD COLUMN cross_at_fill_cents REAL",
+            ),
+            (
+                "paper_fills",
+                "mark_30s_after_fill_cents",
+                "ALTER TABLE paper_fills ADD COLUMN mark_30s_after_fill_cents REAL",
+            ),
+            (
+                "paper_fills",
+                "pnl_30s_after_fill_cents",
+                "ALTER TABLE paper_fills ADD COLUMN pnl_30s_after_fill_cents REAL",
+            ),
+        ]
+
+        for table_name, column_name, alter_sql in migrations:
+            try:
+                # Check if column exists
+                cursor.execute(f"PRAGMA table_info({table_name})")
+                columns = [row[1] for row in cursor.fetchall()]
+                if column_name not in columns:
+                    cursor.execute(alter_sql)
+                    logger.info(
+                        "paper_store_migration_applied",
+                        extra={"table": table_name, "column": column_name},
+                    )
+            except sqlite3.Error as e:
+                logger.warning(
+                    "paper_store_migration_failed",
+                    extra={
+                        "table": table_name,
+                        "column": column_name,
+                        "error": str(e),
+                    },
+                )
+
     def insert_intent(
         self,
         intent: QuoteIntent,
         entry_fee_cents: float | None = None,
         take_profit_cents: float | None = None,
         max_hold_seconds: int | None = None,
+        best_bid_at_submit_cents: float | None = None,
+        cross_at_submit_cents: float | None = None,
     ) -> None:
         """Insert a quote intent with optional runtime parameters.
 
@@ -173,6 +248,8 @@ class PaperStore:
             entry_fee_cents: Entry fee in cents (optional).
             take_profit_cents: Take profit threshold in cents (optional).
             max_hold_seconds: Max hold time in seconds (optional).
+            best_bid_at_submit_cents: Best bid at submission time (optional, for telemetry).
+            cross_at_submit_cents: Cross price at submission time (optional, for telemetry).
         """
         try:
             with sqlite3.connect(self.db_path) as conn:
@@ -180,9 +257,10 @@ class PaperStore:
                     """
                     INSERT INTO quote_intents
                     (id, ticker, side, quote_price_cents, size_contracts, created_ts_ms,
-                     net_edge, inside_width, imbalance_gap, fee_mode, round_trip,
-                     entry_fee_cents, take_profit_cents, max_hold_seconds)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     status, net_edge, inside_width, imbalance_gap, fee_mode, round_trip,
+                     entry_fee_cents, take_profit_cents, max_hold_seconds,
+                     best_bid_at_submit_cents, cross_at_submit_cents)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         intent.id,
@@ -191,6 +269,7 @@ class PaperStore:
                         intent.quote_price_cents,
                         intent.size_contracts,
                         intent.created_ts_ms,
+                        "OPEN",
                         intent.net_edge,
                         intent.inside_width,
                         intent.imbalance_gap,
@@ -199,6 +278,8 @@ class PaperStore:
                         entry_fee_cents,
                         take_profit_cents,
                         max_hold_seconds,
+                        best_bid_at_submit_cents,
+                        cross_at_submit_cents,
                     ),
                 )
                 conn.commit()
@@ -390,6 +471,49 @@ class PaperStore:
             )
             return {}
 
+    def get_intent_by_id(self, intent_id: str) -> QuoteIntent | None:
+        """Get a single intent by ID.
+
+        Args:
+            intent_id: The intent ID.
+
+        Returns:
+            QuoteIntent object or None if not found.
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT id, ticker, side, quote_price_cents, size_contracts, created_ts_ms,
+                           net_edge, inside_width, imbalance_gap, fee_mode, round_trip
+                    FROM quote_intents WHERE id = ?
+                    """,
+                    (intent_id,),
+                )
+                row = cursor.fetchone()
+                if row:
+                    return QuoteIntent(
+                        id=row[0],
+                        ticker=row[1],
+                        side=row[2],
+                        quote_price_cents=row[3],
+                        size_contracts=row[4],
+                        created_ts_ms=row[5],
+                        net_edge=row[6],
+                        inside_width=row[7],
+                        imbalance_gap=row[8],
+                        fee_mode=row[9],
+                        round_trip=bool(row[10]),
+                    )
+                return None
+        except sqlite3.Error as e:
+            logger.exception(
+                "paper_store_get_intent_by_id_error",
+                extra={"intent_id": intent_id, "error": str(e)},
+            )
+            return None
+
     def update_intent_status(
         self,
         intent_id: str,
@@ -424,10 +548,137 @@ class PaperStore:
                 extra={"intent_id": intent_id, "error": str(e)},
             )
 
+    def _normalize_fill_insert_args(self, *args: Any, **kwargs: Any) -> dict[str, Any] | None:
+        """Normalize fill insert arguments to a canonical dict.
+
+        Supports three modes:
+        1. Legacy: insert_fill(PaperFill) - single positional arg of type PaperFill
+        2. Positional: insert_fill(fill_id, intent_id, fill_ts_ms, fill_price_cents, fill_size, ...)
+        3. Keyword: insert_fill(fill_id=..., intent_id=..., ...)
+
+        Returns a dict with canonical keys:
+        {fill_id, intent_id, fill_ts_ms, fill_price_cents, fill_size, remaining_size,
+         queue_ahead_at_fill, fill_fee_cents, best_bid_at_fill_cents, cross_at_fill_cents, note}
+
+        Raises ValueError if required fields are missing or invalid.
+        Returns None if mode cannot be determined (edge case).
+        """
+        # Mode 1: Legacy PaperFill API
+        if len(args) == 1 and isinstance(args[0], PaperFill) and len(kwargs) == 0:
+            fill_obj = args[0]
+            # Generate deterministic fill_id: f"legacy:{intent_id}:{fill_ts_ms}"
+            # This ensures idempotency and proper duplicate detection
+            deterministic_fill_id = f"legacy:{fill_obj.intent_id}:{fill_obj.fill_ts_ms}"
+            return {
+                "fill_id": deterministic_fill_id,
+                "intent_id": fill_obj.intent_id,
+                "fill_ts_ms": fill_obj.fill_ts_ms,
+                "fill_price_cents": fill_obj.fill_price_cents
+                if fill_obj.fill_price_cents is not None
+                else 0.0,
+                "fill_size": 1 if fill_obj.filled else 0,
+                "remaining_size": 0 if fill_obj.filled else 1,
+                "queue_ahead_at_fill": None,
+                "fill_fee_cents": None,
+                "best_bid_at_fill_cents": None,
+                "cross_at_fill_cents": None,
+                "note": "legacy_fill",
+            }
+
+        # Mode 2: Positional API (at least 4 required args: fill_id, intent_id, fill_ts_ms, fill_price_cents)
+        if len(args) >= 4 and len(kwargs) == 0:
+            fill_id = args[0]
+            intent_id = args[1]
+            fill_ts_ms = args[2]
+            fill_price_cents = args[3]
+            fill_size = args[4] if len(args) > 4 else 1
+            remaining_size = args[5] if len(args) > 5 else 0
+            queue_ahead_at_fill = args[6] if len(args) > 6 else None
+            fill_fee_cents = args[7] if len(args) > 7 else None
+            best_bid_at_fill_cents = args[8] if len(args) > 8 else None
+            cross_at_fill_cents = args[9] if len(args) > 9 else None
+            note = args[10] if len(args) > 10 else "fill"
+
+            return {
+                "fill_id": fill_id,
+                "intent_id": intent_id,
+                "fill_ts_ms": fill_ts_ms,
+                "fill_price_cents": fill_price_cents,
+                "fill_size": fill_size,
+                "remaining_size": remaining_size,
+                "queue_ahead_at_fill": queue_ahead_at_fill,
+                "fill_fee_cents": fill_fee_cents,
+                "best_bid_at_fill_cents": best_bid_at_fill_cents,
+                "cross_at_fill_cents": cross_at_fill_cents,
+                "note": note,
+            }
+
+        # Mode 3: Keyword API (can mix kwargs + positional, kwargs take precedence)
+        # Determine values from kwargs first, fall back to positional args
+        fill_id = kwargs.get("fill_id", args[0] if len(args) > 0 else None)
+        intent_id = kwargs.get("intent_id", args[1] if len(args) > 1 else None)
+        fill_ts_ms = kwargs.get("fill_ts_ms", args[2] if len(args) > 2 else None)
+        fill_price_cents = kwargs.get("fill_price_cents", args[3] if len(args) > 3 else None)
+        fill_size = kwargs.get("fill_size", args[4] if len(args) > 4 else 1)
+        remaining_size = kwargs.get("remaining_size", args[5] if len(args) > 5 else 0)
+        queue_ahead_at_fill = kwargs.get("queue_ahead_at_fill", args[6] if len(args) > 6 else None)
+        fill_fee_cents = kwargs.get("fill_fee_cents", args[7] if len(args) > 7 else None)
+        best_bid_at_fill_cents = kwargs.get(
+            "best_bid_at_fill_cents", args[8] if len(args) > 8 else None
+        )
+        cross_at_fill_cents = kwargs.get("cross_at_fill_cents", args[9] if len(args) > 9 else None)
+        note = kwargs.get("note", "fill")
+
+        # We have at least one kwarg or a mix; return the canonical dict
+        if (
+            fill_id is not None
+            or intent_id is not None
+            or fill_ts_ms is not None
+            or fill_price_cents is not None
+        ):
+            return {
+                "fill_id": fill_id,
+                "intent_id": intent_id,
+                "fill_ts_ms": fill_ts_ms,
+                "fill_price_cents": fill_price_cents,
+                "fill_size": fill_size,
+                "remaining_size": remaining_size,
+                "queue_ahead_at_fill": queue_ahead_at_fill,
+                "fill_fee_cents": fill_fee_cents,
+                "best_bid_at_fill_cents": best_bid_at_fill_cents,
+                "cross_at_fill_cents": cross_at_fill_cents,
+                "note": note,
+            }
+
+        return None
+
+    def _validate_fill_dict(self, fill_dict: dict[str, Any]) -> None:
+        """Validate a normalized fill dict for required fields and types.
+
+        Raises ValueError if validation fails.
+        """
+        fill_id = fill_dict.get("fill_id")
+        intent_id = fill_dict.get("intent_id")
+        fill_ts_ms = fill_dict.get("fill_ts_ms")
+        fill_price_cents = fill_dict.get("fill_price_cents")
+        fill_size = fill_dict.get("fill_size")
+        remaining_size = fill_dict.get("remaining_size")
+
+        if not fill_id or not isinstance(fill_id, str):
+            raise ValueError("fill_id must be a non-empty string")
+        if not intent_id or not isinstance(intent_id, str):
+            raise ValueError("intent_id must be a non-empty string")
+        if fill_ts_ms is None or not isinstance(fill_ts_ms, int):
+            raise ValueError("fill_ts_ms must be an integer")
+        if fill_price_cents is None or not isinstance(fill_price_cents, (int, float)):
+            raise ValueError("fill_price_cents must be a number")
+        if not isinstance(fill_size, int) or fill_size < 0:
+            raise ValueError("fill_size must be an integer >= 0")
+        if not isinstance(remaining_size, int) or remaining_size < 0:
+            raise ValueError("remaining_size must be an integer >= 0")
+
     @overload
-    def insert_fill(self, fill: PaperFill) -> None:
-        """Insert a paper fill using old PaperFill API (Phase 1 compatibility)."""
-        ...
+    def insert_fill(self, fill: PaperFill) -> bool: ...
 
     @overload
     def insert_fill(
@@ -436,129 +687,200 @@ class PaperStore:
         intent_id: str,
         fill_ts_ms: int,
         fill_price_cents: float,
-        fill_size: int,
-        remaining_size: int,
+        fill_size: int = 1,
+        remaining_size: int = 0,
         queue_ahead_at_fill: int | None = None,
         fill_fee_cents: float | None = None,
-    ) -> None:
-        """Insert a paper fill event (Phase 2 API)."""
-        ...
+        best_bid_at_fill_cents: float | None = None,
+        cross_at_fill_cents: float | None = None,
+        note: str = "fill",
+    ) -> bool: ...
 
-    def insert_fill(self, *args: Any, **kwargs: Any) -> None:
-        """Insert a paper fill event. Supports both old and new API."""
-        # Check if using old PaperFill API (single positional arg)
-        if len(args) == 1 and isinstance(args[0], PaperFill) and len(kwargs) == 0:
-            fill_obj = args[0]
-            # Convert legacy PaperFill to new insert_fill parameters
-            # Legacy fills are assumed to be full fills (size=1) with no queue tracking
-            try:
-                with sqlite3.connect(self.db_path) as conn:
+    def insert_fill(self, *args: Any, **kwargs: Any) -> bool:
+        """Insert a paper fill event. Supports legacy, positional, and keyword APIs.
+
+        Implements atomic concurrency control: all checks (idempotency, filled_so_far,
+        overfill prevention) happen within a single BEGIN IMMEDIATE transaction to prevent
+        race conditions when multiple fill events for the same intent arrive concurrently.
+
+        Implements overfill prevention: prevents inserting a fill that would exceed
+        the intent's size_contracts.
+
+        Implements idempotency: if fill_id already exists, returns True (no-op).
+
+        Updates intent status atomically:
+        - If remaining_size == 0 after fill -> set status to FILLED
+        - Else -> keep status OPEN
+
+        Args:
+            *args: Positional arguments (see overloads)
+            **kwargs: Keyword arguments (see overloads)
+
+        Returns:
+            True if fill was inserted (or already existed), False if rejected due to overfill prevention.
+
+        Raises:
+            ValueError if arguments cannot be parsed or are invalid.
+        """
+        # Normalize and parse arguments (outside transaction, just for parsing)
+        fill_dict = self._normalize_fill_insert_args(*args, **kwargs)
+        if fill_dict is None:
+            raise ValueError("insert_fill requires either a PaperFill object or fill parameters")
+
+        # Validate the normalized dict (outside transaction, just validation)
+        self._validate_fill_dict(fill_dict)
+
+        fill_id = fill_dict["fill_id"]
+        intent_id = fill_dict["intent_id"]
+        fill_size = fill_dict["fill_size"]
+
+        # ALL ATOMICITY CHECKS INSIDE ONE TRANSACTION WITH BEGIN IMMEDIATE
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                # Use BEGIN IMMEDIATE to acquire immediate write lock
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    cursor = conn.cursor()
+
+                    # Check if fill_id already exists (idempotent)
+                    cursor.execute(
+                        "SELECT 1 FROM paper_fills WHERE id = ? LIMIT 1",
+                        (fill_id,),
+                    )
+                    if cursor.fetchone() is not None:
+                        conn.commit()
+                        logger.info(
+                            "paper_store_insert_fill_idempotent",
+                            extra={
+                                "fill_id": fill_id,
+                                "intent_id": intent_id,
+                            },
+                        )
+                        return True
+
+                    # Load intent to get size_contracts
+                    cursor.execute(
+                        "SELECT size_contracts FROM quote_intents WHERE id = ?",
+                        (intent_id,),
+                    )
+                    intent_row = cursor.fetchone()
+                    if intent_row is None:
+                        conn.rollback()
+                        logger.warning(
+                            "paper_store_insert_fill_intent_not_found",
+                            extra={"intent_id": intent_id},
+                        )
+                        return False
+
+                    size_contracts = intent_row[0]
+
+                    # Query current total filled size (inside transaction for consistency)
+                    cursor.execute(
+                        "SELECT COALESCE(SUM(fill_size), 0) FROM paper_fills WHERE intent_id = ?",
+                        (intent_id,),
+                    )
+                    filled_so_far = cursor.fetchone()[0]
+
+                    # Check if already fully filled (no-op if already at target)
+                    if filled_so_far >= size_contracts:
+                        conn.rollback()
+                        logger.warning(
+                            "paper_store_insert_fill_already_filled",
+                            extra={
+                                "intent_id": intent_id,
+                                "filled_so_far": filled_so_far,
+                                "size_contracts": size_contracts,
+                                "attempted_fill_size": fill_size,
+                            },
+                        )
+                        return False
+
+                    # Check if this fill would cause overfill
+                    if filled_so_far + fill_size > size_contracts:
+                        conn.rollback()
+                        logger.warning(
+                            "paper_store_insert_fill_would_overfill",
+                            extra={
+                                "intent_id": intent_id,
+                                "filled_so_far": filled_so_far,
+                                "fill_size": fill_size,
+                                "size_contracts": size_contracts,
+                            },
+                        )
+                        return False
+
+                    # Compute corrected remaining_size for consistency
+                    # remaining_size should be (size_contracts - (filled_so_far + fill_size))
+                    corrected_remaining_size = max(0, size_contracts - (filled_so_far + fill_size))
+                    fill_dict["remaining_size"] = corrected_remaining_size
+
+                    # Determine new intent status based on corrected remaining size
+                    new_status = "FILLED" if corrected_remaining_size == 0 else "OPEN"
+
+                    # Insert the fill
                     conn.execute(
                         """
                         INSERT INTO paper_fills
                         (id, intent_id, fill_ts_ms, fill_price_cents, fill_size,
-                         remaining_size, queue_ahead_at_fill, fill_fee_cents, note)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         remaining_size, queue_ahead_at_fill, fill_fee_cents, note,
+                         best_bid_at_fill_cents, cross_at_fill_cents)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
-                            str(uuid.uuid4()),
-                            fill_obj.intent_id,
-                            fill_obj.fill_ts_ms,
-                            fill_obj.fill_price_cents
-                            if fill_obj.fill_price_cents is not None
-                            else 0.0,
-                            1 if fill_obj.filled else 0,
-                            0 if fill_obj.filled else 1,
-                            None,
-                            None,
-                            "legacy_fill",
+                            fill_dict["fill_id"],
+                            fill_dict["intent_id"],
+                            fill_dict["fill_ts_ms"],
+                            fill_dict["fill_price_cents"],
+                            fill_dict["fill_size"],
+                            fill_dict["remaining_size"],
+                            fill_dict["queue_ahead_at_fill"],
+                            fill_dict["fill_fee_cents"],
+                            fill_dict["note"],
+                            fill_dict["best_bid_at_fill_cents"],
+                            fill_dict["cross_at_fill_cents"],
                         ),
                     )
-                    conn.commit()
-            except sqlite3.Error as e:
-                logger.exception(
-                    "paper_store_insert_fill_legacy_error",
-                    extra={"intent_id": fill_obj.intent_id, "error": str(e)},
-                )
-        # Check if using new API
-        elif len(args) >= 4 and len(kwargs) == 0:
-            # New positional API
-            fill_id = args[0]
-            intent_id = args[1]
-            fill_ts_ms = args[2]
-            fill_price_cents = args[3]
-            fill_size = args[4] if len(args) > 4 else kwargs.get("fill_size")
-            remaining_size = args[5] if len(args) > 5 else kwargs.get("remaining_size")
-            queue_ahead_at_fill = args[6] if len(args) > 6 else kwargs.get("queue_ahead_at_fill")
-            fill_fee_cents = args[7] if len(args) > 7 else kwargs.get("fill_fee_cents")
 
-            try:
-                with sqlite3.connect(self.db_path) as conn:
+                    # Update intent status atomically
+                    now_ms = int(time.time() * 1000)
                     conn.execute(
                         """
-                        INSERT INTO paper_fills
-                        (id, intent_id, fill_ts_ms, fill_price_cents, fill_size,
-                         remaining_size, queue_ahead_at_fill, fill_fee_cents, note)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        UPDATE quote_intents
+                        SET status = ?, last_update_ts_ms = ?
+                        WHERE id = ?
                         """,
-                        (
-                            fill_id,
-                            intent_id,
-                            fill_ts_ms,
-                            fill_price_cents,
-                            fill_size,
-                            remaining_size,
-                            queue_ahead_at_fill,
-                            fill_fee_cents,
-                            "fill",
-                        ),
+                        (new_status, now_ms, intent_id),
                     )
+
+                    # Commit the transaction
                     conn.commit()
-            except sqlite3.Error as e:
-                logger.exception(
-                    "paper_store_insert_fill_error",
-                    extra={"fill_id": fill_id, "error": str(e)},
-                )
-        else:
-            # keyword API
-            fill_id = kwargs.get("fill_id", args[0] if len(args) > 0 else None)
-            intent_id = kwargs.get("intent_id", args[1] if len(args) > 1 else None)
-            fill_ts_ms = kwargs.get("fill_ts_ms", args[2] if len(args) > 2 else None)
-            fill_price_cents = kwargs.get("fill_price_cents", args[3] if len(args) > 3 else None)
-            fill_size = kwargs.get("fill_size", args[4] if len(args) > 4 else None)
-            remaining_size = kwargs.get("remaining_size", args[5] if len(args) > 5 else None)
-            queue_ahead_at_fill = kwargs.get(
-                "queue_ahead_at_fill", args[6] if len(args) > 6 else None
+
+                    logger.info(
+                        "paper_store_insert_fill_success",
+                        extra={
+                            "fill_id": fill_dict["fill_id"],
+                            "intent_id": fill_dict["intent_id"],
+                            "fill_size": fill_dict["fill_size"],
+                            "remaining_size": fill_dict["remaining_size"],
+                            "new_intent_status": new_status,
+                        },
+                    )
+                    return True
+
+                except sqlite3.Error as e:
+                    conn.rollback()
+                    logger.exception(
+                        "paper_store_insert_fill_error",
+                        extra={"fill_id": fill_dict["fill_id"], "error": str(e)},
+                    )
+                    return False
+
+        except sqlite3.Error as e:
+            logger.exception(
+                "paper_store_insert_fill_connection_error",
+                extra={"fill_id": fill_id, "error": str(e)},
             )
-            fill_fee_cents = kwargs.get("fill_fee_cents", args[7] if len(args) > 7 else None)
-
-            try:
-                with sqlite3.connect(self.db_path) as conn:
-                    conn.execute(
-                        """
-                        INSERT INTO paper_fills
-                        (id, intent_id, fill_ts_ms, fill_price_cents, fill_size,
-                         remaining_size, queue_ahead_at_fill, fill_fee_cents, note)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            fill_id,
-                            intent_id,
-                            fill_ts_ms,
-                            fill_price_cents,
-                            fill_size,
-                            remaining_size,
-                            queue_ahead_at_fill,
-                            fill_fee_cents,
-                            "fill",
-                        ),
-                    )
-                    conn.commit()
-            except sqlite3.Error as e:
-                logger.exception(
-                    "paper_store_insert_fill_error",
-                    extra={"fill_id": fill_id, "error": str(e)},
-                )
+            return False
 
     def upsert_position(
         self,
@@ -876,6 +1198,196 @@ class PaperStore:
             )
             return 0
 
+    def get_total_realized_pnl_cents(self) -> float:
+        """Get total realized PnL across all position rows (open and closed)."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT COALESCE(SUM(realized_pnl_cents), 0.0) FROM paper_positions")
+                row = cursor.fetchone()
+                return float(row[0]) if row and row[0] is not None else 0.0
+        except sqlite3.Error as e:
+            logger.exception(
+                "paper_store_get_total_realized_pnl_error",
+                extra={"error": str(e)},
+            )
+            return 0.0
+
+    def compute_paper_metrics(
+        self, mark_price_dict: dict[str, dict[str, float]] | None = None
+    ) -> dict[str, Any]:
+        """Compute complete paper trading metrics from database source of truth.
+
+        This is the authoritative function for consistent paper trading metrics.
+        All metrics are computed from the same database snapshot in a single transaction.
+
+        Args:
+            mark_price_dict: Optional dict mapping {ticker: {side: mark_price_cents}}.
+                            If provided, computes unrealized_pnl_cents.
+                            If None, unrealized_pnl_cents is set to 0.0.
+
+        Returns:
+            Dict with keys:
+            - realized_pnl_cents: Total realized PnL from paper_positions table.
+            - unrealized_pnl_cents: Current unrealized PnL (0 if no marks provided).
+            - total_pnl_cents: realized_pnl_cents + unrealized_pnl_cents.
+            - open_positions_count: Number of positions where net_contracts != 0.
+            - open_orders_count: Number of intents with status='OPEN'.
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+
+                # Fetch all positions
+                cursor.execute(
+                    """
+                    SELECT ticker, side, net_contracts, avg_entry_price_cents, realized_pnl_cents
+                    FROM paper_positions
+                    """
+                )
+                positions = cursor.fetchall()
+
+                # Compute realized PnL from positions table
+                realized_pnl_cents = sum(
+                    float(row[4]) if row[4] is not None else 0.0 for row in positions
+                )
+
+                # Count nonzero positions
+                open_positions = [p for p in positions if p[2] != 0]  # p[2] is net_contracts
+                open_positions_count = len(open_positions)
+
+                # Count OPEN intents
+                cursor.execute("SELECT COUNT(*) FROM quote_intents WHERE status = 'OPEN'")
+                open_orders_count = cursor.fetchone()[0] or 0
+
+                # Compute unrealized PnL if marks provided
+                unrealized_pnl_cents = 0.0
+                if mark_price_dict:
+                    for ticker, side, net_contracts, avg_entry_price, _ in positions:
+                        if net_contracts == 0:
+                            continue
+
+                        mark_price = mark_price_dict.get(ticker, {}).get(side)
+                        if mark_price is None:
+                            continue
+
+                        # Price PnL component
+                        if side == "YES":
+                            price_pnl = (mark_price - avg_entry_price) * net_contracts
+                        else:
+                            price_pnl = (avg_entry_price - mark_price) * net_contracts
+
+                        # Fee component: sum all entry fees for this position
+                        cursor.execute(
+                            """
+                            SELECT COALESCE(SUM(f.fill_fee_cents), 0.0)
+                            FROM paper_fills f
+                            JOIN quote_intents i ON f.intent_id = i.id
+                            WHERE i.ticker = ? AND i.side = ?
+                            """,
+                            (ticker, side),
+                        )
+                        total_entry_fees = cursor.fetchone()[0] or 0.0
+
+                        # Unrealized = price_pnl - fees
+                        unrealized_pnl_cents += price_pnl - total_entry_fees
+
+                total_pnl_cents = realized_pnl_cents + unrealized_pnl_cents
+
+                return {
+                    "realized_pnl_cents": float(realized_pnl_cents),
+                    "unrealized_pnl_cents": float(unrealized_pnl_cents),
+                    "total_pnl_cents": float(total_pnl_cents),
+                    "open_positions_count": int(open_positions_count),
+                    "open_orders_count": int(open_orders_count),
+                }
+        except sqlite3.Error as e:
+            logger.exception(
+                "paper_store_compute_metrics_error",
+                extra={"error": str(e)},
+            )
+            return {
+                "realized_pnl_cents": 0.0,
+                "unrealized_pnl_cents": 0.0,
+                "total_pnl_cents": 0.0,
+                "open_positions_count": 0,
+                "open_orders_count": 0,
+            }
+
+    def get_latest_intent_id_for_ticker_side(self, ticker: str, side: str) -> str | None:
+        """Get latest intent id for a ticker+side pair."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT id
+                    FROM quote_intents
+                    WHERE ticker = ? AND side = ?
+                    ORDER BY created_ts_ms DESC
+                    LIMIT 1
+                    """,
+                    (ticker, side),
+                )
+                row = cursor.fetchone()
+                return str(row[0]) if row and row[0] is not None else None
+        except sqlite3.Error as e:
+            logger.exception(
+                "paper_store_get_latest_intent_id_error",
+                extra={"ticker": ticker, "side": side, "error": str(e)},
+            )
+            return None
+
+    def mark_exited_intents_for_ticker_side(
+        self,
+        ticker: str,
+        side: str,
+        exit_ts_ms: int,
+        mark_price_cents: float,
+    ) -> None:
+        """Set exit metadata for filled intents on ticker+side that are not yet exited."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    """
+                    UPDATE quote_intents
+                    SET exit_ts_ms = ?, mark_price_cents = ?
+                    WHERE ticker = ?
+                      AND side = ?
+                      AND status = 'FILLED'
+                      AND exit_ts_ms IS NULL
+                    """,
+                    (exit_ts_ms, mark_price_cents, ticker, side),
+                )
+                conn.commit()
+        except sqlite3.Error as e:
+            logger.exception(
+                "paper_store_mark_exited_intents_error",
+                extra={
+                    "ticker": ticker,
+                    "side": side,
+                    "exit_ts_ms": exit_ts_ms,
+                    "error": str(e),
+                },
+            )
+
+    def fill_exists(self, fill_id: str) -> bool:
+        """Check if a fill with the given fill_id already exists."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT 1 FROM paper_fills WHERE id = ? LIMIT 1",
+                    (fill_id,),
+                )
+                return cursor.fetchone() is not None
+        except sqlite3.Error as e:
+            logger.exception(
+                "paper_store_fill_exists_error",
+                extra={"fill_id": fill_id, "error": str(e)},
+            )
+            return False
+
     def get_filled_size_for_intent(self, intent_id: str) -> int:
         """Get cumulative filled size for an intent."""
         try:
@@ -932,5 +1444,52 @@ class PaperStore:
             logger.exception(
                 "paper_store_get_recent_fills_error",
                 extra={"error": str(e)},
+            )
+            return []
+
+    def get_fills_for_position(self, ticker: str, side: str) -> list[dict[str, Any]]:
+        """Get all fills for a specific ticker+side position.
+
+        Args:
+            ticker: Market ticker.
+            side: Position side ("YES" or "NO").
+
+        Returns:
+            List of fill dicts with fill_fee_cents.
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT f.id, f.intent_id, f.fill_ts_ms, f.fill_price_cents,
+                           f.fill_size, f.remaining_size, f.queue_ahead_at_fill,
+                           f.fill_fee_cents
+                    FROM paper_fills f
+                    JOIN quote_intents i ON f.intent_id = i.id
+                    WHERE i.ticker = ? AND i.side = ?
+                    ORDER BY f.fill_ts_ms ASC
+                    """,
+                    (ticker, side),
+                )
+                fills = []
+                for row in cursor.fetchall():
+                    fills.append(
+                        {
+                            "id": row[0],
+                            "intent_id": row[1],
+                            "fill_ts_ms": row[2],
+                            "fill_price_cents": row[3],
+                            "fill_size": row[4],
+                            "remaining_size": row[5],
+                            "queue_ahead_at_fill": row[6],
+                            "fill_fee_cents": row[7],
+                        }
+                    )
+                return fills
+        except sqlite3.Error as e:
+            logger.exception(
+                "paper_store_get_fills_for_position_error",
+                extra={"ticker": ticker, "side": side, "error": str(e)},
             )
             return []

@@ -4,7 +4,6 @@ import asyncio
 import logging
 import random
 import time
-import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -12,6 +11,11 @@ from typing import Any
 from kalshi_edge_engine.kalshi.client import KalshiClient
 
 logger = logging.getLogger(__name__)
+
+
+def _build_fill_id(order_id: str, fill_ts_ms: int, sequence: int) -> str:
+    """Build deterministic fill ID for idempotent reprocessing."""
+    return f"sim:{order_id}:{fill_ts_ms}:{sequence}"
 
 
 def _extract_best_level_raw(levels: Any) -> tuple[float | None, int | None]:
@@ -205,6 +209,8 @@ class Fill:
     remaining_size: int  # contracts still pending
     queue_ahead_at_fill: int | None
     fill_fee_cents: float
+    best_bid_at_fill_cents: float | None = None
+    cross_at_fill_cents: float | None = None
 
 
 @dataclass
@@ -389,8 +395,10 @@ class RealisticOrderSimulator:
                         if random.random() < self.fill_probability_price_moved:
                             fill_size = remaining_size
                             fill_ts_ms = now_ms
+                            # Capture cross at fill time for telemetry
+                            cross_at_fill = cross_yes if order.side == "YES" else cross_no
                             fill = Fill(
-                                id=str(uuid.uuid4()),
+                                id=_build_fill_id(order.id, fill_ts_ms, len(fills) + 1),
                                 order_id=order.id,
                                 fill_ts_ms=fill_ts_ms,
                                 fill_price_cents=order.quote_price_cents,
@@ -399,6 +407,8 @@ class RealisticOrderSimulator:
                                 queue_ahead_at_fill=queue_ahead,
                                 fill_fee_cents=order.effective_entry_fee_per_contract_cents
                                 * fill_size,
+                                best_bid_at_fill_cents=best_bid,
+                                cross_at_fill_cents=cross_at_fill,
                             )
                             fills.append(fill)
                             remaining_size = fill.remaining_size
@@ -428,8 +438,10 @@ class RealisticOrderSimulator:
                                 )
                                 fill_size = min(remaining_size, arrival_volume)
                                 fill_ts_ms = now_ms
+                                # Capture cross at fill time for telemetry
+                                cross_at_fill = cross_yes if order.side == "YES" else cross_no
                                 fill = Fill(
-                                    id=str(uuid.uuid4()),
+                                    id=_build_fill_id(order.id, fill_ts_ms, len(fills) + 1),
                                     order_id=order.id,
                                     fill_ts_ms=fill_ts_ms,
                                     fill_price_cents=order.quote_price_cents,
@@ -438,6 +450,8 @@ class RealisticOrderSimulator:
                                     queue_ahead_at_fill=0,
                                     fill_fee_cents=order.effective_entry_fee_per_contract_cents
                                     * fill_size,
+                                    best_bid_at_fill_cents=best_bid,
+                                    cross_at_fill_cents=cross_at_fill,
                                 )
                                 fills.append(fill)
                                 remaining_size = fill.remaining_size
@@ -470,8 +484,10 @@ class RealisticOrderSimulator:
                                 # We're at front of queue, fill is probabilistic
                                 fill_size = min(remaining_size, max(1, remaining_trade))
                                 fill_ts_ms = now_ms
+                                # Capture cross at fill time for telemetry
+                                cross_at_fill = cross_yes if order.side == "YES" else cross_no
                                 fill = Fill(
-                                    id=str(uuid.uuid4()),
+                                    id=_build_fill_id(order.id, fill_ts_ms, len(fills) + 1),
                                     order_id=order.id,
                                     fill_ts_ms=fill_ts_ms,
                                     fill_price_cents=order.quote_price_cents,
@@ -480,6 +496,8 @@ class RealisticOrderSimulator:
                                     queue_ahead_at_fill=queue_ahead,
                                     fill_fee_cents=order.effective_entry_fee_per_contract_cents
                                     * fill_size,
+                                    best_bid_at_fill_cents=best_bid,
+                                    cross_at_fill_cents=cross_at_fill,
                                 )
                                 fills.append(fill)
                                 remaining_size = fill.remaining_size

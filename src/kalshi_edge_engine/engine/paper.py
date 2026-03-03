@@ -1,4 +1,15 @@
-"""Paper trading module for simulating fills and tracking PnL."""
+"""Paper trading module for simulating fills and tracking PnL.
+
+CURRENT STATE:
+- build_quote_intents(): Active - Used to create intents from signals
+- QuoteIntent dataclass: Active - Core data structure for intents
+- simulate_fill(): DEPRECATED - Use RealisticOrderSimulator from paper_sim.py instead
+- PaperFill/PaperOutcome: LEGACY - Kept for backwards compatibility with old tests
+
+NEW PATH (RECOMMENDED):
+- Use RealisticOrderSimulator from paper_sim.py for realistic fill simulation
+- Read from quote_intents/paper_fills/paper_positions tables in PaperStore
+"""
 
 import asyncio
 import logging
@@ -184,7 +195,13 @@ async def simulate_fill(
     horizon_seconds: int = 90,
     poll_interval_seconds: int = 3,
 ) -> tuple[PaperFill, PaperOutcome]:
-    """Simulate a fill for a quote intent by polling the orderbook.
+    """DEPRECATED: Use RealisticOrderSimulator instead.
+
+    This legacy function is kept for backwards compatibility with old tests.
+    New code should use RealisticOrderSimulator from paper_sim.py for realistic
+    fill simulation with queue modeling.
+
+    Simulate a fill for a quote intent by polling the orderbook.
 
     Logic:
     - Loop until horizon reached
@@ -213,6 +230,13 @@ async def simulate_fill(
     Returns:
         Tuple of (PaperFill, PaperOutcome).
     """
+    logger.warning(
+        "simulate_fill_deprecated",
+        extra={
+            "intent_id": intent.id,
+            "notice": "simulate_fill is deprecated, use RealisticOrderSimulator instead",
+        },
+    )
     sem = _get_paper_semaphore()
     async with sem:
         try:

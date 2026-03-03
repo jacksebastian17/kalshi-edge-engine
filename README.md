@@ -1080,6 +1080,148 @@ python -m mypy src tests
 
 ---
 
+# Running Paper Trading Mode
+
+Paper trading mode allows you to validate the strategy with simulated fills without placing real trades. This section describes how to run and verify paper trading locally.
+
+## Setup and Start
+
+1. **Enable paper trading via environment variable:**
+
+```bash
+# .env file or export
+ENABLE_PAPER_TRADING=true
+```
+
+2. **Start the FastAPI backend:**
+
+```bash
+uvicorn kalshi_edge_engine.api.main:app --host 0.0.0.0 --port 8000
+```
+
+The backend will log `paper_store_ready` on startup, confirming that DB migrations have been applied.
+
+3. **Start paper trading:**
+
+```bash
+curl -X POST http://localhost:8000/paper/start
+```
+
+**Response:**
+```json
+{
+  "started": true,
+  "reason": "paper_trading_started"
+}
+```
+
+4. **Wait 2-5 minutes** for the scanner to discover signals and create quote intents.
+
+## Verification Endpoints
+
+After paper trading has been running for a few minutes, verify correct operation using these endpoints:
+
+### Check Open Orders
+
+```bash
+curl "http://localhost:8000/paper/intents?status=OPEN&limit=50"
+```
+
+**Expected:** List of open quote intents with:
+- `ticker`, `side`, `quote_price_cents`, `size_contracts`
+- `status: "OPEN"`
+- `queue_ahead_contracts` (if tracking)
+- Telemetry fields: `best_bid_at_submit_cents`, `cross_at_submit_cents`
+
+### Check Filled Orders
+
+```bash
+curl "http://localhost:8000/paper/intents?status=FILLED&limit=50"
+```
+
+**Expected:** List of filled quote intents with `status: "FILLED"`.
+
+### Check Fill Events
+
+```bash
+curl "http://localhost:8000/paper/fills?limit=200"
+```
+
+**Expected:** Individual fill events with:
+- `intent_id`, `ticker`, `side`
+- `fill_price_cents`, `fill_size`, `fill_fee_cents`
+- `fill_ts_ms`
+- Telemetry: `best_bid_at_fill_cents`, `cross_at_fill_cents`
+
+### Check PnL Snapshot
+
+```bash
+curl "http://localhost:8000/paper/pnl-snapshot"
+```
+
+**Expected:** Current PnL snapshot with:
+```json
+{
+  "ts_ms": 1234567890,
+  "realized_pnl_cents": 120.0,
+  "unrealized_pnl_cents": -30.0,
+  "total_pnl_cents": 90.0,
+  "open_positions_count": 2,
+  "open_orders_count": 3
+}
+```
+
+### Check Summary
+
+```bash
+curl "http://localhost:8000/paper/summary"
+```
+
+**Expected:** Summary statistics including total intents, fills, and PnL.
+
+## Sanity Checks
+
+Verify that the paper trading system is operating correctly:
+
+1. **PnL Invariant:**
+   ```
+   total_pnl_cents == realized_pnl_cents + unrealized_pnl_cents
+   ```
+
+2. **Fills Join to Intents:**
+   - Every fill should have a valid `intent_id` that maps to an intent.
+   - Check that `ticker` and `side` match.
+
+3. **Snapshot Timestamp Updates:**
+   - Call `/paper/pnl-snapshot` multiple times.
+   - Verify that `ts_ms` is updating and roughly matches current time.
+
+4. **Telemetry Fields Populated:**
+   - Open intents should have `best_bid_at_submit_cents` and `cross_at_submit_cents`.
+   - Fills should have `best_bid_at_fill_cents` and `cross_at_fill_cents`.
+
+## Stop Paper Trading
+
+```bash
+curl -X POST http://localhost:8000/paper/stop
+```
+
+**Response:**
+```json
+{
+  "stopped": true,
+  "reason": "paper_trading_stopped"
+}
+```
+
+## Troubleshooting
+
+- **No intents created?** Check scanner is running and discovering NBA markets.
+- **No fills?** Simulator uses realistic probabilities; fills may take time.
+- **PnL invariant violated?** File a bug with `/paper/debug/intent/{intent_id}` output.
+
+---
+
 # Roadmap
 
 ## Phase 1: Signals + Scanner (Completed) ✅
