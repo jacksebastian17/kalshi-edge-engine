@@ -1447,6 +1447,78 @@ class PaperStore:
             )
             return []
 
+    def get_activity_metrics(self, window_seconds: int = 3600) -> dict[str, Any]:
+        """Get lightweight activity metrics for paper trading telemetry.
+
+        Args:
+            window_seconds: Rolling window size for recent activity metrics.
+
+        Returns:
+            Dict with fill/intents rates and timing aggregates.
+        """
+        now_ms = int(time.time() * 1000)
+        cutoff_ms = now_ms - max(0, window_seconds) * 1000
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+
+                cursor.execute("SELECT COUNT(*) FROM quote_intents")
+                total_intents = int(cursor.fetchone()[0] or 0)
+
+                cursor.execute("SELECT COUNT(*) FROM paper_fills")
+                total_fills = int(cursor.fetchone()[0] or 0)
+
+                cursor.execute(
+                    "SELECT COUNT(*) FROM quote_intents WHERE created_ts_ms >= ?",
+                    (cutoff_ms,),
+                )
+                intents_last_window = int(cursor.fetchone()[0] or 0)
+
+                cursor.execute(
+                    "SELECT COUNT(*) FROM paper_fills WHERE fill_ts_ms >= ?",
+                    (cutoff_ms,),
+                )
+                fills_last_window = int(cursor.fetchone()[0] or 0)
+
+                cursor.execute(
+                    """
+                    SELECT AVG((first_fill_ts_ms - i.created_ts_ms) / 1000.0)
+                    FROM quote_intents i
+                    JOIN (
+                        SELECT intent_id, MIN(fill_ts_ms) AS first_fill_ts_ms
+                        FROM paper_fills
+                        GROUP BY intent_id
+                    ) ff ON i.id = ff.intent_id
+                    """
+                )
+                avg_time_to_fill_seconds_raw = cursor.fetchone()[0]
+                avg_time_to_fill_seconds = (
+                    float(avg_time_to_fill_seconds_raw)
+                    if avg_time_to_fill_seconds_raw is not None
+                    else None
+                )
+
+                fill_rate = float(total_fills / total_intents) if total_intents > 0 else 0.0
+
+                return {
+                    "fill_rate": fill_rate,
+                    "avg_time_to_fill_seconds": avg_time_to_fill_seconds,
+                    "fills_last_1h": fills_last_window,
+                    "intents_last_1h": intents_last_window,
+                }
+        except sqlite3.Error as e:
+            logger.exception(
+                "paper_store_get_activity_metrics_error",
+                extra={"window_seconds": window_seconds, "error": str(e)},
+            )
+            return {
+                "fill_rate": 0.0,
+                "avg_time_to_fill_seconds": None,
+                "fills_last_1h": 0,
+                "intents_last_1h": 0,
+            }
+
     def get_fills_for_position(self, ticker: str, side: str) -> list[dict[str, Any]]:
         """Get all fills for a specific ticker+side position.
 

@@ -1758,6 +1758,20 @@ async def get_paper_summary() -> dict[str, Any]:
     }
 
 
+async def get_paper_metrics() -> dict[str, Any]:
+    """Get lightweight paper activity metrics for dashboard observability."""
+    if not _paper_store:
+        raise HTTPException(status_code=503, detail="Paper trading not enabled")
+
+    metrics = _paper_store.get_activity_metrics(window_seconds=3600)
+    return {
+        "fill_rate": metrics["fill_rate"],
+        "avg_time_to_fill_seconds": metrics["avg_time_to_fill_seconds"],
+        "fills_last_1h": metrics["fills_last_1h"],
+        "intents_last_1h": metrics["intents_last_1h"],
+    }
+
+
 async def get_paper_config() -> dict[str, Any]:
     """Return current paper trading configuration.
 
@@ -2097,6 +2111,7 @@ def create_app(testing: bool = False) -> FastAPI:
     app_instance.get("/paper/positions")(get_paper_positions)
     app_instance.get("/paper/pnl-snapshot")(get_paper_pnl_snapshot)
     app_instance.get("/paper/summary")(get_paper_summary)
+    app_instance.get("/paper/metrics")(get_paper_metrics)
     app_instance.get("/paper/config")(get_paper_config)
     app_instance.get("/paper/debug/intent/{intent_id}")(get_paper_debug_intent)
     app_instance.post("/paper/debug/force-fill")(post_paper_debug_force_fill)

@@ -56,7 +56,7 @@ export function SignalsTable({
   onRowClick,
 }: SignalsTableProps) {
   return (
-    <div className="flex-1 overflow-hidden flex flex-col">
+    <div className="flex-1 min-h-[28rem] overflow-hidden flex flex-col">
       {isLoading && (
         <div className="border-b border-white/10 px-6 py-2 bg-zinc-900/60">
           <span className="text-xs text-zinc-400 animate-pulse">
@@ -83,7 +83,7 @@ export function SignalsTable({
       )}
 
       {signals.length > 0 && (
-        <div className="flex-1 overflow-auto">
+        <div className="flex-1 overflow-auto pb-3">
           <table className="w-full text-xs border-collapse">
             <thead className="sticky top-0 bg-zinc-900/80 backdrop-blur-sm">
               <tr className="border-b border-white/10">

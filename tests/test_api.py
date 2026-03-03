@@ -632,3 +632,102 @@ class TestPaperTradingControl:
         data = response.json()
         assert data["stopped"] is False
         assert data["reason"] == "not_running"
+
+
+class TestPaperMetricsEndpoint:
+    """Tests for paper metrics endpoint."""
+
+    def test_paper_metrics_returns_activity_fields(self, client: TestClient) -> None:
+        """GET /paper/metrics returns fill rate and timing metrics."""
+        import kalshi_edge_engine.api.main as main_module
+
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            store = PaperStore(db_path=db_path)
+            main_module._paper_store = store
+
+            now_ms = int(time.time() * 1000)
+
+            recent_filled_1 = QuoteIntent(
+                id="intent-metrics-1",
+                ticker="KXNBAGAME-26MAR01AAA-BBB",
+                side="YES",
+                quote_price_cents=50.0,
+                size_contracts=1,
+                created_ts_ms=now_ms - 20_000,
+                net_edge=1.0,
+                inside_width=2.0,
+                imbalance_gap=0.0,
+                fee_mode="maker",
+                round_trip=True,
+            )
+            recent_filled_2 = QuoteIntent(
+                id="intent-metrics-2",
+                ticker="KXNBAGAME-26MAR01CCC-DDD",
+                side="NO",
+                quote_price_cents=48.0,
+                size_contracts=1,
+                created_ts_ms=now_ms - 50_000,
+                net_edge=1.2,
+                inside_width=2.5,
+                imbalance_gap=0.0,
+                fee_mode="maker",
+                round_trip=True,
+            )
+            old_unfilled = QuoteIntent(
+                id="intent-metrics-3",
+                ticker="KXNBAGAME-26MAR01EEE-FFF",
+                side="YES",
+                quote_price_cents=52.0,
+                size_contracts=1,
+                created_ts_ms=now_ms - 7_200_000,
+                net_edge=0.9,
+                inside_width=1.8,
+                imbalance_gap=0.0,
+                fee_mode="maker",
+                round_trip=True,
+            )
+
+            store.insert_intent(recent_filled_1)
+            store.insert_intent(recent_filled_2)
+            store.insert_intent(old_unfilled)
+
+            inserted_1 = store.insert_fill(
+                fill_id="fill-metrics-1",
+                intent_id="intent-metrics-1",
+                fill_ts_ms=now_ms - 10_000,
+                fill_price_cents=50.0,
+                fill_size=1,
+                remaining_size=0,
+                queue_ahead_at_fill=0,
+                fill_fee_cents=0.1,
+            )
+            inserted_2 = store.insert_fill(
+                fill_id="fill-metrics-2",
+                intent_id="intent-metrics-2",
+                fill_ts_ms=now_ms - 30_000,
+                fill_price_cents=48.0,
+                fill_size=1,
+                remaining_size=0,
+                queue_ahead_at_fill=1,
+                fill_fee_cents=0.1,
+            )
+
+            assert inserted_1 is True
+            assert inserted_2 is True
+
+            response = client.get("/paper/metrics")
+            assert response.status_code == 200
+
+            data = response.json()
+            assert data["fill_rate"] == pytest.approx(2 / 3)
+            assert data["avg_time_to_fill_seconds"] == pytest.approx(15.0)
+            assert data["fills_last_1h"] == 2
+            assert data["intents_last_1h"] == 2
+        finally:
+            main_module._paper_store = None
+            gc.collect()
+            if os.path.exists(db_path):
+                with contextlib.suppress(OSError):
+                    os.unlink(db_path)
