@@ -12,6 +12,7 @@ import pytest
 
 from kalshi_edge_engine.db.paper_store import PaperStore
 from kalshi_edge_engine.engine.paper import QuoteIntent
+from kalshi_edge_engine.engine.paper_sim import Fill
 from kalshi_edge_engine.engine.signal import SIGNAL_VALID, Signal
 
 
@@ -61,7 +62,11 @@ async def test_process_paper_intents_respects_max_open_orders(
     monkeypatch.setattr(main_module, "_PAPER_MAX_CONCURRENT_INTENTS", 5)
     monkeypatch.setattr(main_module, "_PAPER_MAX_POS_PER_TICKER", 3)
 
-    mock_client = AsyncMock()
+    class _ClientStub:
+        async def get_orderbook(self, _ticker: str) -> dict[str, list[list[float]]]:
+            return {"yes": [[50.0, 10]], "no": [[45.0, 10]]}
+
+    mock_client = _ClientStub()
 
     await main_module._process_paper_intents(signal, mock_client)
 
@@ -132,7 +137,11 @@ async def test_process_paper_intents_respects_max_open_positions(
     monkeypatch.setattr(main_module, "_PAPER_MAX_POS_PER_TICKER", 3)
     monkeypatch.setattr(main_module, "_PAPER_MAX_OPEN_POSITIONS", 1)
 
-    mock_client = AsyncMock()
+    class _ClientStub:
+        async def get_orderbook(self, _ticker: str) -> dict[str, list[list[float]]]:
+            return {"yes": [[50.0, 10]], "no": [[45.0, 10]]}
+
+    mock_client = _ClientStub()
 
     await main_module._process_paper_intents(signal, mock_client)
 
@@ -296,6 +305,117 @@ async def test_process_paper_intents_task_callback_removes_done_task(
     await asyncio.sleep(0)
     await asyncio.sleep(0)
     assert len(main_module._paper_simulation_tasks) == 0
+
+    gc.collect()
+    if os.path.exists(db_path):
+        with contextlib.suppress(OSError):
+            os.unlink(db_path)
+
+
+@pytest.mark.asyncio
+async def test_process_paper_intents_insert_fill_failure_skips_position_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rejected fill inserts should not mutate positions in simulation task."""
+    import kalshi_edge_engine.api.main as main_module
+
+    fd, db_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+
+    store = PaperStore(db_path=db_path)
+    now_ms = int(time.time() * 1000)
+    signal = Signal(
+        ticker="KXNBAGAME-26MAR01SASNYK-SAS",
+        reason_code=SIGNAL_VALID,
+        net_edge_yes=2.0,
+        net_edge_no=0.0,
+        inside_width_yes=3.0,
+        inside_width_no=3.0,
+        bid_yes=50.0,
+        cross_yes=55.0,
+        bid_no=45.0,
+        cross_no=50.0,
+        bid_sum=95.0,
+        imbalance_gap=0.0,
+        fee_yes=0.1,
+        fee_no=0.1,
+        fee_exit_yes=0.1,
+        fee_exit_no=0.1,
+        total_fee_yes=0.2,
+        total_fee_no=0.2,
+        fee_mode="maker",
+        round_trip=True,
+        liq_yes=100,
+        liq_no=100,
+        top_liquidity=100,
+        timestamp_ms=now_ms,
+    )
+    intent = QuoteIntent(
+        id="insert-fail-intent-1",
+        ticker=signal.ticker,
+        side="YES",
+        quote_price_cents=51.0,
+        size_contracts=1,
+        created_ts_ms=now_ms,
+        net_edge=2.0,
+        inside_width=2.0,
+        imbalance_gap=0.0,
+        fee_mode="maker",
+        round_trip=True,
+    )
+
+    class _SingleFillSimulator:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def simulate_order_fills(self, *_args, **_kwargs):
+            fill_ts_ms = int(time.time() * 1000)
+            return (
+                [
+                    Fill(
+                        id="sim-fill-insert-fail-1",
+                        order_id=intent.id,
+                        fill_ts_ms=fill_ts_ms,
+                        fill_price_cents=51.0,
+                        fill_size=1,
+                        remaining_size=0,
+                        queue_ahead_at_fill=0,
+                        fill_fee_cents=0.1,
+                        best_bid_at_fill_cents=51.0,
+                        cross_at_fill_cents=52.0,
+                        fill_path_type="queue_cleared",
+                    )
+                ],
+                {
+                    "exit_reason": "filled",
+                    "last_seen_best_bid": 51.0,
+                    "queue_ahead_contracts": 0,
+                },
+            )
+
+    monkeypatch.setattr(main_module, "_ENABLE_PAPER_TRADING", True)
+    monkeypatch.setattr(main_module, "_paper_enabled", True)
+    monkeypatch.setattr(main_module, "_paper_store", store)
+    monkeypatch.setattr(main_module, "_PAPER_MIN_EDGE_CENTS", 1.0)
+    monkeypatch.setattr(main_module, "build_quote_intents", lambda _signal: [intent])
+    monkeypatch.setattr(main_module, "RealisticOrderSimulator", _SingleFillSimulator)
+
+    def _reject_insert_fill(*_args, **_kwargs) -> bool:
+        return False
+
+    monkeypatch.setattr(store, "insert_fill", _reject_insert_fill)
+    main_module._paper_simulation_tasks.clear()
+
+    mock_client = AsyncMock()
+
+    await main_module._process_paper_intents(signal, mock_client)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    positions = store.get_positions()
+    assert positions == []
+
+    assert store.count_fills_total() == 0
 
     gc.collect()
     if os.path.exists(db_path):

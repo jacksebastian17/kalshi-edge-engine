@@ -91,7 +91,7 @@ class TestRealisticOrderSimulator:
 
         # Should have at least one fill since price moved through
         assert len(fills) >= 1
-        assert order_state["status"] in ["filled", "take_profit"]
+        assert order_state["status"] == "filled"
         assert order_state["total_filled_contracts"] > 0
 
     @pytest.mark.asyncio
@@ -120,6 +120,29 @@ class TestRealisticOrderSimulator:
         assert len(fills) == 0
         assert order_state["status"] == "timeout"
         assert order_state["total_filled_contracts"] == 0
+
+    @pytest.mark.asyncio
+    async def test_simulate_order_fills_price_moved_away_no_fill(
+        self,
+        simulator: RealisticOrderSimulator,
+        sample_order_request: OrderRequest,
+        mock_client: AsyncMock,
+    ):
+        """Moved-away quotes should not fill and should timeout by horizon."""
+        mock_client.get_orderbook.return_value = {
+            "yes": [[40.0, 100]],
+            "no": [[60.0, 100]],
+        }
+
+        fills, order_state = await simulator.simulate_order_fills(
+            mock_client,
+            sample_order_request,
+            horizon_seconds=0.2,
+        )
+
+        assert len(fills) == 0
+        assert order_state["status"] == "timeout"
+        assert order_state["latest_diagnostics"]["eligibility"]["price_moved_away"] is True
 
     @pytest.mark.asyncio
     async def test_simulate_order_fills_returns_fill_objects(
@@ -218,10 +241,10 @@ class TestRealisticOrderSimulator:
         assert len(fills) >= 1
 
     @pytest.mark.asyncio
-    async def test_simulate_order_fills_max_hold_exit(
+    async def test_simulate_order_fills_timeout_ignores_max_hold(
         self, simulator: RealisticOrderSimulator, mock_client: AsyncMock
     ):
-        """Test order exit due to max_hold_seconds."""
+        """Simulator ignores max_hold and exits only on horizon timeout/full fill."""
         now_ms = int(time.time() * 1000)
         order_request = OrderRequest(
             id="order-hold-1",
@@ -246,11 +269,11 @@ class TestRealisticOrderSimulator:
         fills, order_state = await simulator.simulate_order_fills(
             mock_client,
             order_request,
-            horizon_seconds=5,
+            horizon_seconds=0.2,
         )
 
-        # Should exit due to max_hold, not timeout
-        assert order_state["exit_reason"] == "max_hold_reached"
+        assert len(fills) == 0
+        assert order_state["exit_reason"] == "timeout"
 
     @pytest.mark.asyncio
     async def test_partial_fill_fee_scales_with_filled_contracts(
@@ -301,10 +324,10 @@ class TestRealisticOrderSimulator:
         assert total_fill_fees == pytest.approx(3.0)
 
     @pytest.mark.asyncio
-    async def test_take_profit_uses_filled_contracts_not_fill_count(
+    async def test_simulator_does_not_exit_on_take_profit_threshold(
         self, mock_client: AsyncMock, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Take-profit threshold must use filled_contracts, not len(fills)."""
+        """Entry simulator should fill entry order and never emit take-profit exits."""
         monkeypatch.setattr("kalshi_edge_engine.engine.paper_sim.random.random", lambda: 0.0)
 
         simulator = RealisticOrderSimulator(
@@ -340,11 +363,11 @@ class TestRealisticOrderSimulator:
             horizon_seconds=0.2,
         )
 
-        assert len(fills) == 1
-        # With the fix: price_moved_through now fills remaining_size (full 4 contracts)
-        # instead of partial min(4, simulated_volume_per_poll=2)
-        assert fills[0].fill_size == 4
-        assert order_state["exit_reason"] == "take_profit"
+        assert len(fills) >= 1
+        # Conservative moved-through path: no single poll should auto-sweep full size.
+        assert fills[0].fill_size < 4
+        assert all(fill.fill_size <= 3 for fill in fills)
+        assert order_state["exit_reason"] == "filled"
         assert order_state["total_filled_contracts"] == 4
 
     @pytest.mark.asyncio
@@ -468,6 +491,56 @@ class TestRealisticOrderSimulator:
         assert observed_queue[1] == 2
 
     @pytest.mark.asyncio
+    async def test_queue_ahead_absorbs_traded_volume_no_fill(self, mock_client: AsyncMock) -> None:
+        """No fill should occur while prior queue fully absorbs traded volume."""
+        simulator = RealisticOrderSimulator(
+            poll_interval_seconds=0.02,
+            fill_probability_price_moved=0.0,
+            fill_probability_at_best=1.0,
+            fill_probability_price_improves=0.0,
+            simulated_volume_per_poll=2,
+        )
+
+        now_ms = int(time.time() * 1000)
+        order_request = OrderRequest(
+            id="order-queue-absorbs-1",
+            ticker="TEST-TICKER",
+            side="YES",
+            quote_price_cents=50.0,
+            size_contracts=1,
+            created_ts_ms=now_ms,
+            net_edge=0.5,
+            entry_fee_cents=0.5,
+            take_profit_cents=0.0,
+            max_hold_seconds=0.08,
+        )
+
+        best_sizes = [5, 3, 3, 3]
+        call_idx = -1
+
+        def _orderbook_sequence(_ticker: str) -> dict[str, list[list[float]]]:
+            nonlocal call_idx
+            call_idx += 1
+            size = best_sizes[min(call_idx, len(best_sizes) - 1)]
+            return {
+                "yes": [[50.0, size]],
+                "no": [[45.0, 100]],
+            }
+
+        mock_client.get_orderbook.side_effect = _orderbook_sequence
+
+        fills, order_state = await simulator.simulate_order_fills(
+            mock_client,
+            order_request,
+            horizon_seconds=0.005,
+        )
+
+        assert fills == []
+        assert order_state["status"] == "timeout"
+        assert order_state["remaining_unfilled_size"] == 1
+        assert int(order_state["queue_ahead_contracts"] or 0) > 0
+
+    @pytest.mark.asyncio
     async def test_simulate_order_fills_order_state_structure(
         self,
         simulator: RealisticOrderSimulator,
@@ -499,7 +572,7 @@ class TestRealisticOrderSimulator:
         assert "exit_reason" in order_state
 
         assert order_state["order_id"] == sample_order_request.id
-        assert order_state["status"] in ["filled", "take_profit", "max_hold_reached", "timeout"]
+        assert order_state["status"] in ["filled", "timeout"]
         assert order_state["total_filled_contracts"] >= 0
         assert order_state["remaining_unfilled_size"] >= 0
         assert order_state["elapsed_ms"] >= 0
@@ -1196,14 +1269,10 @@ class TestPaperSimCorrectnessPass:
             assert fill.fill_fee_cents == fill.fill_size * 1.0
 
     @pytest.mark.asyncio
-    async def test_take_profit_uses_filled_contracts_not_len_fills(
+    async def test_entry_simulator_fills_without_take_profit_exit(
         self, mock_client: AsyncMock
     ) -> None:
-        """Take-profit calculation must use filled_contracts, not len(fills).
-
-        If we get multiple fills with different sizes, take_profit should
-        trigger based on total contracts, not number of fill events.
-        """
+        """Entry simulator should not return take-profit exit reasons."""
 
         call_count = 0
 
@@ -1249,12 +1318,9 @@ class TestPaperSimCorrectnessPass:
             horizon_seconds=1.0,
         )
 
-        # Test is successful if:
-        # 1. We got some fills (filled_contracts > 0)
-        # 2. Exit reason is take_profit (not filled, which means we didn't fill all contracts)
+        # Test is successful if we got fills and simulator exits for entry lifecycle only.
         if order_state["total_filled_contracts"] > 0:
-            # With high mark price (60), take_profit should trigger
-            assert order_state["exit_reason"] in ["take_profit", "filled"]
+            assert order_state["exit_reason"] in ["filled", "timeout"]
 
     @pytest.mark.asyncio
     async def test_queue_update_monotonic_decrease(self, mock_client: AsyncMock) -> None:
@@ -1361,6 +1427,9 @@ class TestSellerArrivalForPriceImproves:
         assert len(fills) >= 1, "Expected at least one fill via seller arrival"
         for fill in fills:
             assert fill.fill_size >= 1, f"Fill size should be >= 1, got {fill.fill_size}"
+            assert fill.fill_size <= 2, (
+                f"Price-improves fill should be conservatively capped, got {fill.fill_size}"
+            )
             assert fill.queue_ahead_at_fill == 0, (
                 f"queue_ahead should be 0 for price_improves, got {fill.queue_ahead_at_fill}"
             )
@@ -1469,12 +1538,12 @@ class TestCorrectionFixes:
     """Tests for correctness fixes in simulator."""
 
     @pytest.mark.asyncio
-    async def test_no_side_take_profit_correctness(
+    async def test_no_side_has_no_take_profit_exit_in_entry_simulator(
         self,
         simulator: RealisticOrderSimulator,
         mock_client: AsyncMock,
     ):
-        """Test NO side take-profit PnL is computed correctly (entry > mark = profit)."""
+        """NO-side entry simulation should not emit take-profit exits."""
         now_ms = int(time.time() * 1000)
         # NO side order: entry at 50, should profit when mark price is lower
         order = OrderRequest(
@@ -1505,16 +1574,8 @@ class TestCorrectionFixes:
             horizon_seconds=5,
         )
 
-        # Should detect take_profit exit because NO side PnL = (50 - 45) * filled_contracts >= 15
         if len(fills) > 0:
-            filled_contracts = sum(f.fill_size for f in fills)
-            expected_pnl = (order.quote_price_cents - 45.0) * filled_contracts
-            # If filled 5 contracts at 50 entry, mark at 45: PnL = (50-45)*5 = 25 >= 15 threshold
-            if expected_pnl >= order.take_profit_cents:
-                assert order_state["exit_reason"] == "take_profit", (
-                    f"Expected take_profit exit but got {order_state['exit_reason']} "
-                    f"(PnL={expected_pnl}, threshold={order.take_profit_cents})"
-                )
+            assert order_state["exit_reason"] in ["filled", "timeout"]
 
     @pytest.mark.asyncio
     async def test_queue_model_consistency(
@@ -1593,11 +1654,11 @@ class TestCorrectionFixes:
         assert order_state["status"] in ["filled", "timeout"]
 
     @pytest.mark.asyncio
-    async def test_price_moved_through_fills_full_size(
+    async def test_price_moved_through_fill_is_volume_capped(
         self,
         mock_client: AsyncMock,
     ):
-        """Test price_moved_through sweeps through level and fills full remaining size."""
+        """Moved-through fills should be capped conservatively, not full-swept."""
         now_ms = int(time.time() * 1000)
         order = OrderRequest(
             id="order-sweep-test",
@@ -1641,17 +1702,12 @@ class TestCorrectionFixes:
             horizon_seconds=1,
         )
 
-        # Should fill 7 contracts (full remaining_size) when price moves through
         if len(fills) > 0:
             total_filled = sum(f.fill_size for f in fills)
-            # When price moves through, fill_size should be remaining_size, not partial
             first_fill = fills[0]
-            assert (
-                first_fill.fill_size == order.size_contracts or total_filled == order.size_contracts
-            ), (
-                f"Expected full fill of {order.size_contracts} contracts when price moves through, "
-                f"got {total_filled}"
-            )
+            assert first_fill.fill_size < order.size_contracts
+            assert all(fill.fill_size <= 3 for fill in fills)
+            assert total_filled <= order.size_contracts
 
     @pytest.mark.asyncio
     async def test_queue_cleared_invariant(

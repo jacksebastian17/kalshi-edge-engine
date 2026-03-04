@@ -595,3 +595,96 @@ class TestComputePaperMetrics:
 
         metrics = paper_store.compute_paper_metrics({ticker: {side: 53.0}})
         assert metrics["unrealized_pnl_cents"] == pytest.approx((53.0 - 51.0) - 1.25)
+
+    def test_compute_metrics_reopened_position_excludes_old_cycle_entry_fees(
+        self, paper_store: PaperStore
+    ):
+        """Unrealized fees should include only entry fills from current open lifecycle."""
+        now_ms = int(time.time() * 1000)
+        ticker = "NBA_REOPEN"
+        side = "YES"
+
+        with sqlite3.connect(paper_store.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO quote_intents
+                (id, ticker, side, quote_price_cents, size_contracts, created_ts_ms,
+                 net_edge, inside_width, imbalance_gap, fee_mode, round_trip, status,
+                 exit_ts_ms)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "old-cycle-intent",
+                    ticker,
+                    side,
+                    50.0,
+                    1,
+                    now_ms - 50_000,
+                    1.0,
+                    0.5,
+                    None,
+                    "taker",
+                    False,
+                    "FILLED",
+                    now_ms - 40_000,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO quote_intents
+                (id, ticker, side, quote_price_cents, size_contracts, created_ts_ms,
+                 net_edge, inside_width, imbalance_gap, fee_mode, round_trip, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "new-cycle-intent",
+                    ticker,
+                    side,
+                    50.0,
+                    1,
+                    now_ms - 10_000,
+                    1.0,
+                    0.5,
+                    None,
+                    "taker",
+                    False,
+                    "FILLED",
+                ),
+            )
+            conn.commit()
+
+        paper_store.insert_fill(
+            fill_id="old-cycle-fill",
+            intent_id="old-cycle-intent",
+            fill_ts_ms=now_ms - 45_000,
+            fill_price_cents=50.0,
+            fill_size=1,
+            remaining_size=0,
+            queue_ahead_at_fill=0,
+            fill_fee_cents=5.0,
+            note="entry_queue_cleared",
+        )
+        paper_store.insert_fill(
+            fill_id="new-cycle-fill",
+            intent_id="new-cycle-intent",
+            fill_ts_ms=now_ms - 9_000,
+            fill_price_cents=50.0,
+            fill_size=1,
+            remaining_size=0,
+            queue_ahead_at_fill=0,
+            fill_fee_cents=1.0,
+            note="entry_queue_cleared",
+        )
+
+        paper_store.upsert_position(
+            ticker=ticker,
+            side=side,
+            net_contracts=1,
+            avg_entry_price_cents=50.0,
+            realized_pnl_cents=0.0,
+            first_open_ts_ms=now_ms - 10_000,
+        )
+
+        metrics = paper_store.compute_paper_metrics({ticker: {side: 55.0}})
+        # Price PnL = (55 - 50) * 1 = 5.0; only new-cycle fee 1.0 should apply.
+        assert metrics["unrealized_pnl_cents"] == pytest.approx(4.0)

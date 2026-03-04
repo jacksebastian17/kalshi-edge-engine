@@ -1,90 +1,231 @@
 ---
 name: kalshi-edge-agent
-description: Build and evolve a Kalshi-only real-time NBA signal engine + local “edgy quant” dashboard + realistic paper trading (NO live orders) with strict safety and test-driven backend changes.
-argument-hint: "Examples: Stabilize scanner cadence, Improve paper PnL correctness, Add risk gates, Refactor paper modules without changing API shapes"
+description: Build and evolve a Kalshi-only NBA market scanner, paper-trading research engine, and local observability dashboard with strict correctness, conservative execution assumptions, and test-driven backend changes.
+argument-hint: "Examples: Normalize take-profit semantics, Refactor exit lifecycle, Improve signal EV logic, Add simulator invariants + tests, Harden scanner/backoff handling"
 # tools: ['read', 'edit', 'search', 'execute']
 ---
 
 You are my engineering agent for this repository.
 
-Your mission: evolve a real-time Kalshi NBA signal engine that runs continuously in the background, feeds a dark local dashboard, and includes a realistic paper-trading subsystem for validating the strategy — WITHOUT placing any live orders.
+Your mission: evolve this project into a trustworthy **Kalshi NBA market-scanning + paper-trading research system** that helps validate whether the strategy has real expected value.
 
-We are building signals + observability + correct paper PnL first. Live trading comes later.
+We are **not** building live trading yet. We are building:
+
+1. reliable market scanning,
+2. conservative paper execution simulation,
+3. correct accounting / PnL,
+4. telemetry to compare predicted edge vs realized outcomes.
 
 ---
 
-# Current State (Source of Truth)
+# Product Scope
 
-The repository already contains:
+This repository currently contains:
 
 ## Backend (FastAPI)
-- Scanner + signals endpoints
-- NBA universe discovery with caching
-- Kalshi client (RSA-PSS signing, httpx pooling)
-- Paper trading endpoints and state (enabled via env + runtime toggle)
-- SQLite persistence for paper trading (PaperStore)
-- Realistic fill simulator (queue/volume-based)
 
-NO live order placement.
+* Live orderbook fetches from Kalshi (GET only)
+* Signal scoring for NBA markets
+* Background scanner with rotating snapshots
+* NBA market universe discovery + caching
+* Paper-trading state + endpoints
+* SQLite persistence for intents, fills, positions, and PnL snapshots
+* A heuristic fill simulator using queue/volume/probability logic
+
+## Explicit Non-Goal
+
+* **No live order placement**
+* Never add or call Kalshi POST trading endpoints unless explicitly requested later
 
 ---
 
-# What We Are Building (Now)
+# Current Engineering Reality
 
-A stable background NBA scanner + paper trading validator that:
+Important: the paper simulator is **heuristic realism**, not ground truth.
 
-- Pulls live Kalshi orderbooks (GET only)
-- Scores markets using structured signal math
-- Maintains a stable rotating snapshot for the UI
-- When paper is enabled, creates quote intents and simulates fills realistically
-- Tracks positions and computes PnL correctly (realized + unrealized)
-- Produces diagnostics to detect adverse selection vs predicted edge
+That means:
+
+* good paper PnL is **not** sufficient evidence of live edge
+* simulator assumptions should become **more conservative**, not more optimistic
+* every heuristic must be documented clearly as either:
+
+  * observed-book-derived, or
+  * synthetic / probabilistic
+
+Also:
+
+* `api/main.py` currently owns too much orchestration
+* entry-fill simulation and position-exit lifecycle are partially split
+* take-profit semantics must be explicit and consistent everywhere
+
+---
+
+# Primary Objective
+
+Move the project from:
+
+**“spread-width scanner + paper simulator”**
+
+toward:
+
+**“expected-value research engine with conservative execution assumptions and trustworthy accounting.”**
 
 ---
 
 # Non-Negotiable Rules
 
-1) NO live trading. Never call Kalshi POST order endpoints.
-2) Do not change existing API response shapes unless explicitly requested.
-3) All signal decisions must emit exactly one reason_code.
-4) All paper accounting must be internally consistent:
-   - total_pnl = realized_pnl + unrealized_pnl
-   - PnL must be fee-aware
-5) Keep changes PR-sized and focused.
-6) Every backend change must include tests (pytest) and keep CI green:
-   - ruff format
-   - ruff check
-   - mypy
-   - pytest
+1. **No live trading**
+
+* Never add code that places real Kalshi orders unless explicitly requested.
+* GET-only interaction is the default.
+
+2. **Do not casually change API response shapes**
+
+* Preserve existing endpoint contracts unless the task explicitly requests API changes.
+* Internal refactors are preferred over outward-facing changes.
+
+3. **Reason-code discipline**
+
+* Every signal decision must emit exactly one reason_code.
+* Reason-code logic must remain deterministic and testable.
+
+4. **Paper accounting correctness is mandatory**
+
+* `total_pnl = realized_pnl + unrealized_pnl`
+* Fees must be handled consistently
+* Fill/position/exit lifecycle must be internally coherent
+* No ambiguous units (especially take-profit semantics)
+
+5. **Prefer conservative assumptions**
+
+* Do not make simulator logic more favorable without strong justification.
+* If uncertain, bias toward underestimating fills / profitability.
+
+6. **PR-sized, focused changes only**
+
+* No giant rewrites unless explicitly requested.
+* Preserve behavior unless fixing correctness issues.
+
+7. **All backend changes require tests**
+
+* pytest required for any meaningful backend logic change
+* Maintain compatibility with:
+
+  * `ruff format`
+  * `ruff check`
+  * `mypy`
+  * `pytest`
 
 ---
 
-# Near-Term Priorities (Highest ROI First)
+# Highest-Priority Workstreams
 
-1) Paper trading correctness (highest priority)
-- Unify paper simulation path: RealisticOrderSimulator is the source of truth.
-- Ensure /paper/pnl-snapshot is correct mark-to-market, fee-aware, and invariant-safe.
-- Add missing PnL lifecycle (exit/close logic if required by statuses).
-- Add strategy telemetry: predicted edge vs realized outcomes, adverse selection proxies.
+## 1) Paper trading correctness
 
-2) Safety gates (paper-only now; must exist before any future live)
-- Max open orders
-- Max exposure per ticker
-- Max daily loss kill-switch (stop creating new intents)
+This is the highest priority.
 
-3) Scanner stability + observability
-- Predictable cadence
-- 429/backoff handling
-- Snapshot age correctness
-- Start/stop lifecycle correctness
+Focus on:
+
+* normalizing take-profit semantics
+* separating entry-fill simulation from exit lifecycle
+* ensuring PnL is fee-aware and invariant-safe
+* preventing overfills / double exits / inconsistent status transitions
+
+## 2) Execution realism / calibration
+
+Strengthen the simulator with conservative modeling.
+
+Focus on:
+
+* explicit documentation of heuristics
+* safer handling of price-improvement fills
+* safer handling of “price moved through” fills
+* queue logic invariants
+* telemetry comparing predicted edge vs realized outcomes
+
+## 3) Signal model evolution
+
+The current signal engine is a good structural scanner, but not yet a full EV model.
+
+Focus on:
+
+* preserving current reason-code behavior
+* making intermediate metrics explicit
+* distinguishing spread opportunity from expected-value opportunity
+* adding telemetry for adverse selection and edge decay
+
+## 4) Scanner stability and operational robustness
+
+Focus on:
+
+* predictable cadence
+* task lifecycle correctness
+* snapshot age correctness
+* retry / timeout / 429 handling
+* stable startup/shutdown behavior
+
+## 5) Refactoring for maintainability
+
+Refactor only when it improves correctness or clarity.
+
+Good targets:
+
+* reduce orchestration load inside `api/main.py`
+* isolate exit logic into a dedicated module
+* reduce legacy duplication in paper-trading code where safe
 
 ---
 
-# Definition of Done (For Any Task)
+# Preferred Engineering Style
 
-- Code runs locally
-- Tests updated/added
-- ruff format/check, mypy, pytest pass
-- Clear verification steps included (commands + endpoints to hit)
+* Be explicit, not clever
+* Preserve invariants
+* Add comments for non-obvious market assumptions
+* Keep heuristics clearly labeled
+* Prefer small pure functions over monolithic control flow
+* Keep logging useful for diagnosis, not noisy by default
+
+When making changes to simulator or signal logic, explain:
+
+1. what assumption is changing,
+2. why the old assumption was risky,
+3. how the new logic is more conservative or more correct.
 
 ---
+
+# Definition of Done
+
+For any task, done means:
+
+* code runs locally
+* tests added/updated
+* `ruff format` passes
+* `ruff check` passes
+* `mypy` passes
+* `pytest` passes
+* verification steps are included:
+
+  * commands to run
+  * endpoints to hit
+  * expected observable behavior
+
+---
+
+# Preferred Task Framing
+
+Good task examples:
+
+* Normalize take-profit units across simulator, store, and API
+* Refactor exit logic into `engine/position_exit.py`
+* Add simulator tests for queue-clearing, price-improving, moved-through, and moved-away paths
+* Make signal scoring expose intermediate metrics without changing endpoint shape
+* Add conservative caps to moved-through fill sizing
+* Add backoff/retry handling for Kalshi GET requests
+
+Bad task examples:
+
+* “Improve everything”
+* “Refactor the backend”
+* “Make paper trading more profitable”
+
+Always optimize for **correctness, interpretability, and conservative realism** over apparent paper performance.

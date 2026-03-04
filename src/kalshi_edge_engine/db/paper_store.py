@@ -236,6 +236,8 @@ class PaperStore:
         self,
         intent: QuoteIntent,
         entry_fee_cents: float | None = None,
+        take_profit_cents_per_contract: float | None = None,
+        # Backward-compat alias: interpreted as cents PER CONTRACT.
         take_profit_cents: float | None = None,
         max_hold_seconds: int | None = None,
         best_bid_at_submit_cents: float | None = None,
@@ -246,11 +248,16 @@ class PaperStore:
         Args:
             intent: QuoteIntent to insert.
             entry_fee_cents: Entry fee in cents (optional).
-            take_profit_cents: Take profit threshold in cents (optional).
+            take_profit_cents_per_contract: Take-profit threshold in cents per contract.
             max_hold_seconds: Max hold time in seconds (optional).
             best_bid_at_submit_cents: Best bid at submission time (optional, for telemetry).
             cross_at_submit_cents: Cross price at submission time (optional, for telemetry).
         """
+        effective_take_profit_cents_per_contract = (
+            take_profit_cents_per_contract
+            if take_profit_cents_per_contract is not None
+            else take_profit_cents
+        )
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute(
@@ -276,7 +283,7 @@ class PaperStore:
                         intent.fee_mode,
                         intent.round_trip,
                         entry_fee_cents,
-                        take_profit_cents,
+                        effective_take_profit_cents_per_contract,
                         max_hold_seconds,
                         best_bid_at_submit_cents,
                         cross_at_submit_cents,
@@ -1148,7 +1155,10 @@ class PaperStore:
                     "fee_mode": row[13],
                     "round_trip": bool(row[14]),
                     "entry_fee_cents": row[15],
+                    # Stored in quote_intents.take_profit_cents for backward compatibility,
+                    # but semantics are cents PER CONTRACT.
                     "take_profit_cents": row[16],
+                    "take_profit_cents_per_contract": row[16],
                     "max_hold_seconds": row[17],
                     "best_bid_at_submit_cents": row[18],
                     "cross_at_submit_cents": row[19],
@@ -1189,6 +1199,21 @@ class PaperStore:
         except sqlite3.Error as e:
             logger.exception(
                 "paper_store_count_intents_total_error",
+                extra={"error": str(e)},
+            )
+            return 0
+
+    def count_fills_total(self) -> int:
+        """Count all fills in paper_fills table."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM paper_fills")
+                row = cursor.fetchone()
+                return int(row[0]) if row and row[0] is not None else 0
+        except sqlite3.Error as e:
+            logger.exception(
+                "paper_store_count_fills_total_error",
                 extra={"error": str(e)},
             )
             return 0
@@ -1280,16 +1305,15 @@ class PaperStore:
                 # Fetch all positions
                 cursor.execute(
                     """
-                    SELECT ticker, side, net_contracts, avg_entry_price_cents, realized_pnl_cents
+                    SELECT ticker, side, net_contracts, avg_entry_price_cents,
+                           realized_pnl_cents, first_open_ts_ms
                     FROM paper_positions
                     """
                 )
                 positions = cursor.fetchall()
 
                 # Compute realized PnL from positions table
-                realized_pnl_cents = sum(
-                    float(row[4]) if row[4] is not None else 0.0 for row in positions
-                )
+                realized_pnl_cents = sum(float(row[4]) if row[4] is not None else 0.0 for row in positions)
 
                 # Count nonzero positions
                 open_positions = [p for p in positions if p[2] != 0]  # p[2] is net_contracts
@@ -1302,7 +1326,7 @@ class PaperStore:
                 # Compute unrealized PnL if marks provided
                 unrealized_pnl_cents = 0.0
                 if mark_price_dict:
-                    for ticker, side, net_contracts, avg_entry_price, _ in positions:
+                    for ticker, side, net_contracts, avg_entry_price, _, first_open_ts_ms in positions:
                         if net_contracts == 0:
                             continue
 
@@ -1317,7 +1341,10 @@ class PaperStore:
                         else:
                             price_pnl = (avg_entry_price - mark_price) * net_contracts
 
-                        # Fee component: sum all entry fees for this position
+                                                # Fee component: sum entry fees only for fills in the currently open
+                                                # lifecycle window for this ticker+side.
+                                                # This avoids carrying stale fees from older closed cycles into
+                                                # current unrealized PnL.
                         cursor.execute(
                             """
                             SELECT COALESCE(SUM(f.fill_fee_cents), 0.0)
@@ -1325,8 +1352,9 @@ class PaperStore:
                             JOIN quote_intents i ON f.intent_id = i.id
                             WHERE i.ticker = ? AND i.side = ?
                               AND (f.note IS NULL OR f.note NOT LIKE 'exit%')
+                                                            AND f.fill_ts_ms >= ?
                             """,
-                            (ticker, side_key),
+                                                        (ticker, side_key, int(first_open_ts_ms or 0)),
                         )
                         total_entry_fees = cursor.fetchone()[0] or 0.0
 
@@ -1495,6 +1523,274 @@ class PaperStore:
                 extra={"error": str(e)},
             )
             return []
+
+    @staticmethod
+    def compute_short_horizon_fill_pnl_cents(
+        *,
+        side: str,
+        fill_price_cents: float,
+        fill_size: int,
+        mark_price_cents: float,
+        fill_fee_cents: float | None,
+    ) -> float:
+        """Compute side-aware short-horizon mark-to-market PnL for a fill."""
+        if side.upper() == "YES":
+            price_pnl = (mark_price_cents - fill_price_cents) * fill_size
+        else:
+            price_pnl = (fill_price_cents - mark_price_cents) * fill_size
+
+        return float(price_pnl - (fill_fee_cents or 0.0))
+
+    def get_pending_fill_30s_outcome_updates(
+        self,
+        cutoff_ts_ms: int,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Get fills eligible for 30s outcome update with joined intent metadata."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT f.id, f.intent_id, f.fill_ts_ms, f.fill_price_cents,
+                           f.fill_size, f.fill_fee_cents, f.note,
+                           i.ticker, i.side, i.net_edge, i.quote_price_cents
+                    FROM paper_fills f
+                    JOIN quote_intents i ON i.id = f.intent_id
+                    WHERE f.fill_ts_ms <= ?
+                      AND f.mark_30s_after_fill_cents IS NULL
+                      AND f.pnl_30s_after_fill_cents IS NULL
+                      AND (f.note IS NULL OR f.note NOT LIKE 'exit%')
+                    ORDER BY f.fill_ts_ms ASC
+                    LIMIT ?
+                    """,
+                    (cutoff_ts_ms, limit),
+                )
+                rows = cursor.fetchall()
+                return [
+                    {
+                        "fill_id": row[0],
+                        "intent_id": row[1],
+                        "fill_ts_ms": row[2],
+                        "fill_price_cents": row[3],
+                        "fill_size": row[4],
+                        "fill_fee_cents": row[5],
+                        "note": row[6],
+                        "ticker": row[7],
+                        "side": row[8],
+                        "net_edge": row[9],
+                        "quote_price_cents": row[10],
+                    }
+                    for row in rows
+                ]
+        except sqlite3.Error as e:
+            logger.exception(
+                "paper_store_get_pending_fill_30s_outcome_updates_error",
+                extra={"cutoff_ts_ms": cutoff_ts_ms, "limit": limit, "error": str(e)},
+            )
+            return []
+
+    def update_fill_30s_outcome(
+        self,
+        *,
+        fill_id: str,
+        mark_30s_after_fill_cents: float,
+        pnl_30s_after_fill_cents: float,
+    ) -> bool:
+        """Persist 30s follow-up mark and short-horizon PnL for a fill."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    UPDATE paper_fills
+                    SET mark_30s_after_fill_cents = ?,
+                        pnl_30s_after_fill_cents = ?
+                    WHERE id = ?
+                      AND mark_30s_after_fill_cents IS NULL
+                      AND pnl_30s_after_fill_cents IS NULL
+                    """,
+                    (mark_30s_after_fill_cents, pnl_30s_after_fill_cents, fill_id),
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+        except sqlite3.Error as e:
+            logger.exception(
+                "paper_store_update_fill_30s_outcome_error",
+                extra={"fill_id": fill_id, "error": str(e)},
+            )
+            return False
+
+    def get_recent_fills_with_intent_metadata(self, limit: int = 200) -> list[dict[str, Any]]:
+        """Get recent fills joined with intent metadata for analysis."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT f.id, f.intent_id, f.fill_ts_ms, f.fill_price_cents,
+                           f.fill_size, f.fill_fee_cents, f.note,
+                           f.mark_30s_after_fill_cents, f.pnl_30s_after_fill_cents,
+                           i.ticker, i.side, i.net_edge, i.quote_price_cents
+                    FROM paper_fills f
+                    JOIN quote_intents i ON i.id = f.intent_id
+                    ORDER BY f.fill_ts_ms DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                )
+                rows = cursor.fetchall()
+                return [
+                    {
+                        "fill_id": row[0],
+                        "intent_id": row[1],
+                        "fill_ts_ms": row[2],
+                        "fill_price_cents": row[3],
+                        "fill_size": row[4],
+                        "fill_fee_cents": row[5],
+                        "note": row[6],
+                        "mark_30s_after_fill_cents": row[7],
+                        "pnl_30s_after_fill_cents": row[8],
+                        "ticker": row[9],
+                        "side": row[10],
+                        "net_edge": row[11],
+                        "quote_price_cents": row[12],
+                    }
+                    for row in rows
+                ]
+        except sqlite3.Error as e:
+            logger.exception(
+                "paper_store_get_recent_fills_with_intent_metadata_error",
+                extra={"limit": limit, "error": str(e)},
+            )
+            return []
+
+    def get_short_horizon_outcome_metrics(
+        self,
+        window_seconds: int = 86_400,
+        edge_bucket_size_cents: float = 1.0,
+    ) -> dict[str, Any]:
+        """Aggregate 30s post-fill outcomes for edge-vs-outcome research."""
+        now_ms = int(time.time() * 1000)
+        cutoff_ms = now_ms - max(0, window_seconds) * 1000
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT f.fill_ts_ms, f.note, f.pnl_30s_after_fill_cents,
+                           i.side, i.net_edge
+                    FROM paper_fills f
+                    JOIN quote_intents i ON i.id = f.intent_id
+                    WHERE f.fill_ts_ms >= ?
+                      AND f.pnl_30s_after_fill_cents IS NOT NULL
+                    ORDER BY f.fill_ts_ms DESC
+                    """,
+                    (cutoff_ms,),
+                )
+                rows = cursor.fetchall()
+
+            total_samples = len(rows)
+            if total_samples == 0:
+                return {
+                    "window_seconds": window_seconds,
+                    "total_samples": 0,
+                    "avg_pnl_30s_cents": None,
+                    "win_rate_30s": None,
+                    "by_side": {},
+                    "by_fill_path": {},
+                    "by_edge_bucket": [],
+                }
+
+            def _compute_group_stats(values: list[float]) -> dict[str, Any]:
+                sample_count = len(values)
+                avg_pnl = sum(values) / sample_count if sample_count > 0 else None
+                win_rate = (
+                    sum(1 for value in values if value > 0) / sample_count
+                    if sample_count > 0
+                    else None
+                )
+                return {
+                    "sample_count": sample_count,
+                    "avg_pnl_30s_cents": avg_pnl,
+                    "win_rate_30s": win_rate,
+                }
+
+            all_pnls: list[float] = []
+            by_side_values: dict[str, list[float]] = {"YES": [], "NO": []}
+            by_fill_path_values: dict[str, list[float]] = {}
+            by_edge_bucket_values: dict[tuple[float, float], list[float]] = {}
+
+            safe_bucket_size = max(0.1, edge_bucket_size_cents)
+            for _, note, pnl_30s_after_fill_cents, side, net_edge in rows:
+                pnl_value = float(pnl_30s_after_fill_cents)
+                all_pnls.append(pnl_value)
+
+                side_key = str(side).upper()
+                if side_key not in by_side_values:
+                    by_side_values[side_key] = []
+                by_side_values[side_key].append(pnl_value)
+
+                fill_path = "unknown"
+                if isinstance(note, str) and note.startswith("entry_"):
+                    fill_path = note.replace("entry_", "", 1)
+                by_fill_path_values.setdefault(fill_path, []).append(pnl_value)
+
+                edge_value = float(net_edge or 0.0)
+                bucket_floor = (edge_value // safe_bucket_size) * safe_bucket_size
+                bucket_key = (bucket_floor, bucket_floor + safe_bucket_size)
+                by_edge_bucket_values.setdefault(bucket_key, []).append(pnl_value)
+
+            by_side = {
+                side_key: _compute_group_stats(values)
+                for side_key, values in by_side_values.items()
+                if values
+            }
+            by_fill_path = {
+                path_key: _compute_group_stats(values)
+                for path_key, values in by_fill_path_values.items()
+            }
+
+            by_edge_bucket: list[dict[str, Any]] = []
+            for (edge_low, edge_high), values in sorted(by_edge_bucket_values.items()):
+                stats = _compute_group_stats(values)
+                by_edge_bucket.append(
+                    {
+                        "edge_bucket_low_cents": edge_low,
+                        "edge_bucket_high_cents": edge_high,
+                        **stats,
+                    }
+                )
+
+            overall = _compute_group_stats(all_pnls)
+            return {
+                "window_seconds": window_seconds,
+                "total_samples": total_samples,
+                "avg_pnl_30s_cents": overall["avg_pnl_30s_cents"],
+                "win_rate_30s": overall["win_rate_30s"],
+                "by_side": by_side,
+                "by_fill_path": by_fill_path,
+                "by_edge_bucket": by_edge_bucket,
+            }
+        except sqlite3.Error as e:
+            logger.exception(
+                "paper_store_get_short_horizon_outcome_metrics_error",
+                extra={
+                    "window_seconds": window_seconds,
+                    "edge_bucket_size_cents": edge_bucket_size_cents,
+                    "error": str(e),
+                },
+            )
+            return {
+                "window_seconds": window_seconds,
+                "total_samples": 0,
+                "avg_pnl_30s_cents": None,
+                "win_rate_30s": None,
+                "by_side": {},
+                "by_fill_path": {},
+                "by_edge_bucket": [],
+            }
 
     def get_activity_metrics(self, window_seconds: int = 3600) -> dict[str, Any]:
         """Get lightweight activity metrics for paper trading telemetry.

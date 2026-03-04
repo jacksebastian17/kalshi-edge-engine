@@ -1403,3 +1403,216 @@ class TestInsertFillAtomicity:
             row = cursor.fetchone()
             assert row[0] == now_ms, "Original fill_ts_ms should be preserved"
             assert row[1] == 50.0, "Original fill_price_cents should be preserved"
+
+
+class TestShortHorizonOutcomeTelemetry:
+    """Tests for 30s post-fill outcome telemetry helpers."""
+
+    def test_compute_short_horizon_fill_pnl_cents_side_aware(self) -> None:
+        """Short-horizon PnL should be side-aware and fee-aware."""
+        yes_pnl = PaperStore.compute_short_horizon_fill_pnl_cents(
+            side="YES",
+            fill_price_cents=48.0,
+            fill_size=2,
+            mark_price_cents=50.0,
+            fill_fee_cents=0.3,
+        )
+        no_pnl = PaperStore.compute_short_horizon_fill_pnl_cents(
+            side="NO",
+            fill_price_cents=53.0,
+            fill_size=2,
+            mark_price_cents=51.5,
+            fill_fee_cents=0.2,
+        )
+
+        assert yes_pnl == pytest.approx(3.7)
+        assert no_pnl == pytest.approx(2.8)
+
+    def test_pending_30s_updates_and_idempotent_write(self, paper_store: PaperStore) -> None:
+        """Pending selector should return eligible entry fills and updates should be idempotent."""
+        now_ms = int(time.time() * 1000)
+
+        intent_entry = QuoteIntent(
+            id="intent-outcome-entry",
+            ticker="KXNBAGAME-OUTCOME-ENTRY",
+            side="YES",
+            quote_price_cents=50.0,
+            size_contracts=1,
+            created_ts_ms=now_ms - 120_000,
+            net_edge=1.4,
+            inside_width=2.0,
+            imbalance_gap=0.0,
+            fee_mode="maker",
+            round_trip=True,
+        )
+        intent_exit = QuoteIntent(
+            id="intent-outcome-exit",
+            ticker="KXNBAGAME-OUTCOME-EXIT",
+            side="NO",
+            quote_price_cents=49.0,
+            size_contracts=1,
+            created_ts_ms=now_ms - 120_000,
+            net_edge=0.8,
+            inside_width=2.0,
+            imbalance_gap=0.0,
+            fee_mode="maker",
+            round_trip=True,
+        )
+
+        paper_store.insert_intent(intent_entry)
+        paper_store.insert_intent(intent_exit)
+
+        inserted_entry = paper_store.insert_fill(
+            fill_id="fill-entry-pending",
+            intent_id=intent_entry.id,
+            fill_ts_ms=now_ms - 60_000,
+            fill_price_cents=50.0,
+            fill_size=1,
+            remaining_size=0,
+            queue_ahead_at_fill=0,
+            fill_fee_cents=0.1,
+            note="entry_queue_cleared",
+        )
+        inserted_exit = paper_store.insert_fill(
+            fill_id="fill-exit-not-pending",
+            intent_id=intent_exit.id,
+            fill_ts_ms=now_ms - 60_000,
+            fill_price_cents=49.0,
+            fill_size=1,
+            remaining_size=0,
+            queue_ahead_at_fill=0,
+            fill_fee_cents=0.1,
+            note="exit_take_profit",
+        )
+        assert inserted_entry is True
+        assert inserted_exit is True
+
+        pending = paper_store.get_pending_fill_30s_outcome_updates(cutoff_ts_ms=now_ms - 30_000)
+        assert len(pending) == 1
+        assert pending[0]["fill_id"] == "fill-entry-pending"
+        assert pending[0]["side"] == "YES"
+
+        first_update = paper_store.update_fill_30s_outcome(
+            fill_id="fill-entry-pending",
+            mark_30s_after_fill_cents=51.0,
+            pnl_30s_after_fill_cents=0.9,
+        )
+        second_update = paper_store.update_fill_30s_outcome(
+            fill_id="fill-entry-pending",
+            mark_30s_after_fill_cents=52.0,
+            pnl_30s_after_fill_cents=1.9,
+        )
+        assert first_update is True
+        assert second_update is False
+
+        enriched = paper_store.get_recent_fills_with_intent_metadata(limit=10)
+        updated_row = next(row for row in enriched if row["fill_id"] == "fill-entry-pending")
+        assert updated_row["mark_30s_after_fill_cents"] == 51.0
+        assert updated_row["pnl_30s_after_fill_cents"] == 0.9
+
+    def test_short_horizon_outcome_metrics_grouping(self, paper_store: PaperStore) -> None:
+        """Outcome metrics should aggregate by side, fill path, and edge buckets."""
+        now_ms = int(time.time() * 1000)
+        intents = [
+            QuoteIntent(
+                id="intent-metrics-yes-1",
+                ticker="KXNBAGAME-METRICS-1",
+                side="YES",
+                quote_price_cents=50.0,
+                size_contracts=1,
+                created_ts_ms=now_ms - 80_000,
+                net_edge=0.6,
+                inside_width=2.0,
+                imbalance_gap=0.0,
+                fee_mode="maker",
+                round_trip=True,
+            ),
+            QuoteIntent(
+                id="intent-metrics-no-1",
+                ticker="KXNBAGAME-METRICS-2",
+                side="NO",
+                quote_price_cents=49.0,
+                size_contracts=1,
+                created_ts_ms=now_ms - 80_000,
+                net_edge=1.4,
+                inside_width=2.0,
+                imbalance_gap=0.0,
+                fee_mode="maker",
+                round_trip=True,
+            ),
+            QuoteIntent(
+                id="intent-metrics-yes-2",
+                ticker="KXNBAGAME-METRICS-3",
+                side="YES",
+                quote_price_cents=51.0,
+                size_contracts=1,
+                created_ts_ms=now_ms - 80_000,
+                net_edge=1.6,
+                inside_width=2.0,
+                imbalance_gap=0.0,
+                fee_mode="maker",
+                round_trip=True,
+            ),
+        ]
+        for intent in intents:
+            paper_store.insert_intent(intent)
+
+        assert paper_store.insert_fill(
+            fill_id="fill-metrics-yes-1",
+            intent_id="intent-metrics-yes-1",
+            fill_ts_ms=now_ms - 50_000,
+            fill_price_cents=50.0,
+            fill_size=1,
+            remaining_size=0,
+            fill_fee_cents=0.1,
+            note="entry_queue_cleared",
+            mark_30s_after_fill_cents=50.8,
+            pnl_30s_after_fill_cents=0.7,
+        )
+        assert paper_store.insert_fill(
+            fill_id="fill-metrics-no-1",
+            intent_id="intent-metrics-no-1",
+            fill_ts_ms=now_ms - 45_000,
+            fill_price_cents=49.0,
+            fill_size=1,
+            remaining_size=0,
+            fill_fee_cents=0.1,
+            note="entry_price_improves",
+            mark_30s_after_fill_cents=48.0,
+            pnl_30s_after_fill_cents=0.9,
+        )
+        assert paper_store.insert_fill(
+            fill_id="fill-metrics-yes-2",
+            intent_id="intent-metrics-yes-2",
+            fill_ts_ms=now_ms - 40_000,
+            fill_price_cents=51.0,
+            fill_size=1,
+            remaining_size=0,
+            fill_fee_cents=0.1,
+            note="entry_queue_cleared",
+            mark_30s_after_fill_cents=50.4,
+            pnl_30s_after_fill_cents=-0.7,
+        )
+
+        metrics = paper_store.get_short_horizon_outcome_metrics(window_seconds=3600)
+
+        assert metrics["total_samples"] == 3
+        assert metrics["avg_pnl_30s_cents"] == pytest.approx(0.3)
+        assert metrics["win_rate_30s"] == pytest.approx(2 / 3)
+
+        assert metrics["by_side"]["YES"]["sample_count"] == 2
+        assert metrics["by_side"]["YES"]["avg_pnl_30s_cents"] == pytest.approx(0.0)
+        assert metrics["by_side"]["NO"]["sample_count"] == 1
+        assert metrics["by_side"]["NO"]["avg_pnl_30s_cents"] == pytest.approx(0.9)
+
+        assert metrics["by_fill_path"]["queue_cleared"]["sample_count"] == 2
+        assert metrics["by_fill_path"]["price_improves"]["sample_count"] == 1
+
+        bucket_ranges = {
+            (bucket["edge_bucket_low_cents"], bucket["edge_bucket_high_cents"]): bucket
+            for bucket in metrics["by_edge_bucket"]
+        }
+        assert (0.0, 1.0) in bucket_ranges
+        assert (1.0, 2.0) in bucket_ranges
+        assert bucket_ranges[(0.0, 1.0)]["sample_count"] == 1
+        assert bucket_ranges[(1.0, 2.0)]["sample_count"] == 2

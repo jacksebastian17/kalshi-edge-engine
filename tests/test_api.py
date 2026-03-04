@@ -521,6 +521,59 @@ class TestPaperDebugEndpoints:
                 with contextlib.suppress(OSError):
                     os.unlink(db_path)
 
+    def test_paper_debug_force_fill_insert_failure_does_not_mutate_position(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Rejected debug insert should not mutate position or force FILLED status."""
+        import kalshi_edge_engine.api.main as main_module
+
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            store = PaperStore(db_path=db_path)
+            intent = QuoteIntent(
+                id="intent-force-insert-fail",
+                ticker="KXNBAGAME-26MAR01SASNYK-SAS",
+                side="YES",
+                quote_price_cents=53.0,
+                size_contracts=1,
+                created_ts_ms=int(time.time() * 1000),
+                net_edge=1.2,
+                inside_width=2.2,
+                imbalance_gap=0.0,
+                fee_mode="maker",
+                round_trip=True,
+            )
+            store.insert_intent(intent)
+            store.update_intent_status(intent.id, "OPEN", last_seen_best_bid=52.0, queue_ahead=1)
+
+            def _reject_insert_fill(*_args, **_kwargs) -> bool:
+                return False
+
+            monkeypatch.setattr(store, "insert_fill", _reject_insert_fill)
+            main_module._paper_store = store
+
+            response = client.post(
+                "/paper/debug/force-fill",
+                json={"intent_id": intent.id, "fill_size": 1},
+            )
+            assert response.status_code == 200
+            data = response.json()
+            assert data["filled_size"] == 0
+            assert data["remaining_size"] == 1
+            assert data["status"] == "OPEN"
+
+            assert store.get_positions() == []
+            refreshed_intent = store.get_intent_record(intent.id)
+            assert refreshed_intent is not None
+            assert refreshed_intent["status"] == "OPEN"
+        finally:
+            main_module._paper_store = None
+            gc.collect()
+            if os.path.exists(db_path):
+                with contextlib.suppress(OSError):
+                    os.unlink(db_path)
+
     def test_signals_top_respects_limit(self, client: TestClient) -> None:
         """Test that endpoint respects n parameter."""
         import kalshi_edge_engine.api.main as main_module
@@ -817,6 +870,94 @@ class TestPaperMetricsEndpoint:
                 with contextlib.suppress(OSError):
                     os.unlink(db_path)
 
+    def test_paper_outcome_metrics_returns_short_horizon_aggregates(
+        self, client: TestClient
+    ) -> None:
+        """GET /paper/metrics/outcomes returns edge-vs-outcome aggregate telemetry."""
+        import kalshi_edge_engine.api.main as main_module
+
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            store = PaperStore(db_path=db_path)
+            main_module._paper_store = store
+
+            now_ms = int(time.time() * 1000)
+            intent_yes = QuoteIntent(
+                id="intent-outcome-api-yes",
+                ticker="KXNBAGAME-OUTCOME-API-YES",
+                side="YES",
+                quote_price_cents=50.0,
+                size_contracts=1,
+                created_ts_ms=now_ms - 90_000,
+                net_edge=1.2,
+                inside_width=2.0,
+                imbalance_gap=0.0,
+                fee_mode="maker",
+                round_trip=True,
+            )
+            intent_no = QuoteIntent(
+                id="intent-outcome-api-no",
+                ticker="KXNBAGAME-OUTCOME-API-NO",
+                side="NO",
+                quote_price_cents=49.0,
+                size_contracts=1,
+                created_ts_ms=now_ms - 90_000,
+                net_edge=0.8,
+                inside_width=2.0,
+                imbalance_gap=0.0,
+                fee_mode="maker",
+                round_trip=True,
+            )
+            store.insert_intent(intent_yes)
+            store.insert_intent(intent_no)
+
+            assert store.insert_fill(
+                fill_id="fill-outcome-api-yes",
+                intent_id=intent_yes.id,
+                fill_ts_ms=now_ms - 60_000,
+                fill_price_cents=50.0,
+                fill_size=1,
+                remaining_size=0,
+                queue_ahead_at_fill=0,
+                fill_fee_cents=0.1,
+                note="entry_queue_cleared",
+                mark_30s_after_fill_cents=50.8,
+                pnl_30s_after_fill_cents=0.7,
+            )
+            assert store.insert_fill(
+                fill_id="fill-outcome-api-no",
+                intent_id=intent_no.id,
+                fill_ts_ms=now_ms - 55_000,
+                fill_price_cents=49.0,
+                fill_size=1,
+                remaining_size=0,
+                queue_ahead_at_fill=0,
+                fill_fee_cents=0.1,
+                note="entry_moved_through",
+                mark_30s_after_fill_cents=49.4,
+                pnl_30s_after_fill_cents=-0.5,
+            )
+
+            response = client.get("/paper/metrics/outcomes?window_seconds=3600")
+            assert response.status_code == 200
+
+            data = response.json()
+            assert data["window_seconds"] == 3600
+            assert data["total_samples"] == 2
+            assert data["avg_pnl_30s_cents"] == pytest.approx(0.1)
+            assert data["win_rate_30s"] == pytest.approx(0.5)
+            assert data["by_side"]["YES"]["sample_count"] == 1
+            assert data["by_side"]["NO"]["sample_count"] == 1
+            assert data["by_fill_path"]["queue_cleared"]["sample_count"] == 1
+            assert data["by_fill_path"]["moved_through"]["sample_count"] == 1
+        finally:
+            main_module._paper_store = None
+            gc.collect()
+            if os.path.exists(db_path):
+                with contextlib.suppress(OSError):
+                    os.unlink(db_path)
+
 
 class TestPaperConfigAndSummaryEndpoints:
     """Tests for /paper/config and /paper/summary consistency."""
@@ -890,6 +1031,123 @@ class TestPaperConfigAndSummaryEndpoints:
         finally:
             main_module._paper_store = None
             main_module._paper_enabled = False
+            gc.collect()
+            if os.path.exists(db_path):
+                with contextlib.suppress(OSError):
+                    os.unlink(db_path)
+
+    def test_paper_summary_uses_uncapped_total_fill_count(self, client: TestClient) -> None:
+        """GET /paper/summary should report total_fills via COUNT(*), not recent-fills limits."""
+        import kalshi_edge_engine.api.main as main_module
+
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            store = PaperStore(db_path=db_path)
+            main_module._paper_store = store
+            main_module._paper_enabled = True
+
+            now_ms = int(time.time() * 1000)
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO quote_intents
+                    (id, ticker, side, quote_price_cents, size_contracts, created_ts_ms,
+                     net_edge, inside_width, imbalance_gap, fee_mode, round_trip, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "summary-fill-intent-1",
+                        "KXNBAGAME-SUM-FILLS",
+                        "YES",
+                        50.0,
+                        2000,
+                        now_ms,
+                        1.0,
+                        2.0,
+                        None,
+                        "maker",
+                        True,
+                        "FILLED",
+                    ),
+                )
+
+                for idx in range(1005):
+                    conn.execute(
+                        """
+                        INSERT INTO paper_fills
+                        (id, intent_id, fill_ts_ms, fill_price_cents, fill_size,
+                         remaining_size, queue_ahead_at_fill, fill_fee_cents, note)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            f"summary-fill-{idx}",
+                            "summary-fill-intent-1",
+                            now_ms + idx,
+                            50.0,
+                            1,
+                            max(0, 2000 - idx - 1),
+                            0,
+                            0.0,
+                            "entry_queue_cleared",
+                        ),
+                    )
+                conn.commit()
+
+            response = client.get("/paper/summary")
+            assert response.status_code == 200
+            assert response.json()["total_fills"] == 1005
+        finally:
+            main_module._paper_store = None
+            main_module._paper_enabled = False
+            gc.collect()
+            if os.path.exists(db_path):
+                with contextlib.suppress(OSError):
+                    os.unlink(db_path)
+
+
+class TestPaperIntentsStatusLifecycle:
+    """Tests for active vs legacy paper intent status handling."""
+
+    def test_paper_intents_accepts_legacy_status_filters(self, client: TestClient) -> None:
+        """GET /paper/intents should keep legacy status filters queryable."""
+        import kalshi_edge_engine.api.main as main_module
+
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            store = PaperStore(db_path=db_path)
+            main_module._paper_store = store
+
+            response = client.get("/paper/intents?status=TAKE_PROFIT")
+            assert response.status_code == 200
+            data = response.json()
+            assert data["status"] == "TAKE_PROFIT"
+
+            response = client.get("/paper/intents?status=MAX_HOLD_REACHED")
+            assert response.status_code == 200
+            data = response.json()
+            assert data["status"] == "MAX_HOLD_REACHED"
+        finally:
+            main_module._paper_store = None
+            gc.collect()
+            if os.path.exists(db_path):
+                with contextlib.suppress(OSError):
+                    os.unlink(db_path)
+
+    def test_paper_intents_rejects_unknown_status(self, client: TestClient) -> None:
+        """GET /paper/intents should reject unknown statuses."""
+        import kalshi_edge_engine.api.main as main_module
+
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            main_module._paper_store = PaperStore(db_path=db_path)
+
+            response = client.get("/paper/intents?status=TIME_STOP")
+            assert response.status_code == 400
+        finally:
+            main_module._paper_store = None
             gc.collect()
             if os.path.exists(db_path):
                 with contextlib.suppress(OSError):

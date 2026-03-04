@@ -9,6 +9,10 @@ CURRENT STATE:
 NEW PATH (RECOMMENDED):
 - Use RealisticOrderSimulator from paper_sim.py for realistic fill simulation
 - Read from quote_intents/paper_fills/paper_positions tables in PaperStore
+
+SEMANTICS NOTE:
+- take_profit is modeled as cents-per-contract threshold
+    (`take_profit_cents_per_contract`) in lifecycle logic.
 """
 
 import asyncio
