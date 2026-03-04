@@ -400,3 +400,198 @@ class TestComputePaperMetrics:
         assert metrics["total_pnl_cents"] == pytest.approx(
             metrics["realized_pnl_cents"] + metrics["unrealized_pnl_cents"]
         )
+
+    def test_compute_metrics_unrealized_excludes_exit_fill_fees(self, paper_store: PaperStore):
+        """Unrealized fee subtraction must include entry fills only, not exit fills."""
+        now_ms = int(time.time() * 1000)
+        ticker = "NBA_EXIT_FEE_FILTER"
+        side = "YES"
+
+        entry_intent_id = "entry-fee-filter"
+        exit_intent_id = "exit-fee-filter"
+
+        with sqlite3.connect(paper_store.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO quote_intents
+                (id, ticker, side, quote_price_cents, size_contracts, created_ts_ms,
+                 net_edge, inside_width, imbalance_gap, fee_mode, round_trip, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    entry_intent_id,
+                    ticker,
+                    side,
+                    50.0,
+                    2,
+                    now_ms,
+                    1.0,
+                    0.5,
+                    None,
+                    "taker",
+                    False,
+                    "FILLED",
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO quote_intents
+                (id, ticker, side, quote_price_cents, size_contracts, created_ts_ms,
+                 net_edge, inside_width, imbalance_gap, fee_mode, round_trip, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    exit_intent_id,
+                    ticker,
+                    side,
+                    54.0,
+                    2,
+                    now_ms + 1000,
+                    1.0,
+                    0.5,
+                    None,
+                    "taker",
+                    False,
+                    "FILLED",
+                ),
+            )
+            conn.commit()
+
+        entry_fee = 1.5
+        exit_fee = 4.0
+
+        paper_store.insert_fill(
+            fill_id="entry-fee-fill",
+            intent_id=entry_intent_id,
+            fill_ts_ms=now_ms + 2000,
+            fill_price_cents=50.0,
+            fill_size=2,
+            remaining_size=0,
+            queue_ahead_at_fill=0,
+            fill_fee_cents=entry_fee,
+            note="fill",
+        )
+        paper_store.insert_fill(
+            fill_id="exit-fee-fill",
+            intent_id=exit_intent_id,
+            fill_ts_ms=now_ms + 3000,
+            fill_price_cents=54.0,
+            fill_size=2,
+            remaining_size=0,
+            queue_ahead_at_fill=0,
+            fill_fee_cents=exit_fee,
+            note="exit_time_stop",
+        )
+
+        paper_store.upsert_position(
+            ticker=ticker,
+            side=side,
+            net_contracts=2,
+            avg_entry_price_cents=50.0,
+            realized_pnl_cents=0.0,
+            first_open_ts_ms=now_ms,
+        )
+
+        metrics = paper_store.compute_paper_metrics({ticker: {side: 55.0}})
+        expected_unrealized = ((55.0 - 50.0) * 2) - entry_fee
+
+        assert metrics["unrealized_pnl_cents"] == pytest.approx(expected_unrealized)
+
+    def test_compute_metrics_mark_price_dict_uses_yes_no_side_keys(self, paper_store: PaperStore):
+        """Unrealized PnL should map marks by exact YES/NO side keys."""
+        now_ms = int(time.time() * 1000)
+
+        paper_store.upsert_position(
+            ticker="NBA_SIDE_YES",
+            side="yes",
+            net_contracts=2,
+            avg_entry_price_cents=50.0,
+            realized_pnl_cents=0.0,
+            first_open_ts_ms=now_ms,
+        )
+        paper_store.upsert_position(
+            ticker="NBA_SIDE_NO",
+            side="No",
+            net_contracts=3,
+            avg_entry_price_cents=60.0,
+            realized_pnl_cents=0.0,
+            first_open_ts_ms=now_ms,
+        )
+
+        metrics = paper_store.compute_paper_metrics(
+            {
+                "NBA_SIDE_YES": {"YES": 55.0},
+                "NBA_SIDE_NO": {"NO": 58.0},
+            }
+        )
+
+        expected_yes = (55.0 - 50.0) * 2
+        expected_no = (60.0 - 58.0) * 3
+        assert metrics["unrealized_pnl_cents"] == pytest.approx(expected_yes + expected_no)
+
+    def test_compute_metrics_unrealized_ignores_exit_take_profit_fees(
+        self, paper_store: PaperStore
+    ):
+        """Fees from exit_take_profit fills should not be subtracted from unrealized PnL."""
+        now_ms = int(time.time() * 1000)
+        ticker = "NBA_EXIT_TP_FILTER"
+        side = "YES"
+
+        with sqlite3.connect(paper_store.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO quote_intents
+                (id, ticker, side, quote_price_cents, size_contracts, created_ts_ms,
+                 net_edge, inside_width, imbalance_gap, fee_mode, round_trip, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "entry-tp-filter",
+                    ticker,
+                    side,
+                    51.0,
+                    1,
+                    now_ms,
+                    1.0,
+                    0.5,
+                    None,
+                    "taker",
+                    False,
+                    "FILLED",
+                ),
+            )
+            conn.commit()
+
+        paper_store.insert_fill(
+            fill_id="entry-tp-fee",
+            intent_id="entry-tp-filter",
+            fill_ts_ms=now_ms + 1000,
+            fill_price_cents=51.0,
+            fill_size=1,
+            remaining_size=0,
+            queue_ahead_at_fill=0,
+            fill_fee_cents=1.25,
+            note=None,
+        )
+        paper_store.insert_fill(
+            fill_id="exit-tp-fee",
+            intent_id="entry-tp-filter",
+            fill_ts_ms=now_ms + 2000,
+            fill_price_cents=55.0,
+            fill_size=0,
+            remaining_size=0,
+            queue_ahead_at_fill=0,
+            fill_fee_cents=9.99,
+            note="exit_take_profit",
+        )
+        paper_store.upsert_position(
+            ticker=ticker,
+            side=side,
+            net_contracts=1,
+            avg_entry_price_cents=51.0,
+            realized_pnl_cents=0.0,
+            first_open_ts_ms=now_ms,
+        )
+
+        metrics = paper_store.compute_paper_metrics({ticker: {side: 53.0}})
+        assert metrics["unrealized_pnl_cents"] == pytest.approx((53.0 - 51.0) - 1.25)

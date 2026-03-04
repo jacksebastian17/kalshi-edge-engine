@@ -361,6 +361,13 @@ def test_take_profit_close_realizes_pnl_and_updates_exit_ts(
         assert row is not None
         assert row[0] is not None
 
+        cursor.execute(
+            "SELECT note FROM paper_fills WHERE note = 'exit_take_profit'",
+        )
+        fill_row = cursor.fetchone()
+        assert fill_row is not None
+        assert fill_row[0] == "exit_take_profit"
+
     paper_store.insert_pnl_snapshot(
         ts_ms=now_ms + 12_000,
         realized_pnl_cents=actual_realized,
@@ -373,3 +380,90 @@ def test_take_profit_close_realizes_pnl_and_updates_exit_ts(
     assert snapshot["total_pnl_cents"] == pytest.approx(
         snapshot["realized_pnl_cents"] + snapshot["unrealized_pnl_cents"]
     )
+
+
+def test_time_stop_close_inserts_exit_fill_and_closes_position(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Time-stop close should insert exit fill, zero position, and stamp exited intents."""
+    import kalshi_edge_engine.api.main as main_module
+
+    paper_store = PaperStore(str(tmp_path / "test_time_stop_lifecycle.db"))
+    now_ms = int(time.time() * 1000)
+    old_open_ts = now_ms - 700_000
+
+    intent = QuoteIntent(
+        id="ts-intent-1",
+        ticker="TEST-TICKER-TS",
+        side="NO",
+        quote_price_cents=48.0,
+        size_contracts=3,
+        created_ts_ms=old_open_ts,
+        net_edge=1.2,
+        inside_width=1.8,
+        imbalance_gap=0.3,
+        fee_mode="maker",
+        round_trip=True,
+    )
+    paper_store.insert_intent(intent)
+    paper_store.update_intent_status(intent.id, "FILLED")
+    paper_store.insert_fill(
+        fill_id="ts-entry-fill",
+        intent_id=intent.id,
+        fill_ts_ms=old_open_ts + 1000,
+        fill_price_cents=48.0,
+        fill_size=3,
+        remaining_size=0,
+        fill_fee_cents=0.0,
+    )
+    paper_store.upsert_position(
+        ticker=intent.ticker,
+        side=intent.side,
+        net_contracts=3,
+        avg_entry_price_cents=48.0,
+        realized_pnl_cents=0.0,
+        first_open_ts_ms=old_open_ts,
+    )
+
+    monkeypatch.setattr(main_module, "_paper_store", paper_store)
+
+    closed = main_module._close_position(
+        ticker=intent.ticker,
+        side=intent.side,
+        net_contracts=3,
+        avg_entry_price_cents=48.0,
+        realized_pnl_cents=0.0,
+        first_open_ts_ms=old_open_ts,
+        mark_price_cents=44.0,
+        now_ms=now_ms,
+        reason="time_stop",
+    )
+
+    assert closed is True
+    assert paper_store.get_positions() == []
+
+    with sqlite3.connect(paper_store.db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT net_contracts, realized_pnl_cents FROM paper_positions WHERE ticker = ? AND side = ?",
+            (intent.ticker, intent.side),
+        )
+        pos_row = cursor.fetchone()
+        assert pos_row is not None
+        assert pos_row[0] == 0
+
+        cursor.execute(
+            "SELECT note FROM paper_fills WHERE note = 'exit_time_stop'",
+        )
+        fill_row = cursor.fetchone()
+        assert fill_row is not None
+        assert fill_row[0] == "exit_time_stop"
+
+        cursor.execute(
+            "SELECT exit_ts_ms FROM quote_intents WHERE id = ?",
+            (intent.id,),
+        )
+        intent_row = cursor.fetchone()
+        assert intent_row is not None
+        assert intent_row[0] == now_ms

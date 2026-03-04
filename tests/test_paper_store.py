@@ -468,6 +468,11 @@ class TestPaperStoreV2:
                 remaining_size=0,
                 queue_ahead_at_fill=0,
                 fill_fee_cents=0.5,
+                best_bid_at_fill_cents=49.0 + i,
+                cross_at_fill_cents=51.0 + i,
+                mark_30s_after_fill_cents=52.0 + i,
+                pnl_30s_after_fill_cents=1.5 + i,
+                note=f"test_note_{i}",
             )
 
         fills = paper_store.get_recent_fills(limit=10)
@@ -476,6 +481,103 @@ class TestPaperStoreV2:
         assert fills[0]["intent_id"] == "intent-2"
         assert fills[1]["intent_id"] == "intent-1"
         assert fills[2]["intent_id"] == "intent-0"
+        assert fills[0]["note"] == "test_note_2"
+        assert fills[0]["best_bid_at_fill_cents"] == 51.0
+        assert fills[0]["cross_at_fill_cents"] == 53.0
+        assert fills[0]["mark_30s_after_fill_cents"] == 54.0
+        assert fills[0]["pnl_30s_after_fill_cents"] == 3.5
+
+    def test_get_fills_for_position_includes_telemetry(
+        self, paper_store: PaperStore, sample_intent: QuoteIntent
+    ) -> None:
+        """Position fills query should include note + top-of-book telemetry fields."""
+        now_ms = int(time.time() * 1000)
+        paper_store.insert_intent(sample_intent)
+
+        paper_store.insert_fill(
+            fill_id="fill-pos-telemetry-1",
+            intent_id=sample_intent.id,
+            fill_ts_ms=now_ms,
+            fill_price_cents=50.5,
+            fill_size=1,
+            remaining_size=0,
+            queue_ahead_at_fill=0,
+            fill_fee_cents=0.5,
+            best_bid_at_fill_cents=50.0,
+            cross_at_fill_cents=51.0,
+            note="position_fill",
+        )
+
+        fills = paper_store.get_fills_for_position(sample_intent.ticker, sample_intent.side)
+        assert len(fills) == 1
+        assert fills[0]["note"] == "position_fill"
+        assert fills[0]["best_bid_at_fill_cents"] == 50.0
+        assert fills[0]["cross_at_fill_cents"] == 51.0
+
+    def test_mark_exited_intents_skips_synthetic_exit_intents(
+        self, paper_store: PaperStore
+    ) -> None:
+        """Exit metadata update should not touch synthetic exit_intent:* rows."""
+        now_ms = int(time.time() * 1000)
+
+        normal_intent = QuoteIntent(
+            id="intent-normal-1",
+            ticker="KXNBAGAME-TEST-EXIT",
+            side="YES",
+            quote_price_cents=50.0,
+            size_contracts=1,
+            created_ts_ms=now_ms,
+            net_edge=1.0,
+            inside_width=2.0,
+            imbalance_gap=0.0,
+            fee_mode="maker",
+            round_trip=True,
+        )
+        synthetic_exit_intent = QuoteIntent(
+            id="exit_intent:take_profit:KXNBAGAME-TEST-EXIT:YES:123",
+            ticker="KXNBAGAME-TEST-EXIT",
+            side="YES",
+            quote_price_cents=51.0,
+            size_contracts=1,
+            created_ts_ms=now_ms,
+            net_edge=0.0,
+            inside_width=0.0,
+            imbalance_gap=None,
+            fee_mode="taker",
+            round_trip=False,
+        )
+
+        paper_store.insert_intent(normal_intent)
+        paper_store.insert_intent(synthetic_exit_intent)
+        paper_store.update_intent_status(normal_intent.id, "FILLED")
+        paper_store.update_intent_status(synthetic_exit_intent.id, "FILLED")
+
+        paper_store.mark_exited_intents_for_ticker_side(
+            ticker="KXNBAGAME-TEST-EXIT",
+            side="YES",
+            exit_ts_ms=now_ms + 1000,
+            mark_price_cents=52.0,
+        )
+
+        import sqlite3
+
+        with sqlite3.connect(paper_store.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT exit_ts_ms FROM quote_intents WHERE id = ?",
+                (normal_intent.id,),
+            )
+            normal_exit_row = cursor.fetchone()
+            assert normal_exit_row is not None
+            assert normal_exit_row[0] is not None
+
+            cursor.execute(
+                "SELECT exit_ts_ms FROM quote_intents WHERE id = ?",
+                (synthetic_exit_intent.id,),
+            )
+            synthetic_exit_row = cursor.fetchone()
+            assert synthetic_exit_row is not None
+            assert synthetic_exit_row[0] is None
 
     def test_get_intents_by_status_includes_runtime_fields(
         self, paper_store: PaperStore, sample_intent: QuoteIntent

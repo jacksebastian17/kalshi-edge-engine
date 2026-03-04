@@ -21,9 +21,16 @@ def client() -> TestClient:
 class TestScannerStartStop:
     """Test POST /scanner/start and POST /scanner/stop endpoints."""
 
-    def test_scanner_start_when_not_running(self, client: TestClient) -> None:
+    def test_scanner_start_when_not_running(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Test starting scanner when not running."""
         import kalshi_edge_engine.api.main as main_module
+
+        async def _idle_scanner(_client: Any) -> None:
+            await asyncio.sleep(3600)
+
+        monkeypatch.setattr(main_module, "_nba_scanner_loop", _idle_scanner)
 
         # Reset state
         main_module._scanner_state.enabled = False
@@ -41,6 +48,9 @@ class TestScannerStartStop:
         assert data["started"] is True
         assert data.get("reason") is None
 
+        stop_response = client.post("/scanner/stop")
+        assert stop_response.status_code == 200
+
     def test_scanner_start_when_already_running(self, client: TestClient) -> None:
         """Test starting scanner when already running."""
         import kalshi_edge_engine.api.main as main_module
@@ -50,7 +60,7 @@ class TestScannerStartStop:
         client.app.state.kalshi_client = mock_client
 
         # Simulate running task
-        fake_task = AsyncMock()
+        fake_task = MagicMock()
         fake_task.done = MagicMock(return_value=False)
         client.app.state.scanner_task = fake_task
         main_module._scanner_state.enabled = True
@@ -325,14 +335,7 @@ class TestScannerShutdownAndRestart:
 
         main_module._scanner_state.enabled = True
 
-        # Create an awaitable mock task using a coroutine
-        async def dummy_coro() -> None:
-            raise asyncio.CancelledError()
-
         class AwaitableMockTask:
-            def __init__(self, coro: Any) -> None:
-                self.coro = coro
-
             def done(self) -> bool:
                 return False
 
@@ -340,9 +343,12 @@ class TestScannerShutdownAndRestart:
                 pass
 
             def __await__(self) -> Any:
-                return self.coro.__await__()
+                async def _cancelled() -> None:
+                    raise asyncio.CancelledError()
 
-        mock_task = AwaitableMockTask(dummy_coro())
+                return _cancelled().__await__()
+
+        mock_task = AwaitableMockTask()
         client.app.state.scanner_task = mock_task
 
         response = client.post("/scanner/stop")
@@ -373,9 +379,16 @@ class TestScannerShutdownAndRestart:
         status = status_response.json()
         assert status["enabled"] is False
 
-    def test_restart_after_stop_works(self, client: TestClient) -> None:
+    def test_restart_after_stop_works(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Test that scanner can be restarted after being stopped."""
         import kalshi_edge_engine.api.main as main_module
+
+        async def _idle_scanner(_client: Any) -> None:
+            await asyncio.sleep(3600)
+
+        monkeypatch.setattr(main_module, "_nba_scanner_loop", _idle_scanner)
 
         # Don't have a task initially
         if hasattr(client.app.state, "scanner_task"):
@@ -393,11 +406,13 @@ class TestScannerShutdownAndRestart:
         assert hasattr(client.app.state, "scanner_task")
         first_task = client.app.state.scanner_task
 
-        # Cancel the task to simulate stop
-        first_task.cancel()
-
-        # Clear task reference to simulate what stop_scanner does
-        delattr(client.app.state, "scanner_task")
+        stop_response = client.post("/scanner/stop")
+        assert stop_response.status_code == 200
+        stop_payload = stop_response.json()
+        if stop_payload["stopped"] is False:
+            assert stop_payload["reason"] == "not_running"
+            client.app.state.scanner_task = None
+        assert client.app.state.scanner_task is None
 
         # Start again should work
         response2 = client.post("/scanner/start")
@@ -409,30 +424,23 @@ class TestScannerShutdownAndRestart:
         # Should be a different task
         assert first_task is not second_task
 
-        # Clean up
-        second_task.cancel()
+        stop_response_2 = client.post("/scanner/stop")
+        assert stop_response_2.status_code == 200
 
     def test_shutdown_cancels_running_task_from_app_state(self, client: TestClient) -> None:
         """Test that shutdown cancels task from app.state, not local variable."""
 
-        # Create an awaitable mock task using a coroutine
-        async def dummy_coro() -> None:
-            raise asyncio.CancelledError()
-
         class AwaitableMockTask:
-            def __init__(self, coro: Any) -> None:
-                self.coro = coro
+            def __init__(self) -> None:
+                self.cancel_called = False
 
             def done(self) -> bool:
                 return False
 
             def cancel(self) -> None:
-                pass
+                self.cancel_called = True
 
-            def __await__(self) -> Any:
-                return self.coro.__await__()
-
-        mock_task = AwaitableMockTask(dummy_coro())
+        mock_task = AwaitableMockTask()
 
         # Place it only in app.state (simulating task started via POST)
         client.app.state.scanner_task = mock_task

@@ -409,6 +409,65 @@ class TestRealisticOrderSimulator:
         )
 
     @pytest.mark.asyncio
+    async def test_queue_initializes_once_when_best_size_changes(
+        self, mock_client: AsyncMock
+    ) -> None:
+        """Queue ahead should initialize once and then only decay, not re-seed each poll."""
+        simulator = RealisticOrderSimulator(
+            poll_interval_seconds=0.02,
+            fill_probability_price_moved=0.0,
+            fill_probability_at_best=0.0,
+            fill_probability_price_improves=0.0,
+            simulated_volume_per_poll=2,
+        )
+
+        now_ms = int(time.time() * 1000)
+        order_request = OrderRequest(
+            id="order-queue-init-once-1",
+            ticker="TEST-TICKER",
+            side="YES",
+            quote_price_cents=50.0,
+            size_contracts=5,
+            created_ts_ms=now_ms,
+            net_edge=0.5,
+            entry_fee_cents=0.5,
+            take_profit_cents=0.0,
+            max_hold_seconds=0.06,
+        )
+
+        best_sizes = [10, 4, 4]
+        call_idx = -1
+
+        def _orderbook_sequence(_ticker: str) -> dict[str, list[list[float]]]:
+            nonlocal call_idx
+            call_idx += 1
+            size = best_sizes[min(call_idx, len(best_sizes) - 1)]
+            return {
+                "yes": [[50.0, size]],
+                "no": [[45.0, 100]],
+            }
+
+        mock_client.get_orderbook.side_effect = _orderbook_sequence
+
+        observed_queue: list[int] = []
+
+        def _on_poll(runtime_update: dict[str, object]) -> None:
+            queue_value = runtime_update.get("queue_ahead_contracts")
+            if isinstance(queue_value, int):
+                observed_queue.append(queue_value)
+
+        await simulator.simulate_order_fills(
+            mock_client,
+            order_request,
+            horizon_seconds=0.08,
+            on_poll=_on_poll,
+        )
+
+        assert len(observed_queue) >= 2
+        assert observed_queue[0] == 8
+        assert observed_queue[1] == 2
+
+    @pytest.mark.asyncio
     async def test_simulate_order_fills_order_state_structure(
         self,
         simulator: RealisticOrderSimulator,
@@ -726,6 +785,34 @@ class TestDiagnosticsInvariants:
             orderbook=orderbook,
             queue_ahead=10,
             last_best_size_at_bid=None,
+            simulated_volume_per_poll=50,
+        )
+
+        assert diagnostics["eligibility"]["at_best_price"] is True
+        assert diagnostics["eligibility"]["price_moved_through"] is False
+        assert diagnostics["eligibility"]["price_moved_away"] is False
+
+    def test_at_best_price_normalization_invariant_holds(self) -> None:
+        """Diagnostics normalization should enforce exclusivity when at_best_price is true."""
+        now_ms = int(time.time() * 1000)
+        order = OrderRequest(
+            id="order-invariant-1b",
+            ticker="TEST-TICKER",
+            side="NO",
+            quote_price_cents=48.0,
+            size_contracts=1,
+            created_ts_ms=now_ms,
+            net_edge=0.5,
+            entry_fee_cents=0.5,
+            take_profit_cents=2.0,
+            max_hold_seconds=600,
+        )
+
+        diagnostics = compute_simulator_diagnostics(
+            order=order,
+            orderbook={"yes": [[52.0, 100]], "no": [[48.0, 100]]},
+            queue_ahead=0,
+            last_best_size_at_bid=100,
             simulated_volume_per_poll=50,
         )
 

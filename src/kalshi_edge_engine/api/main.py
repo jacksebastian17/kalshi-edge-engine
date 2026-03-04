@@ -17,7 +17,8 @@ from kalshi_edge_engine.engine.fees import (
     estimate_maker_fee_cents,
     estimate_taker_fee_cents,
 )
-from kalshi_edge_engine.engine.paper import build_quote_intents
+from kalshi_edge_engine.engine.orderbook import parse_orderbook
+from kalshi_edge_engine.engine.paper import QuoteIntent, build_quote_intents
 from kalshi_edge_engine.engine.paper_sim import (
     OrderRequest,
     RealisticOrderSimulator,
@@ -145,6 +146,13 @@ class PaperStopResponse(BaseModel):
     reason: str | None = None
 
 
+class ForceFillRequest(BaseModel):
+    """Request body for POST /paper/debug/force-fill."""
+
+    intent_id: str
+    fill_size: int = 1
+
+
 # Paper trading response models
 class PaperIntentResponse(BaseModel):
     """Response model for paper trading intent."""
@@ -172,6 +180,9 @@ class PaperFillResponse(BaseModel):
     remaining_size: int
     queue_ahead_at_fill: int | None
     fill_fee_cents: float | None
+    note: str | None
+    best_bid_at_fill_cents: float | None
+    cross_at_fill_cents: float | None
     ticker: str
     side: str
 
@@ -276,13 +287,27 @@ _PAPER_MAX_DAILY_LOSS_CENTS = float(os.getenv("PAPER_MAX_DAILY_LOSS_CENTS", "0")
 # Paper trading state tracking
 _paper_store: PaperStore | None = None
 _paper_enabled: bool = False  # Runtime flag: starts disabled, can be toggled via API
-_paper_open_orders: dict[str, dict] = {}  # order_id -> order state
 _paper_simulation_tasks: set[asyncio.Task[Any]] = set()
 _paper_pnl_snapshot_interval_ms = 30_000  # Take snapshot every 30 seconds
 _last_pnl_snapshot_ts_ms = 0
 _paper_ticker_cooldown: dict[str, int] = {}  # ticker -> cooldown_until_ms
 _paper_intent_timestamps: list[int] = []  # Timestamps of intents created in last minute
 _paper_daily_loss_breached: bool = False  # True if MAX_DAILY_LOSS breached
+
+PAPER_INTENT_STATUS_OPEN = "OPEN"
+PAPER_INTENT_STATUS_FILLED = "FILLED"
+PAPER_INTENT_STATUS_TAKE_PROFIT = "TAKE_PROFIT"
+PAPER_INTENT_STATUS_MAX_HOLD_REACHED = "MAX_HOLD_REACHED"
+PAPER_INTENT_STATUS_EXPIRED = "EXPIRED"
+PAPER_INTENT_STATUS_ERROR = "ERROR"
+PAPER_INTENT_ALLOWED_STATUSES = {
+    PAPER_INTENT_STATUS_OPEN,
+    PAPER_INTENT_STATUS_FILLED,
+    PAPER_INTENT_STATUS_TAKE_PROFIT,
+    PAPER_INTENT_STATUS_MAX_HOLD_REACHED,
+    PAPER_INTENT_STATUS_EXPIRED,
+    PAPER_INTENT_STATUS_ERROR,
+}
 
 
 # Paper trading helpers
@@ -374,6 +399,126 @@ def _get_mark_price_for_position(
     return None
 
 
+async def _fetch_mark_price_cents(
+    client: KalshiClient,
+    ticker: str,
+    side: str,
+) -> float | None:
+    """Fetch current mark price from live orderbook for a ticker+side.
+
+    Returns:
+        Cross price in cents for the requested side, or None when unavailable.
+    """
+    try:
+        orderbook = await client.get_orderbook(ticker)
+        parsed_orderbook = parse_orderbook(orderbook)
+        if side == "YES":
+            return parsed_orderbook.cross_yes.price if parsed_orderbook.cross_yes else None
+        return parsed_orderbook.cross_no.price if parsed_orderbook.cross_no else None
+    except Exception as e:
+        logger.warning(
+            "paper_mark_price_fetch_failed",
+            extra={"ticker": ticker, "side": side, "error": str(e)},
+        )
+        return None
+
+
+def _close_position(
+    *,
+    ticker: str,
+    side: str,
+    net_contracts: int,
+    avg_entry_price_cents: float,
+    realized_pnl_cents: float,
+    first_open_ts_ms: int,
+    mark_price_cents: float | None,
+    now_ms: int,
+    reason: str,
+) -> bool:
+    """Close an open position and persist fill/position/intent lifecycle updates."""
+    if _paper_store is None or net_contracts <= 0 or mark_price_cents is None:
+        return False
+
+    intent_id = f"exit_intent:{reason}:{ticker}:{side}:{now_ms}"
+    _paper_store.insert_intent(
+        QuoteIntent(
+            id=intent_id,
+            ticker=ticker,
+            side=side,
+            quote_price_cents=mark_price_cents,
+            size_contracts=net_contracts,
+            created_ts_ms=now_ms,
+            net_edge=0.0,
+            inside_width=0.0,
+            imbalance_gap=None,
+            fee_mode="taker",
+            round_trip=False,
+        ),
+        entry_fee_cents=0.0,
+        take_profit_cents=_PAPER_TAKE_PROFIT_CENTS,
+        max_hold_seconds=_PAPER_MAX_HOLD_SECONDS,
+    )
+
+    price_delta = (
+        mark_price_cents - avg_entry_price_cents
+        if side == "YES"
+        else avg_entry_price_cents - mark_price_cents
+    )
+    exit_fee_cents = estimate_taker_fee_cents(mark_price_cents, net_contracts)
+    realized_increment_cents = (price_delta * net_contracts) - exit_fee_cents
+
+    did_insert_exit_fill = _paper_store.insert_fill(
+        fill_id=f"exit:{reason}:{ticker}:{side}:{now_ms}",
+        intent_id=intent_id,
+        fill_ts_ms=now_ms,
+        fill_price_cents=mark_price_cents,
+        fill_size=net_contracts,
+        remaining_size=0,
+        queue_ahead_at_fill=0,
+        fill_fee_cents=exit_fee_cents,
+        best_bid_at_fill_cents=mark_price_cents,
+        cross_at_fill_cents=mark_price_cents,
+        note=f"exit_{reason}",
+    )
+    if not did_insert_exit_fill:
+        logger.warning(
+            "paper_close_position_exit_fill_rejected",
+            extra={"reason": reason, "ticker": ticker, "side": side},
+        )
+        return False
+
+    _paper_store.upsert_position(
+        ticker=ticker,
+        side=side,
+        net_contracts=0,
+        avg_entry_price_cents=avg_entry_price_cents,
+        realized_pnl_cents=realized_pnl_cents + realized_increment_cents,
+        first_open_ts_ms=first_open_ts_ms,
+    )
+    _paper_store.mark_exited_intents_for_ticker_side(
+        ticker=ticker,
+        side=side,
+        exit_ts_ms=now_ms,
+        mark_price_cents=mark_price_cents,
+    )
+
+    logger.info(
+        "paper_position_closed",
+        extra={
+            "reason": reason,
+            "ticker": ticker,
+            "side": side,
+            "net_contracts": net_contracts,
+            "avg_entry_price_cents": avg_entry_price_cents,
+            "mark_price_cents": mark_price_cents,
+            "price_delta_cents": price_delta,
+            "exit_fee_cents": exit_fee_cents,
+            "realized_increment_cents": realized_increment_cents,
+        },
+    )
+    return True
+
+
 def _maybe_close_position_take_profit(
     *,
     ticker: str,
@@ -397,60 +542,17 @@ def _maybe_close_position_take_profit(
     if price_delta < _PAPER_TAKE_PROFIT_CENTS:
         return False
 
-    intent_id = _paper_store.get_latest_intent_id_for_ticker_side(ticker, side)
-    if intent_id is None:
-        logger.warning(
-            "paper_take_profit_skip_no_intent",
-            extra={"ticker": ticker, "side": side},
-        )
-        return False
-
-    exit_fee_cents = estimate_taker_fee_cents(mark_price_cents, net_contracts)
-    realized_increment_cents = (price_delta * net_contracts) - exit_fee_cents
-
-    _paper_store.insert_fill(
-        fill_id=f"exit:{intent_id}:{now_ms}",
-        intent_id=intent_id,
-        fill_ts_ms=now_ms,
-        fill_price_cents=mark_price_cents,
-        fill_size=net_contracts,
-        remaining_size=0,
-        queue_ahead_at_fill=0,
-        fill_fee_cents=exit_fee_cents,
-        best_bid_at_fill_cents=mark_price_cents,
-        cross_at_fill_cents=mark_price_cents,
-        note="exit",
-    )
-
-    _paper_store.upsert_position(
+    return _close_position(
         ticker=ticker,
         side=side,
-        net_contracts=0,
+        net_contracts=net_contracts,
         avg_entry_price_cents=avg_entry_price_cents,
-        realized_pnl_cents=realized_pnl_cents + realized_increment_cents,
+        realized_pnl_cents=realized_pnl_cents,
         first_open_ts_ms=first_open_ts_ms,
-    )
-    _paper_store.mark_exited_intents_for_ticker_side(
-        ticker=ticker,
-        side=side,
-        exit_ts_ms=now_ms,
         mark_price_cents=mark_price_cents,
+        now_ms=now_ms,
+        reason="take_profit",
     )
-
-    logger.info(
-        "paper_position_take_profit_closed",
-        extra={
-            "ticker": ticker,
-            "side": side,
-            "net_contracts": net_contracts,
-            "avg_entry_price_cents": avg_entry_price_cents,
-            "mark_price_cents": mark_price_cents,
-            "price_delta_cents": price_delta,
-            "exit_fee_cents": exit_fee_cents,
-            "realized_increment_cents": realized_increment_cents,
-        },
-    )
-    return True
 
 
 async def _process_paper_intents(
@@ -471,13 +573,25 @@ async def _process_paper_intents(
     # Build intents from signal
     intents = build_quote_intents(signal)
 
-    for intent in intents:
-        # Clean up completed simulation tasks first
-        for task in list(_paper_simulation_tasks):
-            if task.done():
-                _paper_simulation_tasks.discard(task)
+    for task in list(_paper_simulation_tasks):
+        if task.done():
+            _paper_simulation_tasks.discard(task)
 
-        open_intent_count = _paper_store.count_intents_by_status("OPEN")
+    for intent in intents:
+        if intent.net_edge < _PAPER_MIN_EDGE_CENTS:
+            logger.info(
+                "paper_intent_skipped",
+                extra={
+                    "ticker": intent.ticker,
+                    "side": intent.side,
+                    "reason": "min_edge",
+                    "net_edge": intent.net_edge,
+                    "min_edge": _PAPER_MIN_EDGE_CENTS,
+                },
+            )
+            continue
+
+        open_intent_count = _paper_store.count_intents_by_status(PAPER_INTENT_STATUS_OPEN)
         if open_intent_count >= _PAPER_MAX_OPEN_ORDERS:
             logger.info(
                 "paper_intent_skipped",
@@ -561,8 +675,6 @@ async def _process_paper_intents(
             cross_at_submit_cents: float | None = None
             try:
                 orderbook_snapshot = await client.get_orderbook(intent.ticker)
-                from kalshi_edge_engine.engine.orderbook import parse_orderbook
-
                 parsed_ob = parse_orderbook(orderbook_snapshot)
                 if intent.side == "YES":
                     best_bid_at_submit_cents = (
@@ -589,7 +701,7 @@ async def _process_paper_intents(
                 best_bid_at_submit_cents=best_bid_at_submit_cents,
                 cross_at_submit_cents=cross_at_submit_cents,
             )
-            _paper_store.update_intent_status(intent.id, "OPEN")
+            _paper_store.update_intent_status(intent.id, PAPER_INTENT_STATUS_OPEN)
             _paper_intent_timestamps.append(now_ms)
             _paper_ticker_cooldown[intent.ticker] = now_ms + (_PAPER_TICKER_COOLDOWN_SECONDS * 1000)
         except Exception as e:
@@ -637,7 +749,7 @@ async def _process_paper_intents(
                         return
                     _paper_store.update_intent_status(
                         intent_param.id,
-                        "OPEN",
+                        PAPER_INTENT_STATUS_OPEN,
                         last_seen_best_bid=runtime_update.get("last_seen_best_bid"),
                         queue_ahead=runtime_update.get("queue_ahead_contracts"),
                     )
@@ -692,6 +804,7 @@ async def _process_paper_intents(
                         fill_fee_cents=fill.fill_fee_cents,
                         best_bid_at_fill_cents=fill.best_bid_at_fill_cents,
                         cross_at_fill_cents=fill.cross_at_fill_cents,
+                        note=None,
                     )
                     total_filled += fill.fill_size
 
@@ -749,35 +862,35 @@ async def _process_paper_intents(
                 if total_filled_now >= intent_size:
                     # Only mark as FILLED if not already filled
                     existing_status = (
-                        current_intent_status.get("status", "OPEN")
+                        current_intent_status.get("status", PAPER_INTENT_STATUS_OPEN)
                         if current_intent_status
-                        else "OPEN"
+                        else PAPER_INTENT_STATUS_OPEN
                     )
-                    if existing_status != "FILLED":
+                    if existing_status != PAPER_INTENT_STATUS_FILLED:
                         _paper_store.update_intent_status(
                             intent_param.id,
-                            "FILLED",
+                            PAPER_INTENT_STATUS_FILLED,
                             last_seen_best_bid=last_seen_best_bid,
                             queue_ahead=queue_ahead_contracts,
                         )
                 elif exit_reason == "take_profit":
                     _paper_store.update_intent_status(
                         intent_param.id,
-                        "TAKE_PROFIT",
+                        PAPER_INTENT_STATUS_TAKE_PROFIT,
                         last_seen_best_bid=last_seen_best_bid,
                         queue_ahead=queue_ahead_contracts,
                     )
                 elif exit_reason == "max_hold_reached":
                     _paper_store.update_intent_status(
                         intent_param.id,
-                        "MAX_HOLD_REACHED",
+                        PAPER_INTENT_STATUS_MAX_HOLD_REACHED,
                         last_seen_best_bid=last_seen_best_bid,
                         queue_ahead=queue_ahead_contracts,
                     )
                 else:
                     _paper_store.update_intent_status(
                         intent_param.id,
-                        "EXPIRED",
+                        PAPER_INTENT_STATUS_EXPIRED,
                         last_seen_best_bid=last_seen_best_bid,
                         queue_ahead=queue_ahead_contracts,
                     )
@@ -798,11 +911,15 @@ async def _process_paper_intents(
                     "paper_simulation_task_error",
                     extra={"intent_id": intent_param.id, "error": str(e)},
                 )
-                _paper_store.update_intent_status(intent_param.id, "ERROR")
+                _paper_store.update_intent_status(intent_param.id, PAPER_INTENT_STATUS_ERROR)
 
         task = asyncio.create_task(_simulate_task(intent, entry_fee_cents))
         _paper_simulation_tasks.add(task)
-        task.add_done_callback(_paper_simulation_tasks.discard)
+
+        def _cleanup(t: asyncio.Task[Any]) -> None:
+            _paper_simulation_tasks.discard(t)
+
+        task.add_done_callback(_cleanup)
 
 
 # Background scanner
@@ -984,7 +1101,7 @@ async def _nba_scanner_loop(client: KalshiClient) -> None:
                     # Get current open positions
                     positions = _paper_store.get_positions()
 
-                    # Close positions that reached take-profit at current mark.
+                    # Close positions that reached take-profit or time-stop.
                     for pos in positions:
                         mark_price = _get_mark_price_for_position(
                             ticker=pos["ticker"],
@@ -992,8 +1109,15 @@ async def _nba_scanner_loop(client: KalshiClient) -> None:
                             snapshot=_top_signals_snapshot,
                         )
                         if mark_price is None:
+                            mark_price = await _fetch_mark_price_cents(
+                                client,
+                                pos["ticker"],
+                                pos["side"],
+                            )
+                        if mark_price is None:
                             continue
-                        _maybe_close_position_take_profit(
+
+                        closed_for_take_profit = _maybe_close_position_take_profit(
                             ticker=pos["ticker"],
                             side=pos["side"],
                             net_contracts=pos["net_contracts"],
@@ -1003,6 +1127,22 @@ async def _nba_scanner_loop(client: KalshiClient) -> None:
                             mark_price_cents=mark_price,
                             now_ms=snapshot_ts_ms,
                         )
+                        if closed_for_take_profit:
+                            continue
+
+                        hold_elapsed_ms = snapshot_ts_ms - pos["first_open_ts_ms"]
+                        if hold_elapsed_ms >= (_PAPER_MAX_HOLD_SECONDS * 1000):
+                            _close_position(
+                                ticker=pos["ticker"],
+                                side=pos["side"],
+                                net_contracts=pos["net_contracts"],
+                                avg_entry_price_cents=pos["avg_entry_price_cents"],
+                                realized_pnl_cents=pos.get("realized_pnl_cents", 0.0),
+                                first_open_ts_ms=pos["first_open_ts_ms"],
+                                mark_price_cents=mark_price,
+                                now_ms=snapshot_ts_ms,
+                                reason="time_stop",
+                            )
 
                     # Reload open positions after optional TP closes.
                     positions = _paper_store.get_positions()
@@ -1655,11 +1795,13 @@ async def stop_paper_trading() -> dict[str, Any]:
 
 
 # Paper Trading Endpoints
-async def get_paper_intents(status: str = "OPEN", limit: int = 50) -> dict[str, Any]:
+async def get_paper_intents(
+    status: str = PAPER_INTENT_STATUS_OPEN, limit: int = 50
+) -> dict[str, Any]:
     """Get paper trading intents by status.
 
     Args:
-        status: Filter by status (NEW, OPEN, FILLED, CANCELED, EXPIRED).
+        status: Filter by status (OPEN, FILLED, TAKE_PROFIT, MAX_HOLD_REACHED, EXPIRED, ERROR).
         limit: Max intents to return.
 
     Returns:
@@ -1668,8 +1810,12 @@ async def get_paper_intents(status: str = "OPEN", limit: int = 50) -> dict[str, 
     if not _paper_store:
         raise HTTPException(status_code=503, detail="Paper trading not enabled")
 
-    intents = _paper_store.get_intents_by_status(status, limit)
-    return {"status": status, "intents": intents, "count": len(intents)}
+    normalized_status = status.strip().upper()
+    if normalized_status not in PAPER_INTENT_ALLOWED_STATUSES:
+        raise HTTPException(status_code=400, detail="Invalid paper intent status")
+
+    intents = _paper_store.get_intents_by_status(normalized_status, limit)
+    return {"status": normalized_status, "intents": intents, "count": len(intents)}
 
 
 async def get_paper_fills(limit: int = 50) -> dict[str, Any]:
@@ -1742,13 +1888,9 @@ async def get_paper_summary() -> dict[str, Any]:
     metrics = _paper_store.compute_paper_metrics()
     snapshot = _paper_store.get_latest_pnl_snapshot()
 
-    # Count total intents (both filled and open)
-    intents_filled = _paper_store.get_intents_by_status("FILLED", limit=1000)
-    intents_open = _paper_store.get_intents_by_status("OPEN", limit=1000)
-
     return {
         "enabled": _paper_enabled,
-        "total_intents_created": len(intents_filled) + len(intents_open),
+        "total_intents_created": _paper_store.count_intents_total(),
         "total_fills": len(_paper_store.get_recent_fills(limit=1000)),
         "total_positions": metrics["open_positions_count"],
         "realized_pnl_cents": metrics["realized_pnl_cents"],
@@ -1783,7 +1925,7 @@ async def get_paper_config() -> dict[str, Any]:
                   (enabled=true AND has running simulation tasks)
     """
     # Check if there are active simulation tasks
-    active = len(_paper_simulation_tasks) > 0 and _paper_enabled
+    active = _paper_enabled and any(not t.done() for t in _paper_simulation_tasks)
 
     return {
         "configured": _ENABLE_PAPER_TRADING,
@@ -1868,10 +2010,12 @@ async def get_paper_debug_intent(intent_id: str, request: Request) -> dict[str, 
     }
 
 
-async def post_paper_debug_force_fill(intent_id: str, fill_size: int = 1) -> dict[str, Any]:
+async def post_paper_debug_force_fill(request: ForceFillRequest) -> dict[str, Any]:
     """Force-insert a synthetic fill for debug purposes."""
     if not _paper_store:
         raise HTTPException(status_code=503, detail="Paper trading not enabled")
+    intent_id = request.intent_id
+    fill_size = request.fill_size
     if fill_size <= 0:
         raise HTTPException(status_code=400, detail="fill_size must be > 0")
 
@@ -1887,7 +2031,7 @@ async def post_paper_debug_force_fill(intent_id: str, fill_size: int = 1) -> dic
     if actual_fill_size <= 0:
         _paper_store.update_intent_status(
             intent_id,
-            "FILLED",
+            PAPER_INTENT_STATUS_FILLED,
             last_seen_best_bid=intent.get("last_seen_best_bid"),
             queue_ahead=intent.get("queue_ahead_contracts"),
         )
@@ -1895,7 +2039,7 @@ async def post_paper_debug_force_fill(intent_id: str, fill_size: int = 1) -> dic
             "intent_id": intent_id,
             "filled_size": 0,
             "remaining_size": 0,
-            "status": "FILLED",
+            "status": PAPER_INTENT_STATUS_FILLED,
         }
 
     remaining_after = remaining_before - actual_fill_size
@@ -1909,6 +2053,9 @@ async def post_paper_debug_force_fill(intent_id: str, fill_size: int = 1) -> dic
         remaining_size=remaining_after,
         queue_ahead_at_fill=intent.get("queue_ahead_contracts"),
         fill_fee_cents=0.0,
+        best_bid_at_fill_cents=intent.get("last_seen_best_bid"),
+        cross_at_fill_cents=intent.get("cross_at_submit_cents"),
+        note="debug_fill",
     )
 
     positions = _paper_store.get_positions()
@@ -1944,7 +2091,7 @@ async def post_paper_debug_force_fill(intent_id: str, fill_size: int = 1) -> dic
 
     _paper_store.update_intent_status(
         intent_id,
-        "FILLED",
+        PAPER_INTENT_STATUS_FILLED,
         last_seen_best_bid=intent.get("last_seen_best_bid"),
         queue_ahead=intent.get("queue_ahead_contracts"),
     )
@@ -1953,7 +2100,7 @@ async def post_paper_debug_force_fill(intent_id: str, fill_size: int = 1) -> dic
         "intent_id": intent_id,
         "filled_size": actual_fill_size,
         "remaining_size": remaining_after,
-        "status": "FILLED",
+        "status": PAPER_INTENT_STATUS_FILLED,
     }
 
 

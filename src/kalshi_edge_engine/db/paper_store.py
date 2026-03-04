@@ -531,7 +531,7 @@ class PaperStore:
         """
         try:
             with sqlite3.connect(self.db_path) as conn:
-                now_ms = int(__import__("time").time() * 1000)
+                now_ms = int(time.time() * 1000)
                 conn.execute(
                     """
                     UPDATE quote_intents
@@ -558,7 +558,8 @@ class PaperStore:
 
         Returns a dict with canonical keys:
         {fill_id, intent_id, fill_ts_ms, fill_price_cents, fill_size, remaining_size,
-         queue_ahead_at_fill, fill_fee_cents, best_bid_at_fill_cents, cross_at_fill_cents, note}
+         queue_ahead_at_fill, fill_fee_cents, best_bid_at_fill_cents, cross_at_fill_cents,
+         mark_30s_after_fill_cents, pnl_30s_after_fill_cents, note}
 
         Raises ValueError if required fields are missing or invalid.
         Returns None if mode cannot be determined (edge case).
@@ -582,6 +583,8 @@ class PaperStore:
                 "fill_fee_cents": None,
                 "best_bid_at_fill_cents": None,
                 "cross_at_fill_cents": None,
+                "mark_30s_after_fill_cents": None,
+                "pnl_30s_after_fill_cents": None,
                 "note": "legacy_fill",
             }
 
@@ -597,7 +600,9 @@ class PaperStore:
             fill_fee_cents = args[7] if len(args) > 7 else None
             best_bid_at_fill_cents = args[8] if len(args) > 8 else None
             cross_at_fill_cents = args[9] if len(args) > 9 else None
-            note = args[10] if len(args) > 10 else "fill"
+            mark_30s_after_fill_cents = args[10] if len(args) > 10 else None
+            pnl_30s_after_fill_cents = args[11] if len(args) > 11 else None
+            note = args[12] if len(args) > 12 else None
 
             return {
                 "fill_id": fill_id,
@@ -610,6 +615,8 @@ class PaperStore:
                 "fill_fee_cents": fill_fee_cents,
                 "best_bid_at_fill_cents": best_bid_at_fill_cents,
                 "cross_at_fill_cents": cross_at_fill_cents,
+                "mark_30s_after_fill_cents": mark_30s_after_fill_cents,
+                "pnl_30s_after_fill_cents": pnl_30s_after_fill_cents,
                 "note": note,
             }
 
@@ -627,7 +634,13 @@ class PaperStore:
             "best_bid_at_fill_cents", args[8] if len(args) > 8 else None
         )
         cross_at_fill_cents = kwargs.get("cross_at_fill_cents", args[9] if len(args) > 9 else None)
-        note = kwargs.get("note", "fill")
+        mark_30s_after_fill_cents = kwargs.get(
+            "mark_30s_after_fill_cents", args[10] if len(args) > 10 else None
+        )
+        pnl_30s_after_fill_cents = kwargs.get(
+            "pnl_30s_after_fill_cents", args[11] if len(args) > 11 else None
+        )
+        note = kwargs.get("note")
 
         # We have at least one kwarg or a mix; return the canonical dict
         if (
@@ -647,6 +660,8 @@ class PaperStore:
                 "fill_fee_cents": fill_fee_cents,
                 "best_bid_at_fill_cents": best_bid_at_fill_cents,
                 "cross_at_fill_cents": cross_at_fill_cents,
+                "mark_30s_after_fill_cents": mark_30s_after_fill_cents,
+                "pnl_30s_after_fill_cents": pnl_30s_after_fill_cents,
                 "note": note,
             }
 
@@ -693,7 +708,9 @@ class PaperStore:
         fill_fee_cents: float | None = None,
         best_bid_at_fill_cents: float | None = None,
         cross_at_fill_cents: float | None = None,
-        note: str = "fill",
+        mark_30s_after_fill_cents: float | None = None,
+        pnl_30s_after_fill_cents: float | None = None,
+        note: str | None = None,
     ) -> bool: ...
 
     def insert_fill(self, *args: Any, **kwargs: Any) -> bool:
@@ -823,8 +840,9 @@ class PaperStore:
                         INSERT INTO paper_fills
                         (id, intent_id, fill_ts_ms, fill_price_cents, fill_size,
                          remaining_size, queue_ahead_at_fill, fill_fee_cents, note,
-                         best_bid_at_fill_cents, cross_at_fill_cents)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         best_bid_at_fill_cents, cross_at_fill_cents,
+                         mark_30s_after_fill_cents, pnl_30s_after_fill_cents)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             fill_dict["fill_id"],
@@ -838,6 +856,8 @@ class PaperStore:
                             fill_dict["note"],
                             fill_dict["best_bid_at_fill_cents"],
                             fill_dict["cross_at_fill_cents"],
+                            fill_dict["mark_30s_after_fill_cents"],
+                            fill_dict["pnl_30s_after_fill_cents"],
                         ),
                     )
 
@@ -893,6 +913,7 @@ class PaperStore:
     ) -> None:
         """Insert or update a position."""
         try:
+            side = side.strip().upper()
             pos_id = f"{ticker}_{side}_{int(time.time())}"
             now_ms = int(time.time() * 1000)
 
@@ -1098,7 +1119,8 @@ class PaperStore:
                            queue_ahead_contracts, last_update_ts_ms,
                            net_edge, inside_width, imbalance_gap,
                            fee_mode, round_trip, entry_fee_cents,
-                           take_profit_cents, max_hold_seconds
+                              take_profit_cents, max_hold_seconds,
+                              best_bid_at_submit_cents, cross_at_submit_cents
                     FROM quote_intents
                     WHERE id = ?
                     LIMIT 1
@@ -1128,6 +1150,8 @@ class PaperStore:
                     "entry_fee_cents": row[15],
                     "take_profit_cents": row[16],
                     "max_hold_seconds": row[17],
+                    "best_bid_at_submit_cents": row[18],
+                    "cross_at_submit_cents": row[19],
                 }
         except sqlite3.Error as e:
             logger.exception(
@@ -1151,6 +1175,21 @@ class PaperStore:
             logger.exception(
                 "paper_store_count_intents_by_status_error",
                 extra={"status": status, "error": str(e)},
+            )
+            return 0
+
+    def count_intents_total(self) -> int:
+        """Count all intents in quote_intents table."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM quote_intents")
+                row = cursor.fetchone()
+                return int(row[0]) if row and row[0] is not None else 0
+        except sqlite3.Error as e:
+            logger.exception(
+                "paper_store_count_intents_total_error",
+                extra={"error": str(e)},
             )
             return 0
 
@@ -1267,12 +1306,13 @@ class PaperStore:
                         if net_contracts == 0:
                             continue
 
-                        mark_price = mark_price_dict.get(ticker, {}).get(side)
+                        side_key = str(side).upper()
+                        mark_price = mark_price_dict.get(ticker, {}).get(side_key)
                         if mark_price is None:
                             continue
 
                         # Price PnL component
-                        if side == "YES":
+                        if side_key == "YES":
                             price_pnl = (mark_price - avg_entry_price) * net_contracts
                         else:
                             price_pnl = (avg_entry_price - mark_price) * net_contracts
@@ -1284,8 +1324,9 @@ class PaperStore:
                             FROM paper_fills f
                             JOIN quote_intents i ON f.intent_id = i.id
                             WHERE i.ticker = ? AND i.side = ?
+                              AND (f.note IS NULL OR f.note NOT LIKE 'exit%')
                             """,
-                            (ticker, side),
+                            (ticker, side_key),
                         )
                         total_entry_fees = cursor.fetchone()[0] or 0.0
 
@@ -1355,6 +1396,7 @@ class PaperStore:
                     WHERE ticker = ?
                       AND side = ?
                       AND status = 'FILLED'
+                      AND id NOT LIKE 'exit_intent:%'
                       AND exit_ts_ms IS NULL
                     """,
                     (exit_ts_ms, mark_price_cents, ticker, side),
@@ -1415,7 +1457,9 @@ class PaperStore:
                     """
                     SELECT f.id, f.intent_id, f.fill_ts_ms, f.fill_price_cents,
                            f.fill_size, f.remaining_size, f.queue_ahead_at_fill,
-                           f.fill_fee_cents, i.ticker, i.side
+                           f.fill_fee_cents, f.note, f.best_bid_at_fill_cents,
+                              f.cross_at_fill_cents, f.mark_30s_after_fill_cents,
+                              f.pnl_30s_after_fill_cents, i.ticker, i.side
                     FROM paper_fills f
                     JOIN quote_intents i ON f.intent_id = i.id
                     ORDER BY f.fill_ts_ms DESC
@@ -1435,8 +1479,13 @@ class PaperStore:
                             "remaining_size": row[5],
                             "queue_ahead_at_fill": row[6],
                             "fill_fee_cents": row[7],
-                            "ticker": row[8],
-                            "side": row[9],
+                            "note": row[8],
+                            "best_bid_at_fill_cents": row[9],
+                            "cross_at_fill_cents": row[10],
+                            "mark_30s_after_fill_cents": row[11],
+                            "pnl_30s_after_fill_cents": row[12],
+                            "ticker": row[13],
+                            "side": row[14],
                         }
                     )
                 return fills
@@ -1536,7 +1585,8 @@ class PaperStore:
                     """
                     SELECT f.id, f.intent_id, f.fill_ts_ms, f.fill_price_cents,
                            f.fill_size, f.remaining_size, f.queue_ahead_at_fill,
-                           f.fill_fee_cents
+                              f.fill_fee_cents, f.note, f.best_bid_at_fill_cents,
+                              f.cross_at_fill_cents
                     FROM paper_fills f
                     JOIN quote_intents i ON f.intent_id = i.id
                     WHERE i.ticker = ? AND i.side = ?
@@ -1556,6 +1606,9 @@ class PaperStore:
                             "remaining_size": row[5],
                             "queue_ahead_at_fill": row[6],
                             "fill_fee_cents": row[7],
+                            "note": row[8],
+                            "best_bid_at_fill_cents": row[9],
+                            "cross_at_fill_cents": row[10],
                         }
                     )
                 return fills

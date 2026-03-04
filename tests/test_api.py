@@ -3,6 +3,7 @@
 import contextlib
 import gc
 import os
+import sqlite3
 import tempfile
 import time
 from unittest.mock import AsyncMock
@@ -410,11 +411,18 @@ class TestPaperDebugEndpoints:
                 fee_mode="maker",
                 round_trip=True,
             )
-            store.insert_intent(intent)
-            store.update_intent_status(intent.id, "OPEN")
+            store.insert_intent(
+                intent,
+                best_bid_at_submit_cents=52.0,
+                cross_at_submit_cents=54.0,
+            )
+            store.update_intent_status(intent.id, "OPEN", last_seen_best_bid=52.0, queue_ahead=1)
             main_module._paper_store = store
 
-            response = client.post(f"/paper/debug/force-fill?intent_id={intent.id}&fill_size=1")
+            response = client.post(
+                "/paper/debug/force-fill",
+                json={"intent_id": intent.id, "fill_size": 1},
+            )
             assert response.status_code == 200
             data = response.json()
             assert data["intent_id"] == intent.id
@@ -425,10 +433,87 @@ class TestPaperDebugEndpoints:
             assert len(fills) == 1
             assert fills[0]["intent_id"] == intent.id
 
+            with sqlite3.connect(store.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT note, best_bid_at_fill_cents, cross_at_fill_cents
+                    FROM paper_fills
+                    WHERE intent_id = ?
+                    ORDER BY fill_ts_ms DESC
+                    LIMIT 1
+                    """,
+                    (intent.id,),
+                )
+                note_row = cursor.fetchone()
+                assert note_row is not None
+                assert note_row[0] == "debug_fill"
+                assert note_row[1] == 52.0
+                assert note_row[2] == 54.0
+
             positions = store.get_positions()
             assert len(positions) == 1
             assert positions[0]["ticker"] == intent.ticker
             assert positions[0]["side"] == intent.side
+        finally:
+            main_module._paper_store = None
+            gc.collect()
+            if os.path.exists(db_path):
+                with contextlib.suppress(OSError):
+                    os.unlink(db_path)
+
+    def test_paper_debug_force_fill_rejects_non_positive_size(self, client: TestClient) -> None:
+        """POST /paper/debug/force-fill returns 400 for fill_size <= 0."""
+        import kalshi_edge_engine.api.main as main_module
+
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            store = PaperStore(db_path=db_path)
+            intent = QuoteIntent(
+                id="intent-force-bad-size",
+                ticker="KXNBAGAME-26MAR01SASNYK-SAS",
+                side="YES",
+                quote_price_cents=53.0,
+                size_contracts=1,
+                created_ts_ms=int(time.time() * 1000),
+                net_edge=1.2,
+                inside_width=2.2,
+                imbalance_gap=0.0,
+                fee_mode="maker",
+                round_trip=True,
+            )
+            store.insert_intent(intent)
+            main_module._paper_store = store
+
+            response = client.post(
+                "/paper/debug/force-fill",
+                json={"intent_id": intent.id, "fill_size": 0},
+            )
+            assert response.status_code == 400
+        finally:
+            main_module._paper_store = None
+            gc.collect()
+            if os.path.exists(db_path):
+                with contextlib.suppress(OSError):
+                    os.unlink(db_path)
+
+    def test_paper_debug_force_fill_returns_404_for_unknown_intent(
+        self, client: TestClient
+    ) -> None:
+        """POST /paper/debug/force-fill returns 404 when intent is missing."""
+        import kalshi_edge_engine.api.main as main_module
+
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            main_module._paper_store = PaperStore(db_path=db_path)
+
+            response = client.post(
+                "/paper/debug/force-fill",
+                json={"intent_id": "does-not-exist", "fill_size": 1},
+            )
+            assert response.status_code == 404
         finally:
             main_module._paper_store = None
             gc.collect()
@@ -727,6 +812,84 @@ class TestPaperMetricsEndpoint:
             assert data["intents_last_1h"] == 2
         finally:
             main_module._paper_store = None
+            gc.collect()
+            if os.path.exists(db_path):
+                with contextlib.suppress(OSError):
+                    os.unlink(db_path)
+
+
+class TestPaperConfigAndSummaryEndpoints:
+    """Tests for /paper/config and /paper/summary consistency."""
+
+    def test_paper_config_active_uses_running_tasks_only(self, client: TestClient) -> None:
+        """GET /paper/config should only mark active when any tracked task is not done."""
+        import kalshi_edge_engine.api.main as main_module
+
+        class _StubTask:
+            def __init__(self, done_value: bool) -> None:
+                self._done_value = done_value
+
+            def done(self) -> bool:
+                return self._done_value
+
+        main_module._paper_enabled = True
+        main_module._paper_simulation_tasks = {_StubTask(True), _StubTask(False)}  # type: ignore[assignment]
+        response_active = client.get("/paper/config")
+        assert response_active.status_code == 200
+        assert response_active.json()["active"] is True
+
+        main_module._paper_simulation_tasks = {_StubTask(True)}  # type: ignore[assignment]
+        response_done_only = client.get("/paper/config")
+        assert response_done_only.status_code == 200
+        assert response_done_only.json()["active"] is False
+
+        main_module._paper_enabled = False
+        main_module._paper_simulation_tasks = set()
+
+    def test_paper_summary_uses_total_intent_count(self, client: TestClient) -> None:
+        """GET /paper/summary should use total COUNT(*) and not be capped by status list limits."""
+        import kalshi_edge_engine.api.main as main_module
+
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            store = PaperStore(db_path=db_path)
+            main_module._paper_store = store
+            main_module._paper_enabled = True
+
+            now_ms = int(time.time() * 1000)
+            with sqlite3.connect(db_path) as conn:
+                for idx in range(1005):
+                    conn.execute(
+                        """
+                        INSERT INTO quote_intents
+                        (id, ticker, side, quote_price_cents, size_contracts, created_ts_ms,
+                         net_edge, inside_width, imbalance_gap, fee_mode, round_trip, status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            f"summary-intent-{idx}",
+                            f"KXNBAGAME-SUM-{idx}",
+                            "YES",
+                            50.0,
+                            1,
+                            now_ms,
+                            1.0,
+                            2.0,
+                            None,
+                            "maker",
+                            True,
+                            "OPEN",
+                        ),
+                    )
+                conn.commit()
+
+            response = client.get("/paper/summary")
+            assert response.status_code == 200
+            assert response.json()["total_intents_created"] == 1005
+        finally:
+            main_module._paper_store = None
+            main_module._paper_enabled = False
             gc.collect()
             if os.path.exists(db_path):
                 with contextlib.suppress(OSError):

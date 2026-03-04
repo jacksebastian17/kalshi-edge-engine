@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 import random
 import time
 from collections.abc import Callable
@@ -11,6 +12,8 @@ from typing import Any
 from kalshi_edge_engine.kalshi.client import KalshiClient
 
 logger = logging.getLogger(__name__)
+
+_PAPER_SIM_LOG_EVERY_N = max(1, int(os.getenv("PAPER_SIM_LOG_EVERY_N", "1")))
 
 
 def _build_fill_id(order_id: str, fill_ts_ms: int, sequence: int) -> str:
@@ -296,6 +299,8 @@ class RealisticOrderSimulator:
         last_seen_best_bid: float | None = None
         last_update_ts_ms = start_ts_ms
         latest_diagnostics: dict[str, Any] | None = None
+        queue_initialized = False
+        poll_count = 0
 
         while elapsed_ms < horizon_ms and remaining_size > 0:
             try:
@@ -310,6 +315,7 @@ class RealisticOrderSimulator:
                     simulated_volume_per_poll=self.simulated_volume_per_poll,
                 )
                 latest_diagnostics = diagnostics
+                poll_count += 1
 
                 best_bid = diagnostics["best_bid"]
                 best_size_at_bid = diagnostics["best_size_at_bid"]
@@ -323,12 +329,9 @@ class RealisticOrderSimulator:
                 # Queue decreases when we have traded volume at our price level
                 if eligibility["at_best_price"] and not price_improves:
                     # Initialize queue on first time seeing this price level
-                    if (
-                        queue_ahead == 0
-                        and best_size_at_bid is not None
-                        and last_best_size_at_bid is None
-                    ):
+                    if not queue_initialized and best_size_at_bid is not None:
                         queue_ahead = best_size_at_bid
+                        queue_initialized = True
                     # Queue decreases with traded volume
                     queue_ahead = max(0, queue_ahead - traded_volume)
 
@@ -341,36 +344,37 @@ class RealisticOrderSimulator:
                 last_update_ts_ms = now_ms
                 last_seen_best_bid = best_bid
 
-                logger.info(
-                    "paper_simulator_poll",
-                    extra={
-                        "intent_id": order.id,
-                        "ticker": order.ticker,
-                        "side": order.side,
-                        "chosen_side": diagnostics["chosen_side"],
-                        "raw_yes_best_bid_price": diagnostics["raw_top_of_book"]["yes"][
-                            "best_bid_price"
-                        ],
-                        "raw_yes_best_bid_size": diagnostics["raw_top_of_book"]["yes"][
-                            "best_bid_size"
-                        ],
-                        "raw_no_best_bid_price": diagnostics["raw_top_of_book"]["no"][
-                            "best_bid_price"
-                        ],
-                        "raw_no_best_bid_size": diagnostics["raw_top_of_book"]["no"][
-                            "best_bid_size"
-                        ],
-                        "best_yes_bid": diagnostics["best_yes_bid"],
-                        "best_no_bid": diagnostics["best_no_bid"],
-                        "best_bid": best_bid,
-                        "quote_price_cents": order.quote_price_cents,
-                        "queue_ahead_before": diagnostics["queue_ahead_before"],
-                        "queue_ahead_after": diagnostics["queue_ahead_after"],
-                        "traded_volume_estimate": diagnostics["traded_volume_estimate"],
-                        "price_improves": diagnostics["price_improves"],
-                        "eligibility": eligibility,
-                    },
-                )
+                if poll_count % _PAPER_SIM_LOG_EVERY_N == 0:
+                    logger.info(
+                        "paper_simulator_poll",
+                        extra={
+                            "intent_id": order.id,
+                            "ticker": order.ticker,
+                            "side": order.side,
+                            "chosen_side": diagnostics["chosen_side"],
+                            "raw_yes_best_bid_price": diagnostics["raw_top_of_book"]["yes"][
+                                "best_bid_price"
+                            ],
+                            "raw_yes_best_bid_size": diagnostics["raw_top_of_book"]["yes"][
+                                "best_bid_size"
+                            ],
+                            "raw_no_best_bid_price": diagnostics["raw_top_of_book"]["no"][
+                                "best_bid_price"
+                            ],
+                            "raw_no_best_bid_size": diagnostics["raw_top_of_book"]["no"][
+                                "best_bid_size"
+                            ],
+                            "best_yes_bid": diagnostics["best_yes_bid"],
+                            "best_no_bid": diagnostics["best_no_bid"],
+                            "best_bid": best_bid,
+                            "quote_price_cents": order.quote_price_cents,
+                            "queue_ahead_before": diagnostics["queue_ahead_before"],
+                            "queue_ahead_after": diagnostics["queue_ahead_after"],
+                            "traded_volume_estimate": diagnostics["traded_volume_estimate"],
+                            "price_improves": diagnostics["price_improves"],
+                            "eligibility": eligibility,
+                        },
+                    )
 
                 if on_poll is not None:
                     callback_result = on_poll(
