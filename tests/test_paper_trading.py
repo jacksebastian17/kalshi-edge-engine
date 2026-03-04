@@ -108,6 +108,7 @@ class TestBuildQuoteIntents:
         assert yes_intent.side == "YES"
         assert yes_intent.size_contracts == 1
         assert 1.0 <= yes_intent.quote_price_cents <= 99.0
+        assert sample_valid_signal.bid_yes is not None
         assert yes_intent.quote_price_cents > sample_valid_signal.bid_yes
         assert yes_intent.net_edge == sample_valid_signal.net_edge_yes
         assert yes_intent.fee_mode == sample_valid_signal.fee_mode
@@ -120,8 +121,10 @@ class TestBuildQuoteIntents:
             assert 1.0 <= intent.quote_price_cents <= 99.0
             # Quote price should be above bid
             if intent.side == "YES":
+                assert sample_valid_signal.bid_yes is not None
                 assert intent.quote_price_cents > sample_valid_signal.bid_yes
             else:
+                assert sample_valid_signal.bid_no is not None
                 assert intent.quote_price_cents > sample_valid_signal.bid_no
 
     def test_no_intents_if_edge_too_small(self, sample_valid_signal: Signal) -> None:
@@ -146,6 +149,28 @@ class TestBuildQuoteIntents:
 
         all_ids = [i.id for i in intents1 + intents2]
         assert len(all_ids) == len(set(all_ids))  # All IDs should be unique
+
+    def test_no_inside_quote_when_width_is_one_cent(self, sample_valid_signal: Signal) -> None:
+        """1-cent inside width cannot produce a valid inside quote intent."""
+        sample_valid_signal.bid_yes = 50.0
+        sample_valid_signal.cross_yes = 51.0
+        sample_valid_signal.net_edge_yes = 10.0
+        sample_valid_signal.inside_width_yes = 1.0
+
+        sample_valid_signal.net_edge_no = None
+        sample_valid_signal.bid_no = None
+        sample_valid_signal.cross_no = None
+        sample_valid_signal.inside_width_no = None
+
+        intents = build_quote_intents(sample_valid_signal, min_edge=0.1)
+        assert intents == []
+
+    def test_quote_price_is_integer_cent(self, sample_valid_signal: Signal) -> None:
+        """Constructed quote intent prices should always be integer-cent values."""
+        intents = build_quote_intents(sample_valid_signal)
+        assert len(intents) == 2
+        for intent in intents:
+            assert float(intent.quote_price_cents).is_integer()
 
 
 @pytest.mark.asyncio

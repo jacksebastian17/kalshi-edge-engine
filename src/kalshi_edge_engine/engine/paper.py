@@ -21,7 +21,11 @@ import time
 import uuid
 from dataclasses import dataclass
 
-from kalshi_edge_engine.engine.signal import SIGNAL_VALID, Signal
+from kalshi_edge_engine.engine.signal import (
+    SIGNAL_VALID,
+    Signal,
+    compute_intended_inside_quote_price_cents,
+)
 from kalshi_edge_engine.kalshi.client import KalshiClient
 
 logger = logging.getLogger(__name__)
@@ -53,6 +57,9 @@ class QuoteIntent:
     imbalance_gap: float | None  # imbalance_gap from signal
     fee_mode: str  # "maker" or "taker"
     round_trip: bool  # Whether round-trip fees were modeled
+    capturable_edge_to_cross_cents: float | None = None
+    net_edge_after_entry_fee_cents: float | None = None
+    net_edge_after_round_trip_fee_cents: float | None = None
 
 
 @dataclass
@@ -82,7 +89,6 @@ class PaperOutcome:
 def build_quote_intents(
     signal: Signal,
     min_edge: float = 0.1,
-    tick_size_cents: float = 1,
 ) -> list[QuoteIntent]:
     """Build quote intents from a signal if it is SIGNAL_VALID.
 
@@ -90,15 +96,13 @@ def build_quote_intents(
     - Only if signal.reason_code == SIGNAL_VALID
     - YES intent if net_edge_yes >= min_edge and bid_yes/cross_yes exist
     - NO intent if net_edge_no >= min_edge and bid_no/cross_no exist
-    - Quote price = bid + 1 tick but never >= cross
+    - Quote price = bid + 1 tick (integer cents only) when width >= 2 cents
     - Size = 1 contract
     - Ensure price bounds 1 <= price <= 99
 
     Args:
         signal: The signal to process.
         min_edge: Minimum net edge threshold.
-        tick_size_cents: Tick size in cents.
-
     Returns:
         List of QuoteIntent objects (0, 1, or 2 items).
     """
@@ -111,25 +115,25 @@ def build_quote_intents(
     now_ms = int(time.time() * 1000)
 
     # Check YES side
+    yes_quote_price_cents = (
+        signal.intended_quote_yes_cents
+        if signal.intended_quote_yes_cents is not None
+        else compute_intended_inside_quote_price_cents(
+            bid_price_cents=signal.bid_yes,
+            cross_price_cents=signal.cross_yes,
+        )
+    )
     if (
         signal.net_edge_yes is not None
         and signal.net_edge_yes >= min_edge
-        and signal.bid_yes is not None
-        and signal.cross_yes is not None
         and signal.inside_width_yes is not None
+        and yes_quote_price_cents is not None
     ):
-        # Quote price = bid + 1 tick, but never >= cross
-        quote_price = signal.bid_yes + tick_size_cents
-        quote_price = min(quote_price, signal.cross_yes - 0.01)  # Ensure room below cross
-
-        # Enforce bounds
-        quote_price = max(1.0, min(99.0, quote_price))
-
         intent = QuoteIntent(
             id=str(uuid.uuid4()),
             ticker=signal.ticker,
             side="YES",
-            quote_price_cents=quote_price,
+            quote_price_cents=float(yes_quote_price_cents),
             size_contracts=1,
             created_ts_ms=now_ms,
             net_edge=signal.net_edge_yes,
@@ -137,6 +141,9 @@ def build_quote_intents(
             imbalance_gap=signal.imbalance_gap,
             fee_mode=signal.fee_mode,
             round_trip=signal.round_trip,
+            capturable_edge_to_cross_cents=signal.capturable_edge_to_cross_yes_cents,
+            net_edge_after_entry_fee_cents=signal.net_edge_after_entry_fee_yes_cents,
+            net_edge_after_round_trip_fee_cents=signal.net_edge_after_round_trip_fee_yes_cents,
         )
         intents.append(intent)
         logger.info(
@@ -145,31 +152,31 @@ def build_quote_intents(
                 "intent_id": intent.id,
                 "ticker": signal.ticker,
                 "side": "YES",
-                "quote_price": quote_price,
+                "quote_price": yes_quote_price_cents,
                 "net_edge": signal.net_edge_yes,
             },
         )
 
     # Check NO side
+    no_quote_price_cents = (
+        signal.intended_quote_no_cents
+        if signal.intended_quote_no_cents is not None
+        else compute_intended_inside_quote_price_cents(
+            bid_price_cents=signal.bid_no,
+            cross_price_cents=signal.cross_no,
+        )
+    )
     if (
         signal.net_edge_no is not None
         and signal.net_edge_no >= min_edge
-        and signal.bid_no is not None
-        and signal.cross_no is not None
         and signal.inside_width_no is not None
+        and no_quote_price_cents is not None
     ):
-        # Quote price = bid + 1 tick, but never >= cross
-        quote_price = signal.bid_no + tick_size_cents
-        quote_price = min(quote_price, signal.cross_no - 0.01)  # Ensure room below cross
-
-        # Enforce bounds
-        quote_price = max(1.0, min(99.0, quote_price))
-
         intent = QuoteIntent(
             id=str(uuid.uuid4()),
             ticker=signal.ticker,
             side="NO",
-            quote_price_cents=quote_price,
+            quote_price_cents=float(no_quote_price_cents),
             size_contracts=1,
             created_ts_ms=now_ms,
             net_edge=signal.net_edge_no,
@@ -177,6 +184,9 @@ def build_quote_intents(
             imbalance_gap=signal.imbalance_gap,
             fee_mode=signal.fee_mode,
             round_trip=signal.round_trip,
+            capturable_edge_to_cross_cents=signal.capturable_edge_to_cross_no_cents,
+            net_edge_after_entry_fee_cents=signal.net_edge_after_entry_fee_no_cents,
+            net_edge_after_round_trip_fee_cents=signal.net_edge_after_round_trip_fee_no_cents,
         )
         intents.append(intent)
         logger.info(
@@ -185,7 +195,7 @@ def build_quote_intents(
                 "intent_id": intent.id,
                 "ticker": signal.ticker,
                 "side": "NO",
-                "quote_price": quote_price,
+                "quote_price": no_quote_price_cents,
                 "net_edge": signal.net_edge_no,
             },
         )

@@ -400,10 +400,12 @@ async def test_process_paper_intents_insert_fill_failure_skips_position_mutation
     monkeypatch.setattr(main_module, "build_quote_intents", lambda _signal: [intent])
     monkeypatch.setattr(main_module, "RealisticOrderSimulator", _SingleFillSimulator)
 
-    def _reject_insert_fill(*_args, **_kwargs) -> bool:
-        return False
+    from kalshi_edge_engine.db.paper_store import FillInsertResult
 
-    monkeypatch.setattr(store, "insert_fill", _reject_insert_fill)
+    def _reject_insert_fill_result(*_args, **_kwargs) -> FillInsertResult:
+        return FillInsertResult(status="error")
+
+    monkeypatch.setattr(store, "insert_fill_result", _reject_insert_fill_result)
     main_module._paper_simulation_tasks.clear()
 
     mock_client = AsyncMock()

@@ -85,6 +85,14 @@ class SignalResponse(BaseModel):
     fee_exit_no: float | None
     total_fee_yes: float | None
     total_fee_no: float | None
+    intended_quote_yes_cents: int | None = None
+    intended_quote_no_cents: int | None = None
+    capturable_edge_to_cross_yes_cents: float | None = None
+    capturable_edge_to_cross_no_cents: float | None = None
+    net_edge_after_entry_fee_yes_cents: float | None = None
+    net_edge_after_entry_fee_no_cents: float | None = None
+    net_edge_after_round_trip_fee_yes_cents: float | None = None
+    net_edge_after_round_trip_fee_no_cents: float | None = None
     fee_mode: str
     round_trip: bool
     liq_yes: int
@@ -548,7 +556,7 @@ def _close_position(
         exit_fee_cents=exit_fee_cents,
     )
 
-    did_insert_exit_fill = _paper_store.insert_fill(
+    exit_fill_result = _paper_store.insert_fill_result(
         fill_id=f"exit:{reason}:{ticker}:{side}:{now_ms}",
         intent_id=intent_id,
         fill_ts_ms=now_ms,
@@ -561,10 +569,21 @@ def _close_position(
         cross_at_fill_cents=mark_price_cents,
         note=f"exit_{reason}",
     )
-    if not did_insert_exit_fill:
+    if not exit_fill_result.inserted_new_fill:
+        if exit_fill_result.already_exists:
+            logger.info(
+                "paper_close_position_exit_fill_idempotent",
+                extra={"reason": reason, "ticker": ticker, "side": side},
+            )
+            return True
         logger.warning(
             "paper_close_position_exit_fill_rejected",
-            extra={"reason": reason, "ticker": ticker, "side": side},
+            extra={
+                "reason": reason,
+                "ticker": ticker,
+                "side": side,
+                "insert_status": exit_fill_result.status,
+            },
         )
         return False
 
@@ -874,7 +893,7 @@ async def _process_paper_intents(
                     remaining_after = max(0, size_contracts - (filled_so_far + fill.fill_size))
 
                     # Insert fill to database with telemetry
-                    did_insert_fill = _paper_store.insert_fill(
+                    fill_insert_result = _paper_store.insert_fill_result(
                         fill_id=fill.id,
                         intent_id=fill.order_id,
                         fill_ts_ms=fill.fill_ts_ms,
@@ -892,7 +911,7 @@ async def _process_paper_intents(
                         ),
                     )
 
-                    if not did_insert_fill:
+                    if not fill_insert_result.inserted_new_fill:
                         logger.warning(
                             "paper_fill_insert_rejected_skip_position_mutation",
                             extra={
@@ -901,6 +920,7 @@ async def _process_paper_intents(
                                 "ticker": intent_param.ticker,
                                 "side": intent_param.side,
                                 "fill_size": fill.fill_size,
+                                "insert_status": fill_insert_result.status,
                             },
                         )
                         continue
@@ -1335,6 +1355,14 @@ def _signal_to_response(signal: Signal) -> dict[str, Any]:
         "fee_exit_no": signal.fee_exit_no,
         "total_fee_yes": signal.total_fee_yes,
         "total_fee_no": signal.total_fee_no,
+        "intended_quote_yes_cents": signal.intended_quote_yes_cents,
+        "intended_quote_no_cents": signal.intended_quote_no_cents,
+        "capturable_edge_to_cross_yes_cents": signal.capturable_edge_to_cross_yes_cents,
+        "capturable_edge_to_cross_no_cents": signal.capturable_edge_to_cross_no_cents,
+        "net_edge_after_entry_fee_yes_cents": signal.net_edge_after_entry_fee_yes_cents,
+        "net_edge_after_entry_fee_no_cents": signal.net_edge_after_entry_fee_no_cents,
+        "net_edge_after_round_trip_fee_yes_cents": signal.net_edge_after_round_trip_fee_yes_cents,
+        "net_edge_after_round_trip_fee_no_cents": signal.net_edge_after_round_trip_fee_no_cents,
         "fee_mode": signal.fee_mode,
         "round_trip": signal.round_trip,
         "liq_yes": signal.liq_yes,
@@ -1981,6 +2009,23 @@ async def get_paper_summary() -> dict[str, Any]:
         "realized_pnl_cents": metrics["realized_pnl_cents"],
         "unrealized_pnl_cents": metrics.get("unrealized_pnl_cents", 0.0),
         "total_pnl_cents": metrics["total_pnl_cents"],
+        "intent_fill_rate": metrics.get("intent_fill_rate", 0.0),
+        "raw_fills_per_intent_ratio": metrics.get("raw_fills_per_intent_ratio", 0.0),
+        "intents_with_at_least_one_fill": metrics.get("intents_with_at_least_one_fill", 0),
+        "fully_filled_intents": metrics.get("fully_filled_intents", 0),
+        "partial_fill_intents": metrics.get("partial_fill_intents", 0),
+        "partial_fill_rate": metrics.get("partial_fill_rate", 0.0),
+        "average_filled_fraction": metrics.get("average_filled_fraction", 0.0),
+        "average_time_to_first_fill_seconds": metrics.get("average_time_to_first_fill_seconds"),
+        "median_time_to_first_fill_seconds": metrics.get("median_time_to_first_fill_seconds"),
+        "average_time_to_full_fill_seconds": metrics.get("average_time_to_full_fill_seconds"),
+        "median_time_to_full_fill_seconds": metrics.get("median_time_to_full_fill_seconds"),
+        "unrealized_marks_available": metrics.get("unrealized_marks_available", False),
+        "unrealized_pnl_status": metrics.get("unrealized_pnl_status", "marks_unavailable"),
+        "unrealized_marked_positions_count": metrics.get("unrealized_marked_positions_count", 0),
+        "unrealized_unmarked_positions_count": metrics.get(
+            "unrealized_unmarked_positions_count", 0
+        ),
         "latest_snapshot_ts_ms": snapshot["ts_ms"] if snapshot else None,
     }
 
@@ -1993,6 +2038,8 @@ async def get_paper_metrics() -> dict[str, Any]:
     metrics = _paper_store.get_activity_metrics(window_seconds=3600)
     return {
         "fill_rate": metrics["fill_rate"],
+        "raw_fills_per_intent_ratio": metrics.get("raw_fills_per_intent_ratio", 0.0),
+        "intents_with_at_least_one_fill": metrics.get("intents_with_at_least_one_fill", 0),
         "avg_time_to_fill_seconds": metrics["avg_time_to_fill_seconds"],
         "fills_last_1h": metrics["fills_last_1h"],
         "intents_last_1h": metrics["intents_last_1h"],
@@ -2143,7 +2190,7 @@ async def post_paper_debug_force_fill(request: ForceFillRequest) -> dict[str, An
     remaining_after = remaining_before - actual_fill_size
     fill_ts_ms = int(time.time() * 1000)
     fill_id = f"debug:{intent_id}:{fill_ts_ms}"
-    did_insert_fill = _paper_store.insert_fill(
+    fill_insert_result = _paper_store.insert_fill_result(
         fill_id=fill_id,
         intent_id=intent_id,
         fill_ts_ms=fill_ts_ms,
@@ -2157,7 +2204,7 @@ async def post_paper_debug_force_fill(request: ForceFillRequest) -> dict[str, An
         note="debug_fill",
     )
 
-    if not did_insert_fill:
+    if not fill_insert_result.inserted_new_fill:
         logger.warning(
             "paper_debug_force_fill_insert_rejected",
             extra={
@@ -2166,6 +2213,7 @@ async def post_paper_debug_force_fill(request: ForceFillRequest) -> dict[str, An
                 "ticker": intent["ticker"],
                 "side": intent["side"],
                 "fill_size": actual_fill_size,
+                "insert_status": fill_insert_result.status,
             },
         )
         return {

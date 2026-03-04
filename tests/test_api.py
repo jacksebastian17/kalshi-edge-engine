@@ -547,10 +547,12 @@ class TestPaperDebugEndpoints:
             store.insert_intent(intent)
             store.update_intent_status(intent.id, "OPEN", last_seen_best_bid=52.0, queue_ahead=1)
 
-            def _reject_insert_fill(*_args, **_kwargs) -> bool:
-                return False
+            from kalshi_edge_engine.db.paper_store import FillInsertResult
 
-            monkeypatch.setattr(store, "insert_fill", _reject_insert_fill)
+            def _reject_insert_fill_result(*_args, **_kwargs) -> FillInsertResult:
+                return FillInsertResult(status="error")
+
+            monkeypatch.setattr(store, "insert_fill_result", _reject_insert_fill_result)
             main_module._paper_store = store
 
             response = client.post(

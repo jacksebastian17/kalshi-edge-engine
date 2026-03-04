@@ -30,6 +30,42 @@ VALID_REASON_CODES = {
 }
 
 
+def compute_intended_inside_quote_price_cents(
+    *,
+    bid_price_cents: float | None,
+    cross_price_cents: float | None,
+) -> int | None:
+    """Compute conservative inside quote price in integer cents.
+
+    Rules:
+    - Requires integer-cent bid and cross inputs.
+    - Requires at least 2 cents of width to place a real inside quote.
+    - Quote exactly one tick inside the bid: bid + 1.
+    - Enforces valid Kalshi cent bounds: 1..99 and strictly below cross.
+    """
+    if bid_price_cents is None or cross_price_cents is None:
+        return None
+
+    bid_rounded = round(bid_price_cents)
+    cross_rounded = round(cross_price_cents)
+    if abs(bid_price_cents - bid_rounded) > 1e-9:
+        return None
+    if abs(cross_price_cents - cross_rounded) > 1e-9:
+        return None
+
+    bid = int(bid_rounded)
+    cross = int(cross_rounded)
+    if cross - bid < 2:
+        return None
+
+    quote = bid + 1
+    if quote < 1 or quote > 99:
+        return None
+    if quote >= cross:
+        return None
+    return quote
+
+
 @dataclass
 class Signal:
     """Scored signal output with reason code and edge estimate."""
@@ -58,6 +94,14 @@ class Signal:
     liq_no: int  # Liquidity at best NO bid (contracts)
     top_liquidity: int  # Size at best bid level across both sides (contracts)
     timestamp_ms: int  # When signal was computed
+    intended_quote_yes_cents: int | None = None
+    intended_quote_no_cents: int | None = None
+    capturable_edge_to_cross_yes_cents: float | None = None
+    capturable_edge_to_cross_no_cents: float | None = None
+    net_edge_after_entry_fee_yes_cents: float | None = None
+    net_edge_after_entry_fee_no_cents: float | None = None
+    net_edge_after_round_trip_fee_yes_cents: float | None = None
+    net_edge_after_round_trip_fee_no_cents: float | None = None
 
 
 def score_signal(
@@ -125,16 +169,32 @@ def score_signal(
     # Determine top liquidity (max across all best levels)
     top_liquidity = max(liq_yes, liq_no)
 
+    intended_quote_yes_cents = compute_intended_inside_quote_price_cents(
+        bid_price_cents=bid_yes,
+        cross_price_cents=cross_yes,
+    )
+    intended_quote_no_cents = compute_intended_inside_quote_price_cents(
+        bid_price_cents=bid_no,
+        cross_price_cents=cross_no,
+    )
+
+    capturable_edge_to_cross_yes_cents: float | None = None
+    capturable_edge_to_cross_no_cents: float | None = None
+    if intended_quote_yes_cents is not None and cross_yes is not None:
+        capturable_edge_to_cross_yes_cents = cross_yes - float(intended_quote_yes_cents)
+    if intended_quote_no_cents is not None and cross_no is not None:
+        capturable_edge_to_cross_no_cents = cross_no - float(intended_quote_no_cents)
+
     # Select fee function based on mode
     fee_func = estimate_maker_fee_cents if fee_mode == "maker" else estimate_taker_fee_cents
 
-    # Compute entry fees for each side (based on bid price)
+    # Compute entry fees for each side (based on intended quote price)
     fee_yes: float | None = None
     fee_no: float | None = None
-    if bid_yes is not None:
-        fee_yes = fee_func(bid_yes, contracts_for_fee)
-    if bid_no is not None:
-        fee_no = fee_func(bid_no, contracts_for_fee)
+    if intended_quote_yes_cents is not None:
+        fee_yes = fee_func(float(intended_quote_yes_cents), contracts_for_fee)
+    if intended_quote_no_cents is not None:
+        fee_no = fee_func(float(intended_quote_no_cents), contracts_for_fee)
 
     # Compute exit fees if round_trip=True (use taker rate at cross price)
     fee_exit_yes: float | None = None
@@ -157,10 +217,13 @@ def score_signal(
     # Default: no edge
     net_edge_yes: float | None = None
     net_edge_no: float | None = None
+    net_edge_after_entry_fee_yes_cents: float | None = None
+    net_edge_after_entry_fee_no_cents: float | None = None
+    net_edge_after_round_trip_fee_yes_cents: float | None = None
+    net_edge_after_round_trip_fee_no_cents: float | None = None
     bid_sum: float | None = None
     imbalance_gap: float | None = None
     reason_code = MARKET_INELIGIBLE
-    one_tick = 1.0
 
     # A) If either best bid missing, market is ineligible
     if bid_yes is None or bid_no is None:
@@ -176,16 +239,26 @@ def score_signal(
         # Structural imbalance too small
         reason_code = SPREAD_TOO_SMALL
     else:
-        # Determine side usability (width > 1 tick)
-        usable_yes = inside_width_yes is not None and inside_width_yes > one_tick
-        usable_no = inside_width_no is not None and inside_width_no > one_tick
+        # Determine side usability based on actual intended quote constructability.
+        usable_yes = (
+            intended_quote_yes_cents is not None and capturable_edge_to_cross_yes_cents is not None
+        )
+        usable_no = (
+            intended_quote_no_cents is not None and capturable_edge_to_cross_no_cents is not None
+        )
 
-        # Determine eligibility: usable + meets min_liquidity + (if round_trip, requires cross)
+        # Determine eligibility: usable + meets min_liquidity + fee data available
         eligible_yes = (
-            usable_yes and liq_yes >= min_liquidity and (not round_trip or cross_yes is not None)
+            usable_yes
+            and liq_yes >= min_liquidity
+            and fee_yes is not None
+            and (not round_trip or fee_exit_yes is not None)
         )
         eligible_no = (
-            usable_no and liq_no >= min_liquidity and (not round_trip or cross_no is not None)
+            usable_no
+            and liq_no >= min_liquidity
+            and fee_no is not None
+            and (not round_trip or fee_exit_no is not None)
         )
 
         # Check if we have any eligible sides
@@ -193,11 +266,44 @@ def score_signal(
             # No eligible sides; if usable but illiquid -> LOW_LIQUIDITY, else SPREAD_TOO_SMALL
             reason_code = LOW_LIQUIDITY if usable_yes or usable_no else SPREAD_TOO_SMALL
         else:
-            # Calculate net edges only for eligible sides
-            if eligible_yes and inside_width_yes is not None and total_fee_yes is not None:
-                net_edge_yes = inside_width_yes - total_fee_yes - safety_buffer
-            if eligible_no and inside_width_no is not None and total_fee_no is not None:
-                net_edge_no = inside_width_no - total_fee_no - safety_buffer
+            # Compute explicit edge variants from capturable edge and fee assumptions.
+            if capturable_edge_to_cross_yes_cents is not None and fee_yes is not None:
+                net_edge_after_entry_fee_yes_cents = (
+                    capturable_edge_to_cross_yes_cents - fee_yes - safety_buffer
+                )
+            if (
+                capturable_edge_to_cross_yes_cents is not None
+                and fee_yes is not None
+                and fee_exit_yes is not None
+            ):
+                net_edge_after_round_trip_fee_yes_cents = (
+                    capturable_edge_to_cross_yes_cents - fee_yes - fee_exit_yes - safety_buffer
+                )
+
+            if capturable_edge_to_cross_no_cents is not None and fee_no is not None:
+                net_edge_after_entry_fee_no_cents = (
+                    capturable_edge_to_cross_no_cents - fee_no - safety_buffer
+                )
+            if (
+                capturable_edge_to_cross_no_cents is not None
+                and fee_no is not None
+                and fee_exit_no is not None
+            ):
+                net_edge_after_round_trip_fee_no_cents = (
+                    capturable_edge_to_cross_no_cents - fee_no - fee_exit_no - safety_buffer
+                )
+
+            # Backward-compatible net_edge_* fields now represent the decision metric.
+            net_edge_yes = (
+                net_edge_after_round_trip_fee_yes_cents
+                if round_trip
+                else net_edge_after_entry_fee_yes_cents
+            )
+            net_edge_no = (
+                net_edge_after_round_trip_fee_no_cents
+                if round_trip
+                else net_edge_after_entry_fee_no_cents
+            )
 
             # Signal valid if any eligible side meets edge threshold
             valid_yes = eligible_yes and net_edge_yes is not None and net_edge_yes >= min_edge
@@ -229,4 +335,12 @@ def score_signal(
         liq_no=liq_no,
         top_liquidity=top_liquidity,
         timestamp_ms=now_ms,
+        intended_quote_yes_cents=intended_quote_yes_cents,
+        intended_quote_no_cents=intended_quote_no_cents,
+        capturable_edge_to_cross_yes_cents=capturable_edge_to_cross_yes_cents,
+        capturable_edge_to_cross_no_cents=capturable_edge_to_cross_no_cents,
+        net_edge_after_entry_fee_yes_cents=net_edge_after_entry_fee_yes_cents,
+        net_edge_after_entry_fee_no_cents=net_edge_after_entry_fee_no_cents,
+        net_edge_after_round_trip_fee_yes_cents=net_edge_after_round_trip_fee_yes_cents,
+        net_edge_after_round_trip_fee_no_cents=net_edge_after_round_trip_fee_no_cents,
     )

@@ -2,7 +2,9 @@
 
 import time
 import unittest
+from typing import Literal
 
+from kalshi_edge_engine.engine.fees import estimate_maker_fee_cents, estimate_taker_fee_cents
 from kalshi_edge_engine.engine.orderbook import (
     BestLevel,
     get_best_bid_size,
@@ -14,6 +16,7 @@ from kalshi_edge_engine.engine.signal import (
     MARKET_INELIGIBLE,
     SIGNAL_VALID,
     SPREAD_TOO_SMALL,
+    compute_intended_inside_quote_price_cents,
     score_signal,
 )
 
@@ -160,16 +163,16 @@ class TestSignalScoring(unittest.TestCase):
         """Test that safety buffer is applied to net edge calculation."""
         orderbook = {
             "yes": [[80, 250]],
-            "no": [[18, 250]],
+            "no": [[17, 250]],
         }
-        # inside_width_yes = 100-18-80 = 2.0
+        # inside_width_yes = 100-17-80 = 3.0
         # Fee computed dynamically, safety_buffer=0.2
-        # imbalance_gap = 100 - (80 + 18) = 2.0 >= 1.5 ✓
+        # imbalance_gap = 100 - (80 + 17) = 3.0 >= 1.5 ✓
 
         signal = score_signal("TEST-TICKER", orderbook, min_edge=0.1, safety_buffer=0.2)
 
         assert signal.reason_code == SIGNAL_VALID
-        assert signal.inside_width_yes == 2.0
+        assert signal.inside_width_yes == 3.0
         # net_edge = inside_width - fee - safety_buffer (fee varies by price)
         assert signal.net_edge_yes is not None and signal.net_edge_yes >= 0.1
 
@@ -289,7 +292,8 @@ class TestSignalScoring(unittest.TestCase):
 
         # Test with different fee modes
         for fee_mode in ["maker", "taker"]:
-            signal = score_signal("TEST-TICKER", orderbook, fee_mode=fee_mode)
+            fee_mode_literal: Literal["maker", "taker"] = fee_mode
+            signal = score_signal("TEST-TICKER", orderbook, fee_mode=fee_mode_literal)
             assert signal.reason_code in {
                 SPREAD_TOO_SMALL,
                 LOW_LIQUIDITY,
@@ -306,6 +310,72 @@ class TestSignalScoring(unittest.TestCase):
         after_ms = int(time.time() * 1000)
 
         assert before_ms <= signal.timestamp_ms <= after_ms
+
+    def test_intended_quote_1_cent_width_none(self) -> None:
+        """1-cent width cannot host a real inside quote."""
+        quote = compute_intended_inside_quote_price_cents(
+            bid_price_cents=50.0,
+            cross_price_cents=51.0,
+        )
+        assert quote is None
+
+    def test_intended_quote_2_cent_width_bid_plus_one(self) -> None:
+        """2-cent width quotes exactly one tick inside."""
+        quote = compute_intended_inside_quote_price_cents(
+            bid_price_cents=50.0,
+            cross_price_cents=52.0,
+        )
+        assert quote == 51
+
+    def test_intended_quote_rejects_non_integer_levels(self) -> None:
+        """Non-integer prices must not produce impossible decimal quote intents."""
+        quote = compute_intended_inside_quote_price_cents(
+            bid_price_cents=50.5,
+            cross_price_cents=53.0,
+        )
+        assert quote is None
+
+    def test_signal_uses_capturable_edge_from_actual_quote(self) -> None:
+        """Capturable edge equals cross - intended quote and drives net edge."""
+        orderbook = {
+            "yes": [[80, 250]],
+            "no": [[18, 250]],
+        }
+        # YES: bid=80, cross=82, intended quote=81, capturable edge=1
+        signal = score_signal("TEST-TICKER", orderbook, min_edge=0.0, safety_buffer=0.0)
+
+        assert signal.intended_quote_yes_cents == 81
+        assert signal.capturable_edge_to_cross_yes_cents == 1.0
+        assert signal.inside_width_yes == 2.0
+        assert signal.net_edge_yes is not None
+        assert signal.net_edge_yes < signal.capturable_edge_to_cross_yes_cents
+
+    def test_round_trip_net_edge_is_more_conservative_than_entry_only(self) -> None:
+        """Round-trip fee modeling should never overstate edge vs entry-only."""
+        orderbook = {
+            "yes": [[80, 250]],
+            "no": [[15, 250]],
+        }
+        signal_entry = score_signal(
+            "TEST-TICKER",
+            orderbook,
+            round_trip=False,
+            min_edge=-10.0,
+            safety_buffer=0.0,
+        )
+        signal_round_trip = score_signal(
+            "TEST-TICKER",
+            orderbook,
+            round_trip=True,
+            min_edge=-10.0,
+            safety_buffer=0.0,
+        )
+
+        assert signal_entry.net_edge_yes is not None
+        assert signal_round_trip.net_edge_yes is not None
+        assert signal_round_trip.net_edge_yes <= signal_entry.net_edge_yes
+        assert signal_entry.net_edge_after_entry_fee_yes_cents is not None
+        assert signal_round_trip.net_edge_after_round_trip_fee_yes_cents is not None
 
 
 class TestOrderbookPriceValidation(unittest.TestCase):
@@ -497,8 +567,8 @@ class TestSideLiquidityGating(unittest.TestCase):
 
         signal = score_signal("TEST-TICKER", orderbook)
 
-        # YES side should have fee
-        assert signal.fee_yes is not None
+        # Missing opposite side => no valid intended quote, so no fee on YES
+        assert signal.fee_yes is None
         # NO side missing, so fee_no should be None
         assert signal.fee_no is None
 
@@ -556,27 +626,27 @@ class TestSideLiquidityGating(unittest.TestCase):
 
     def test_signal_exit_fees_use_cross_prices(self) -> None:
         """Test that exit fees are calculated using cross prices, not bid prices."""
-        # Create orderbook where bid and cross are significantly different
         orderbook = {
-            "yes": [[1, 100]],  # bid_yes=1, cross_yes=100-99=1
-            "no": [[99, 100]],  # bid_no=99, cross_no=100-1=99
+            "yes": [[10, 100]],
+            "no": [[80, 100]],
         }
 
         signal = score_signal("TEST-TICKER", orderbook, fee_mode="maker", round_trip=True)
 
-        # Exit fees should use cross prices (1¢ for YES, 99¢ for NO)
-        # At P=1¢ or P=99¢, both are near boundaries where fee → 0
-        # P=0.01: P*(1-P) = 0.01*0.99 = 0.0099
-        # Taker: 0.07 * 0.0099 = 0.000693 → ceil(0.0693) = 1 cent
-        # P=0.99: P*(1-P) = 0.99*0.01 = 0.0099 (same)
+        assert signal.intended_quote_yes_cents == 11
+        assert signal.intended_quote_no_cents == 81
+        assert signal.cross_yes == 20.0
+        assert signal.cross_no == 90.0
+
+        # Exit fees should use cross prices.
         assert signal.fee_exit_yes is not None
         assert signal.fee_exit_no is not None
-        assert signal.fee_exit_yes == 1.0  # Using cross_yes=1
-        assert signal.fee_exit_no == 1.0  # Using cross_no=99
+        assert signal.fee_exit_yes == estimate_taker_fee_cents(20.0, 1)
+        assert signal.fee_exit_no == estimate_taker_fee_cents(90.0, 1)
 
-        # Entry fees use bid prices (1¢ and 99¢)
-        assert signal.fee_yes == 1.0  # maker at bid_yes=1
-        assert signal.fee_no == 1.0  # maker at bid_no=99
+        # Entry fees use intended quote prices (11 and 81).
+        assert signal.fee_yes == estimate_maker_fee_cents(11.0, 1)
+        assert signal.fee_no == estimate_maker_fee_cents(81.0, 1)
 
     def test_signal_debug_fields_populated(self) -> None:
         """Test that debug fields are populated correctly."""
@@ -592,6 +662,8 @@ class TestSideLiquidityGating(unittest.TestCase):
         assert signal.round_trip is True
         assert signal.fee_exit_yes is not None
         assert signal.fee_exit_no is not None
+        assert signal.fee_yes is not None
+        assert signal.fee_no is not None
         assert signal.total_fee_yes is not None
         assert signal.total_fee_no is not None
 

@@ -2,9 +2,11 @@
 
 import logging
 import sqlite3
+import statistics
 import time
 import uuid
-from typing import Any, overload
+from dataclasses import dataclass
+from typing import Any
 
 from kalshi_edge_engine.engine.paper import PaperFill, PaperOutcome, QuoteIntent
 
@@ -12,6 +14,39 @@ logger = logging.getLogger(__name__)
 
 # Default database path
 DEFAULT_DB_PATH = "paper_trading.db"
+
+FILL_INSERTED_NEW = "inserted_new_fill"
+FILL_ALREADY_EXISTS = "already_exists"
+FILL_REJECTED_OVERFILL = "rejected_overfill"
+FILL_REJECTED_MISSING_INTENT = "rejected_missing_intent"
+FILL_ERROR = "error"
+
+
+@dataclass(frozen=True)
+class FillInsertResult:
+    """Structured result for insert_fill operations."""
+
+    status: str
+
+    @property
+    def inserted_new_fill(self) -> bool:
+        return self.status == FILL_INSERTED_NEW
+
+    @property
+    def already_exists(self) -> bool:
+        return self.status == FILL_ALREADY_EXISTS
+
+    @property
+    def rejected_overfill(self) -> bool:
+        return self.status == FILL_REJECTED_OVERFILL
+
+    @property
+    def rejected_missing_intent(self) -> bool:
+        return self.status == FILL_REJECTED_MISSING_INTENT
+
+    @property
+    def error(self) -> bool:
+        return self.status == FILL_ERROR
 
 
 class PaperStore:
@@ -699,29 +734,8 @@ class PaperStore:
         if not isinstance(remaining_size, int) or remaining_size < 0:
             raise ValueError("remaining_size must be an integer >= 0")
 
-    @overload
-    def insert_fill(self, fill: PaperFill) -> bool: ...
-
-    @overload
-    def insert_fill(
-        self,
-        fill_id: str,
-        intent_id: str,
-        fill_ts_ms: int,
-        fill_price_cents: float,
-        fill_size: int = 1,
-        remaining_size: int = 0,
-        queue_ahead_at_fill: int | None = None,
-        fill_fee_cents: float | None = None,
-        best_bid_at_fill_cents: float | None = None,
-        cross_at_fill_cents: float | None = None,
-        mark_30s_after_fill_cents: float | None = None,
-        pnl_30s_after_fill_cents: float | None = None,
-        note: str | None = None,
-    ) -> bool: ...
-
-    def insert_fill(self, *args: Any, **kwargs: Any) -> bool:
-        """Insert a paper fill event. Supports legacy, positional, and keyword APIs.
+    def insert_fill_result(self, *args: Any, **kwargs: Any) -> FillInsertResult:
+        """Insert a paper fill event and return a structured result.
 
         Implements atomic concurrency control: all checks (idempotency, filled_so_far,
         overfill prevention) happen within a single BEGIN IMMEDIATE transaction to prevent
@@ -730,7 +744,7 @@ class PaperStore:
         Implements overfill prevention: prevents inserting a fill that would exceed
         the intent's size_contracts.
 
-        Implements idempotency: if fill_id already exists, returns True (no-op).
+        Implements idempotency: if fill_id already exists, returns already_exists (no-op).
 
         Updates intent status atomically:
         - If remaining_size == 0 after fill -> set status to FILLED
@@ -741,7 +755,12 @@ class PaperStore:
             **kwargs: Keyword arguments (see overloads)
 
         Returns:
-            True if fill was inserted (or already existed), False if rejected due to overfill prevention.
+            FillInsertResult status:
+            - inserted_new_fill
+            - already_exists
+            - rejected_overfill
+            - rejected_missing_intent
+            - error
 
         Raises:
             ValueError if arguments cannot be parsed or are invalid.
@@ -780,7 +799,7 @@ class PaperStore:
                                 "intent_id": intent_id,
                             },
                         )
-                        return True
+                        return FillInsertResult(status=FILL_ALREADY_EXISTS)
 
                     # Load intent to get size_contracts
                     cursor.execute(
@@ -794,7 +813,7 @@ class PaperStore:
                             "paper_store_insert_fill_intent_not_found",
                             extra={"intent_id": intent_id},
                         )
-                        return False
+                        return FillInsertResult(status=FILL_REJECTED_MISSING_INTENT)
 
                     size_contracts = intent_row[0]
 
@@ -817,7 +836,7 @@ class PaperStore:
                                 "attempted_fill_size": fill_size,
                             },
                         )
-                        return False
+                        return FillInsertResult(status=FILL_REJECTED_OVERFILL)
 
                     # Check if this fill would cause overfill
                     if filled_so_far + fill_size > size_contracts:
@@ -831,7 +850,7 @@ class PaperStore:
                                 "size_contracts": size_contracts,
                             },
                         )
-                        return False
+                        return FillInsertResult(status=FILL_REJECTED_OVERFILL)
 
                     # Compute corrected remaining_size for consistency
                     # remaining_size should be (size_contracts - (filled_so_far + fill_size))
@@ -892,7 +911,7 @@ class PaperStore:
                             "new_intent_status": new_status,
                         },
                     )
-                    return True
+                    return FillInsertResult(status=FILL_INSERTED_NEW)
 
                 except sqlite3.Error as e:
                     conn.rollback()
@@ -900,14 +919,24 @@ class PaperStore:
                         "paper_store_insert_fill_error",
                         extra={"fill_id": fill_dict["fill_id"], "error": str(e)},
                     )
-                    return False
+                    return FillInsertResult(status=FILL_ERROR)
 
         except sqlite3.Error as e:
             logger.exception(
                 "paper_store_insert_fill_connection_error",
                 extra={"fill_id": fill_id, "error": str(e)},
             )
-            return False
+            return FillInsertResult(status=FILL_ERROR)
+
+    def insert_fill(self, *args: Any, **kwargs: Any) -> bool:
+        """Insert a fill with backward-compatible bool semantics.
+
+        Returns:
+            True when a new fill is inserted OR the fill already exists (idempotent replay).
+            False when rejected (missing intent, overfill) or on error.
+        """
+        result = self.insert_fill_result(*args, **kwargs)
+        return result.inserted_new_fill or result.already_exists
 
     def upsert_position(
         self,
@@ -1313,7 +1342,9 @@ class PaperStore:
                 positions = cursor.fetchall()
 
                 # Compute realized PnL from positions table
-                realized_pnl_cents = sum(float(row[4]) if row[4] is not None else 0.0 for row in positions)
+                realized_pnl_cents = sum(
+                    float(row[4]) if row[4] is not None else 0.0 for row in positions
+                )
 
                 # Count nonzero positions
                 open_positions = [p for p in positions if p[2] != 0]  # p[2] is net_contracts
@@ -1323,17 +1354,129 @@ class PaperStore:
                 cursor.execute("SELECT COUNT(*) FROM quote_intents WHERE status = 'OPEN'")
                 open_orders_count = cursor.fetchone()[0] or 0
 
+                cursor.execute("SELECT COUNT(*) FROM quote_intents")
+                total_intents = int(cursor.fetchone()[0] or 0)
+
+                cursor.execute("SELECT COUNT(*) FROM paper_fills")
+                total_fills = int(cursor.fetchone()[0] or 0)
+
+                cursor.execute("SELECT COUNT(DISTINCT intent_id) FROM paper_fills")
+                intents_with_at_least_one_fill = int(cursor.fetchone()[0] or 0)
+
+                cursor.execute(
+                    """
+                    SELECT i.id, i.created_ts_ms, i.size_contracts,
+                           COALESCE(SUM(f.fill_size), 0) AS filled_size,
+                           MIN(f.fill_ts_ms) AS first_fill_ts_ms,
+                           MAX(f.fill_ts_ms) AS last_fill_ts_ms
+                    FROM quote_intents i
+                    LEFT JOIN paper_fills f ON f.intent_id = i.id
+                    GROUP BY i.id, i.created_ts_ms, i.size_contracts
+                    """
+                )
+                intent_rows = cursor.fetchall()
+
+                fully_filled_intents = 0
+                partial_fill_intents = 0
+                fill_fractions: list[float] = []
+                time_to_first_fill_seconds: list[float] = []
+                time_to_full_fill_seconds: list[float] = []
+                for (
+                    _intent_id,
+                    created_ts_ms,
+                    size_contracts,
+                    filled_size,
+                    first_fill_ts_ms,
+                    last_fill_ts_ms,
+                ) in intent_rows:
+                    intent_size = max(0, int(size_contracts or 0))
+                    total_filled_for_intent = max(0, int(filled_size or 0))
+                    if intent_size <= 0:
+                        fill_fractions.append(0.0)
+                        continue
+
+                    fill_fraction = min(1.0, total_filled_for_intent / float(intent_size))
+                    fill_fractions.append(fill_fraction)
+
+                    has_fill = total_filled_for_intent > 0
+                    is_fully_filled = total_filled_for_intent >= intent_size
+
+                    if has_fill and first_fill_ts_ms is not None:
+                        ttf_seconds = (int(first_fill_ts_ms) - int(created_ts_ms)) / 1000.0
+                        time_to_first_fill_seconds.append(max(0.0, float(ttf_seconds)))
+
+                    if has_fill and not is_fully_filled:
+                        partial_fill_intents += 1
+
+                    if is_fully_filled:
+                        fully_filled_intents += 1
+                        if last_fill_ts_ms is not None:
+                            ttf_full_seconds = (int(last_fill_ts_ms) - int(created_ts_ms)) / 1000.0
+                            time_to_full_fill_seconds.append(max(0.0, float(ttf_full_seconds)))
+
+                avg_time_to_first_fill_seconds = (
+                    float(sum(time_to_first_fill_seconds) / len(time_to_first_fill_seconds))
+                    if time_to_first_fill_seconds
+                    else None
+                )
+                median_time_to_first_fill_seconds = (
+                    float(statistics.median(time_to_first_fill_seconds))
+                    if time_to_first_fill_seconds
+                    else None
+                )
+                avg_time_to_full_fill_seconds = (
+                    float(sum(time_to_full_fill_seconds) / len(time_to_full_fill_seconds))
+                    if time_to_full_fill_seconds
+                    else None
+                )
+                median_time_to_full_fill_seconds = (
+                    float(statistics.median(time_to_full_fill_seconds))
+                    if time_to_full_fill_seconds
+                    else None
+                )
+
+                intents_without_fill = max(0, total_intents - intents_with_at_least_one_fill)
+                true_intent_fill_rate = (
+                    float(intents_with_at_least_one_fill / total_intents)
+                    if total_intents > 0
+                    else 0.0
+                )
+                full_fill_rate = (
+                    float(fully_filled_intents / total_intents) if total_intents > 0 else 0.0
+                )
+                partial_fill_rate = (
+                    float(partial_fill_intents / total_intents) if total_intents > 0 else 0.0
+                )
+                avg_filled_fraction = (
+                    float(sum(fill_fractions) / len(fill_fractions)) if fill_fractions else 0.0
+                )
+                raw_fills_per_intent_ratio = (
+                    float(total_fills / total_intents) if total_intents > 0 else 0.0
+                )
+
                 # Compute unrealized PnL if marks provided
                 unrealized_pnl_cents = 0.0
-                if mark_price_dict:
-                    for ticker, side, net_contracts, avg_entry_price, _, first_open_ts_ms in positions:
+                marked_open_positions_count = 0
+                unmarked_open_positions_count = 0
+                marks_available = mark_price_dict is not None
+                if mark_price_dict is not None:
+                    for (
+                        ticker,
+                        side,
+                        net_contracts,
+                        avg_entry_price,
+                        _,
+                        first_open_ts_ms,
+                    ) in positions:
                         if net_contracts == 0:
                             continue
 
                         side_key = str(side).upper()
                         mark_price = mark_price_dict.get(ticker, {}).get(side_key)
                         if mark_price is None:
+                            unmarked_open_positions_count += 1
                             continue
+                        marked_open_positions_count += 1
 
                         # Price PnL component
                         if side_key == "YES":
@@ -1341,10 +1484,10 @@ class PaperStore:
                         else:
                             price_pnl = (avg_entry_price - mark_price) * net_contracts
 
-                                                # Fee component: sum entry fees only for fills in the currently open
-                                                # lifecycle window for this ticker+side.
-                                                # This avoids carrying stale fees from older closed cycles into
-                                                # current unrealized PnL.
+                            # Fee component: sum entry fees only for fills in the currently open
+                            # lifecycle window for this ticker+side.
+                            # This avoids carrying stale fees from older closed cycles into
+                            # current unrealized PnL.
                         cursor.execute(
                             """
                             SELECT COALESCE(SUM(f.fill_fee_cents), 0.0)
@@ -1354,7 +1497,7 @@ class PaperStore:
                               AND (f.note IS NULL OR f.note NOT LIKE 'exit%')
                                                             AND f.fill_ts_ms >= ?
                             """,
-                                                        (ticker, side_key, int(first_open_ts_ms or 0)),
+                            (ticker, side_key, int(first_open_ts_ms or 0)),
                         )
                         total_entry_fees = cursor.fetchone()[0] or 0.0
 
@@ -1362,6 +1505,15 @@ class PaperStore:
                         unrealized_pnl_cents += price_pnl - total_entry_fees
 
                 total_pnl_cents = realized_pnl_cents + unrealized_pnl_cents
+                unrealized_pnl_status = "marked" if marks_available else "marks_unavailable"
+                if marks_available:
+                    unrealized_pnl_status = (
+                        "partial_marks"
+                        if unmarked_open_positions_count > 0 and open_positions_count > 0
+                        else "marked"
+                    )
+                elif open_positions_count == 0:
+                    unrealized_pnl_status = "no_open_positions"
 
                 return {
                     "realized_pnl_cents": float(realized_pnl_cents),
@@ -1369,6 +1521,25 @@ class PaperStore:
                     "total_pnl_cents": float(total_pnl_cents),
                     "open_positions_count": int(open_positions_count),
                     "open_orders_count": int(open_orders_count),
+                    "total_intents": int(total_intents),
+                    "total_fills": int(total_fills),
+                    "raw_fills_per_intent_ratio": float(raw_fills_per_intent_ratio),
+                    "intents_with_at_least_one_fill": int(intents_with_at_least_one_fill),
+                    "intents_without_fill": int(intents_without_fill),
+                    "fully_filled_intents": int(fully_filled_intents),
+                    "partial_fill_intents": int(partial_fill_intents),
+                    "intent_fill_rate": float(true_intent_fill_rate),
+                    "full_fill_rate": float(full_fill_rate),
+                    "partial_fill_rate": float(partial_fill_rate),
+                    "average_filled_fraction": float(avg_filled_fraction),
+                    "average_time_to_first_fill_seconds": avg_time_to_first_fill_seconds,
+                    "median_time_to_first_fill_seconds": median_time_to_first_fill_seconds,
+                    "average_time_to_full_fill_seconds": avg_time_to_full_fill_seconds,
+                    "median_time_to_full_fill_seconds": median_time_to_full_fill_seconds,
+                    "unrealized_marks_available": bool(marks_available),
+                    "unrealized_marked_positions_count": int(marked_open_positions_count),
+                    "unrealized_unmarked_positions_count": int(unmarked_open_positions_count),
+                    "unrealized_pnl_status": unrealized_pnl_status,
                 }
         except sqlite3.Error as e:
             logger.exception(
@@ -1381,6 +1552,25 @@ class PaperStore:
                 "total_pnl_cents": 0.0,
                 "open_positions_count": 0,
                 "open_orders_count": 0,
+                "total_intents": 0,
+                "total_fills": 0,
+                "raw_fills_per_intent_ratio": 0.0,
+                "intents_with_at_least_one_fill": 0,
+                "intents_without_fill": 0,
+                "fully_filled_intents": 0,
+                "partial_fill_intents": 0,
+                "intent_fill_rate": 0.0,
+                "full_fill_rate": 0.0,
+                "partial_fill_rate": 0.0,
+                "average_filled_fraction": 0.0,
+                "average_time_to_first_fill_seconds": None,
+                "median_time_to_first_fill_seconds": None,
+                "average_time_to_full_fill_seconds": None,
+                "median_time_to_full_fill_seconds": None,
+                "unrealized_marks_available": False,
+                "unrealized_marked_positions_count": 0,
+                "unrealized_unmarked_positions_count": 0,
+                "unrealized_pnl_status": "error",
             }
 
     def get_latest_intent_id_for_ticker_side(self, ticker: str, side: str) -> str | None:
@@ -1844,10 +2034,22 @@ class PaperStore:
                     else None
                 )
 
-                fill_rate = float(total_fills / total_intents) if total_intents > 0 else 0.0
+                cursor.execute("SELECT COUNT(DISTINCT intent_id) FROM paper_fills")
+                intents_with_at_least_one_fill = int(cursor.fetchone()[0] or 0)
+
+                fill_rate = (
+                    float(intents_with_at_least_one_fill / total_intents)
+                    if total_intents > 0
+                    else 0.0
+                )
+                raw_fills_per_intent_ratio = (
+                    float(total_fills / total_intents) if total_intents > 0 else 0.0
+                )
 
                 return {
                     "fill_rate": fill_rate,
+                    "raw_fills_per_intent_ratio": raw_fills_per_intent_ratio,
+                    "intents_with_at_least_one_fill": intents_with_at_least_one_fill,
                     "avg_time_to_fill_seconds": avg_time_to_fill_seconds,
                     "fills_last_1h": fills_last_window,
                     "intents_last_1h": intents_last_window,
@@ -1859,6 +2061,8 @@ class PaperStore:
             )
             return {
                 "fill_rate": 0.0,
+                "raw_fills_per_intent_ratio": 0.0,
+                "intents_with_at_least_one_fill": 0,
                 "avg_time_to_fill_seconds": None,
                 "fills_last_1h": 0,
                 "intents_last_1h": 0,

@@ -178,7 +178,7 @@ class TestSignalsScanEndpoint(unittest.TestCase):
 
         books: dict[str, dict[str, list[list[int]]]] = {
             "AAA": {"yes": [[70, 100]], "no": [[27, 100]]},  # strongest net edge
-            "BBB": {"yes": [[80, 100]], "no": [[18, 100]]},  # medium net edge
+            "BBB": {"yes": [[80, 100]], "no": [[17, 100]]},  # medium net edge
             "CCC": {"yes": [[50, 100]], "no": [[49, 100]]},  # spread too small
         }
 

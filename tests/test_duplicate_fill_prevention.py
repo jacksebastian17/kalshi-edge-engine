@@ -124,6 +124,72 @@ class TestDuplicateFillPrevention:
             fill_count = cursor.fetchone()[0]
             assert fill_count == 1, "Only 1 fill row should exist"
 
+    def test_duplicate_fill_replay_returns_already_exists_status(self, paper_store: PaperStore):
+        """Replaying identical fill_id should be idempotent and explicit."""
+        ticker = "TEST_NBA6"
+        side = "YES"
+        intent_id = self._create_intent(paper_store, ticker, side, size_contracts=2)
+        now_ms = int(time.time() * 1000)
+
+        first = paper_store.insert_fill_result(
+            fill_id="dup-fill-id",
+            intent_id=intent_id,
+            fill_ts_ms=now_ms,
+            fill_price_cents=50.0,
+            fill_size=1,
+            remaining_size=1,
+            fill_fee_cents=0.1,
+        )
+        replay = paper_store.insert_fill_result(
+            fill_id="dup-fill-id",
+            intent_id=intent_id,
+            fill_ts_ms=now_ms,
+            fill_price_cents=50.0,
+            fill_size=1,
+            remaining_size=1,
+            fill_fee_cents=0.1,
+        )
+
+        assert first.inserted_new_fill is True
+        assert replay.already_exists is True
+
+    def test_duplicate_replay_does_not_double_mutate_position(self, paper_store: PaperStore):
+        """Position mutation should happen only for newly inserted fills."""
+        ticker = "TEST_NBA7"
+        side = "NO"
+        intent_id = self._create_intent(paper_store, ticker, side, size_contracts=2)
+        now_ms = int(time.time() * 1000)
+
+        net_contracts = 0
+
+        first = paper_store.insert_fill_result(
+            fill_id="replay-fill",
+            intent_id=intent_id,
+            fill_ts_ms=now_ms,
+            fill_price_cents=47.0,
+            fill_size=1,
+            remaining_size=1,
+            fill_fee_cents=0.1,
+        )
+        if first.inserted_new_fill:
+            net_contracts += 1
+
+        replay = paper_store.insert_fill_result(
+            fill_id="replay-fill",
+            intent_id=intent_id,
+            fill_ts_ms=now_ms,
+            fill_price_cents=47.0,
+            fill_size=1,
+            remaining_size=1,
+            fill_fee_cents=0.1,
+        )
+        if replay.inserted_new_fill:
+            net_contracts += 1
+
+        assert replay.already_exists is True
+        assert net_contracts == 1
+        assert paper_store.get_filled_size_for_intent(intent_id) == 1
+
     def test_prevent_double_counting_fees(self, paper_store: PaperStore):
         """Test that fees are not double-counted when duplicate fills would occur.
 
