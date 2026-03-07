@@ -253,6 +253,10 @@ async def _process_paper_intents(
 
         async def _simulate_task(intent_param, entry_fee_param: float) -> None:
             try:
+                store = runtime_state.paper_store
+                if store is None:
+                    return
+
                 entry_fee_cents = entry_fee_param
 
                 order_request = OrderRequest(
@@ -282,9 +286,9 @@ async def _process_paper_intents(
                 )
 
                 def _on_simulator_poll(runtime_update: dict[str, Any]) -> None:
-                    if runtime_state.paper_store is None:
+                    if store is None:
                         return
-                    runtime_state.paper_store.update_intent_status(
+                    store.update_intent_status(
                         intent_param.id,
                         PAPER_INTENT_STATUS_OPEN,
                         last_seen_best_bid=runtime_update.get("last_seen_best_bid"),
@@ -300,7 +304,7 @@ async def _process_paper_intents(
 
                 total_filled = 0
                 for fill in fills:
-                    intent_record = runtime_state.paper_store.get_intent_record(fill.order_id)
+                    intent_record = store.get_intent_record(fill.order_id)
                     if intent_record is None:
                         logger.warning(
                             "paper_fill_skip_intent_not_found",
@@ -309,9 +313,7 @@ async def _process_paper_intents(
                         continue
 
                     size_contracts = int(intent_record["size_contracts"])
-                    filled_so_far = runtime_state.paper_store.get_filled_size_for_intent(
-                        fill.order_id
-                    )
+                    filled_so_far = store.get_filled_size_for_intent(fill.order_id)
 
                     if filled_so_far >= size_contracts:
                         logger.warning(
@@ -328,7 +330,7 @@ async def _process_paper_intents(
 
                     remaining_after = max(0, size_contracts - (filled_so_far + fill.fill_size))
 
-                    fill_insert_result = runtime_state.paper_store.insert_fill_result(
+                    fill_insert_result = store.insert_fill_result(
                         fill_id=fill.id,
                         intent_id=fill.order_id,
                         fill_ts_ms=fill.fill_ts_ms,
@@ -363,7 +365,7 @@ async def _process_paper_intents(
                     total_filled += fill.fill_size
 
                     if fill.fill_size > 0:
-                        positions = runtime_state.paper_store.get_positions()
+                        positions = store.get_positions()
                         current_pos = next(
                             (
                                 p
@@ -381,7 +383,7 @@ async def _process_paper_intents(
                             )
                             new_contracts = current_pos["net_contracts"] + fill.fill_size
                             new_avg_price = total_cost / new_contracts if new_contracts > 0 else 0.0
-                            runtime_state.paper_store.upsert_position(
+                            store.upsert_position(
                                 ticker=intent_param.ticker,
                                 side=intent_param.side,
                                 net_contracts=new_contracts,
@@ -390,7 +392,7 @@ async def _process_paper_intents(
                                 first_open_ts_ms=current_pos["first_open_ts_ms"],
                             )
                         else:
-                            runtime_state.paper_store.upsert_position(
+                            store.upsert_position(
                                 ticker=intent_param.ticker,
                                 side=intent_param.side,
                                 net_contracts=fill.fill_size,
@@ -403,11 +405,9 @@ async def _process_paper_intents(
                 last_seen_best_bid = order_state.get("last_seen_best_bid")
                 queue_ahead_contracts = order_state.get("queue_ahead_contracts")
 
-                total_filled_now = runtime_state.paper_store.get_filled_size_for_intent(
-                    intent_param.id
-                )
+                total_filled_now = store.get_filled_size_for_intent(intent_param.id)
                 intent_size = intent_param.size_contracts
-                current_intent_status = runtime_state.paper_store.get_intent_record(intent_param.id)
+                current_intent_status = store.get_intent_record(intent_param.id)
 
                 if total_filled_now >= intent_size:
                     existing_status = (
@@ -416,14 +416,14 @@ async def _process_paper_intents(
                         else PAPER_INTENT_STATUS_OPEN
                     )
                     if existing_status != PAPER_INTENT_STATUS_FILLED:
-                        runtime_state.paper_store.update_intent_status(
+                        store.update_intent_status(
                             intent_param.id,
                             PAPER_INTENT_STATUS_FILLED,
                             last_seen_best_bid=last_seen_best_bid,
                             queue_ahead=queue_ahead_contracts,
                         )
                 else:
-                    runtime_state.paper_store.update_intent_status(
+                    store.update_intent_status(
                         intent_param.id,
                         PAPER_INTENT_STATUS_EXPIRED,
                         last_seen_best_bid=last_seen_best_bid,
@@ -446,9 +446,10 @@ async def _process_paper_intents(
                     "paper_simulation_task_error",
                     extra={"intent_id": intent_param.id, "error": str(e)},
                 )
-                runtime_state.paper_store.update_intent_status(
-                    intent_param.id, PAPER_INTENT_STATUS_ERROR
-                )
+                if runtime_state.paper_store is not None:
+                    runtime_state.paper_store.update_intent_status(
+                        intent_param.id, PAPER_INTENT_STATUS_ERROR
+                    )
 
         task = asyncio.create_task(_simulate_task(intent, entry_fee_cents))
         runtime_state.paper_simulation_tasks.add(task)

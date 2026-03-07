@@ -507,8 +507,8 @@ async def _process_paper_intents(
     client: KalshiClient,
 ) -> None:
     _sync_runtime_from_legacy()
-    _runtime_paper_runtime_module.build_quote_intents = build_quote_intents
-    _runtime_paper_runtime_module.RealisticOrderSimulator = RealisticOrderSimulator
+    setattr(_runtime_paper_runtime_module, "build_quote_intents", build_quote_intents)
+    setattr(_runtime_paper_runtime_module, "RealisticOrderSimulator", RealisticOrderSimulator)
     await _runtime_process_paper_intents(signal, client)
     _sync_legacy_from_runtime()
 
