@@ -27,6 +27,7 @@ from kalshi_edge_engine.kalshi.client import (
     KalshiClient,
 )
 from kalshi_edge_engine.runtime import config as runtime_config
+from kalshi_edge_engine.runtime import paper_runtime as _runtime_paper_runtime_module
 from kalshi_edge_engine.runtime import state as runtime_state
 from kalshi_edge_engine.runtime.paper_exit_runtime import (
     _close_position as _runtime_close_position,
@@ -43,7 +44,9 @@ from kalshi_edge_engine.runtime.paper_exit_runtime import (
 from kalshi_edge_engine.runtime.paper_exit_runtime import (
     _update_fill_30s_outcomes as _runtime_update_fill_30s_outcomes,
 )
-from kalshi_edge_engine.runtime.paper_runtime import _can_create_intent as _runtime_can_create_intent
+from kalshi_edge_engine.runtime.paper_runtime import (
+    _can_create_intent as _runtime_can_create_intent,
+)
 from kalshi_edge_engine.runtime.paper_runtime import (
     _get_rate_limit_or_cooldown_reason as _runtime_get_rate_limit_or_cooldown_reason,
 )
@@ -51,8 +54,9 @@ from kalshi_edge_engine.runtime.paper_runtime import _init_paper_store as _runti
 from kalshi_edge_engine.runtime.paper_runtime import (
     _process_paper_intents as _runtime_process_paper_intents,
 )
-from kalshi_edge_engine.runtime import paper_runtime as _runtime_paper_runtime_module
-from kalshi_edge_engine.runtime.scanner_runtime import _nba_scanner_loop as _runtime_nba_scanner_loop
+from kalshi_edge_engine.runtime.scanner_runtime import (
+    _nba_scanner_loop as _runtime_nba_scanner_loop,
+)
 
 # Load environment variables from .env file
 load_dotenv()

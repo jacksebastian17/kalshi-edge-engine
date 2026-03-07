@@ -64,7 +64,8 @@ async def _nba_scanner_loop(
                 del runtime_state.scanner_state.cooldown_until_ms[t]
 
             should_refresh_universe = (
-                now_ms - runtime_state.scanner_state.last_universe_refresh_ms > universe_refresh_ttl_ms
+                now_ms - runtime_state.scanner_state.last_universe_refresh_ms
+                > universe_refresh_ttl_ms
             )
 
             if should_refresh_universe or not runtime_state.scanner_state.market_tickers:
@@ -95,9 +96,9 @@ async def _nba_scanner_loop(
             skipped_count = 0
 
             idx = start_idx
-            while len(available_tickers) < scan_slice_size and len(available_tickers) + skipped_count < len(
-                market_tickers
-            ):
+            while len(available_tickers) < scan_slice_size and len(
+                available_tickers
+            ) + skipped_count < len(market_tickers):
                 ticker = market_tickers[idx % len(market_tickers)]
                 if ticker not in runtime_state.scanner_state.cooldown_until_ms:
                     available_tickers.append(ticker)
@@ -127,13 +128,17 @@ async def _nba_scanner_loop(
                         )
                         return (ticker, None)
 
-            results = await asyncio.gather(*[fetch_and_score(t, semaphore, client) for t in slice_tickers])
+            results = await asyncio.gather(
+                *[fetch_and_score(t, semaphore, client) for t in slice_tickers]
+            )
 
             for ticker, signal in results:
                 if signal is None:
                     runtime_state.scanner_state.tickers_failed_last_cycle.append(ticker)
                     fail_now_ms = int(time.time() * 1000)
-                    runtime_state.scanner_state.cooldown_until_ms[ticker] = fail_now_ms + COOLDOWN_MS
+                    runtime_state.scanner_state.cooldown_until_ms[ticker] = (
+                        fail_now_ms + COOLDOWN_MS
+                    )
                 else:
                     all_signals.append(signal)
 
@@ -243,7 +248,9 @@ async def _nba_scanner_loop(
 
                     await _update_fill_30s_outcomes(client=client, now_ms=snapshot_ts_ms)
 
-                    metrics = runtime_state.paper_store.compute_paper_metrics(mark_price_dict or None)
+                    metrics = runtime_state.paper_store.compute_paper_metrics(
+                        mark_price_dict or None
+                    )
                     realized_pnl_cents = metrics["realized_pnl_cents"]
                     unrealized_pnl_cents = metrics["unrealized_pnl_cents"]
                     total_pnl_cents = metrics["total_pnl_cents"]

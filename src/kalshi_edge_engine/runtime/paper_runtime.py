@@ -129,7 +129,9 @@ async def _process_paper_intents(
             )
             continue
 
-        open_intent_count = runtime_state.paper_store.count_intents_by_status(PAPER_INTENT_STATUS_OPEN)
+        open_intent_count = runtime_state.paper_store.count_intents_by_status(
+            PAPER_INTENT_STATUS_OPEN
+        )
         if open_intent_count >= runtime_config.PAPER_MAX_OPEN_ORDERS:
             logger.info(
                 "paper_intent_skipped",
@@ -153,7 +155,9 @@ async def _process_paper_intents(
             )
             continue
 
-        ticker_position_count = runtime_state.paper_store.count_open_positions_for_ticker(intent.ticker)
+        ticker_position_count = runtime_state.paper_store.count_open_positions_for_ticker(
+            intent.ticker
+        )
         if ticker_position_count >= runtime_config.PAPER_MAX_POS_PER_TICKER:
             logger.info(
                 "paper_intent_skipped",
@@ -201,7 +205,9 @@ async def _process_paper_intents(
             continue
 
         try:
-            fee_func = estimate_maker_fee_cents if intent.fee_mode == "maker" else estimate_taker_fee_cents
+            fee_func = (
+                estimate_maker_fee_cents if intent.fee_mode == "maker" else estimate_taker_fee_cents
+            )
             entry_fee_cents = fee_func(intent.quote_price_cents, intent.size_contracts)
 
             best_bid_at_submit_cents: float | None = None
@@ -210,8 +216,12 @@ async def _process_paper_intents(
                 orderbook_snapshot = await client.get_orderbook(intent.ticker)
                 parsed_ob = parse_orderbook(orderbook_snapshot)
                 if intent.side == "YES":
-                    best_bid_at_submit_cents = parsed_ob.bid_yes.price if parsed_ob.bid_yes else None
-                    cross_at_submit_cents = parsed_ob.cross_yes.price if parsed_ob.cross_yes else None
+                    best_bid_at_submit_cents = (
+                        parsed_ob.bid_yes.price if parsed_ob.bid_yes else None
+                    )
+                    cross_at_submit_cents = (
+                        parsed_ob.cross_yes.price if parsed_ob.cross_yes else None
+                    )
                 else:
                     best_bid_at_submit_cents = parsed_ob.bid_no.price if parsed_ob.bid_no else None
                     cross_at_submit_cents = parsed_ob.cross_no.price if parsed_ob.cross_no else None
@@ -299,7 +309,9 @@ async def _process_paper_intents(
                         continue
 
                     size_contracts = int(intent_record["size_contracts"])
-                    filled_so_far = runtime_state.paper_store.get_filled_size_for_intent(fill.order_id)
+                    filled_so_far = runtime_state.paper_store.get_filled_size_for_intent(
+                        fill.order_id
+                    )
 
                     if filled_so_far >= size_contracts:
                         logger.warning(
@@ -356,7 +368,8 @@ async def _process_paper_intents(
                             (
                                 p
                                 for p in positions
-                                if p["ticker"] == intent_param.ticker and p["side"] == intent_param.side
+                                if p["ticker"] == intent_param.ticker
+                                and p["side"] == intent_param.side
                             ),
                             None,
                         )
@@ -390,7 +403,9 @@ async def _process_paper_intents(
                 last_seen_best_bid = order_state.get("last_seen_best_bid")
                 queue_ahead_contracts = order_state.get("queue_ahead_contracts")
 
-                total_filled_now = runtime_state.paper_store.get_filled_size_for_intent(intent_param.id)
+                total_filled_now = runtime_state.paper_store.get_filled_size_for_intent(
+                    intent_param.id
+                )
                 intent_size = intent_param.size_contracts
                 current_intent_status = runtime_state.paper_store.get_intent_record(intent_param.id)
 
@@ -431,7 +446,9 @@ async def _process_paper_intents(
                     "paper_simulation_task_error",
                     extra={"intent_id": intent_param.id, "error": str(e)},
                 )
-                runtime_state.paper_store.update_intent_status(intent_param.id, PAPER_INTENT_STATUS_ERROR)
+                runtime_state.paper_store.update_intent_status(
+                    intent_param.id, PAPER_INTENT_STATUS_ERROR
+                )
 
         task = asyncio.create_task(_simulate_task(intent, entry_fee_cents))
         runtime_state.paper_simulation_tasks.add(task)
