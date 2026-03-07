@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-import os
 import time
 from contextlib import asynccontextmanager
 from typing import Any
@@ -13,23 +12,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from kalshi_edge_engine.db.paper_store import PaperStore
-from kalshi_edge_engine.engine.fees import (
-    estimate_maker_fee_cents,
-    estimate_taker_fee_cents,
-)
-from kalshi_edge_engine.engine.orderbook import parse_orderbook
-from kalshi_edge_engine.engine.paper import QuoteIntent, build_quote_intents
+from kalshi_edge_engine.engine.paper import build_quote_intents
 from kalshi_edge_engine.engine.paper_sim import (
     OrderRequest,
     RealisticOrderSimulator,
     compute_simulator_diagnostics,
     extract_top_of_book_snapshot,
-)
-from kalshi_edge_engine.engine.position_exit import (
-    compute_price_delta_cents_per_contract,
-    compute_realized_exit_pnl_cents,
-    decide_position_exit,
-    should_take_profit,
 )
 from kalshi_edge_engine.engine.signal import Signal, score_signal
 from kalshi_edge_engine.engine.universe import discover_nba_universe
@@ -38,6 +26,33 @@ from kalshi_edge_engine.kalshi.client import (
     KalshiAuthError,
     KalshiClient,
 )
+from kalshi_edge_engine.runtime import config as runtime_config
+from kalshi_edge_engine.runtime import state as runtime_state
+from kalshi_edge_engine.runtime.paper_exit_runtime import (
+    _close_position as _runtime_close_position,
+)
+from kalshi_edge_engine.runtime.paper_exit_runtime import (
+    _fetch_mark_price_cents as _runtime_fetch_mark_price_cents,
+)
+from kalshi_edge_engine.runtime.paper_exit_runtime import (
+    _get_mark_price_for_position as _runtime_get_mark_price_for_position,
+)
+from kalshi_edge_engine.runtime.paper_exit_runtime import (
+    _maybe_close_position_take_profit as _runtime_maybe_close_position_take_profit,
+)
+from kalshi_edge_engine.runtime.paper_exit_runtime import (
+    _update_fill_30s_outcomes as _runtime_update_fill_30s_outcomes,
+)
+from kalshi_edge_engine.runtime.paper_runtime import _can_create_intent as _runtime_can_create_intent
+from kalshi_edge_engine.runtime.paper_runtime import (
+    _get_rate_limit_or_cooldown_reason as _runtime_get_rate_limit_or_cooldown_reason,
+)
+from kalshi_edge_engine.runtime.paper_runtime import _init_paper_store as _runtime_init_paper_store
+from kalshi_edge_engine.runtime.paper_runtime import (
+    _process_paper_intents as _runtime_process_paper_intents,
+)
+from kalshi_edge_engine.runtime import paper_runtime as _runtime_paper_runtime_module
+from kalshi_edge_engine.runtime.scanner_runtime import _nba_scanner_loop as _runtime_nba_scanner_loop
 
 # Load environment variables from .env file
 load_dotenv()
@@ -237,83 +252,42 @@ class PaperTradingSummaryResponse(BaseModel):
 
 
 # Scanner state
-class _ScannerState:
-    """Mutable state for the background NBA scanner."""
+_ScannerState = runtime_state._ScannerState
 
-    def __init__(self) -> None:
-        self.enabled = False
-        self.last_scan_ms: int | None = None
-        self.markets_discovered = 0
-        self.markets_scanned_last_cycle = 0
-        self.last_cycle_duration_ms: int | None = None
-        self.tickers_failed_last_cycle: list[str] = []
-        self.tickers_skipped_cooldown_last_cycle: list[str] = []
-        self.last_error: str | None = None
-        self.rotating_index = 0
-        self.market_tickers: list[str] = []
-        self.last_universe_refresh_ms = 0
-        self.cooldown_until_ms: dict[str, int] = {}
-
-    def reset(self) -> None:
-        """Reset scanner state."""
-        self.last_scan_ms = None
-        self.markets_discovered = 0
-        self.markets_scanned_last_cycle = 0
-        self.last_cycle_duration_ms = None
-        self.tickers_failed_last_cycle = []
-        self.tickers_skipped_cooldown_last_cycle = []
-        self.last_error = None
-        self.rotating_index = 0
-        self.market_tickers = []
-        self.last_universe_refresh_ms = 0
-        self.cooldown_until_ms = {}
-
-
-# Global in-memory stores
-_top_signals_snapshot: TopSignalsSnapshot | None = None
-_scanner_state = _ScannerState()
+# Global in-memory stores (legacy compatibility aliases)
+_top_signals_snapshot: TopSignalsSnapshot | None = runtime_state.top_signals_snapshot
+_scanner_state = runtime_state.scanner_state
 
 # Paper trading configuration (v2 - realistic)
-_ENABLE_PAPER_TRADING = os.getenv("ENABLE_PAPER_TRADING", "false").lower() in (
-    "true",
-    "1",
-    "yes",
-)
-_PAPER_MIN_EDGE_CENTS = float(os.getenv("PAPER_MIN_EDGE_CENTS", "1.0"))
-_PAPER_MAX_CONCURRENT_INTENTS = int(os.getenv("PAPER_MAX_CONCURRENT_INTENTS", "5"))
-_PAPER_MAX_OPEN_ORDERS = int(os.getenv("PAPER_MAX_OPEN_ORDERS", "20"))
-_PAPER_MAX_POS_PER_TICKER = int(os.getenv("PAPER_MAX_POS_PER_TICKER", "3"))
-_PAPER_MAX_OPEN_POSITIONS = int(os.getenv("PAPER_MAX_OPEN_POSITIONS", "20"))
-_PAPER_TAKE_PROFIT_CENTS_PER_CONTRACT = float(
-    os.getenv(
-        "PAPER_TAKE_PROFIT_CENTS_PER_CONTRACT",
-        os.getenv("PAPER_TAKE_PROFIT_CENTS", "2.0"),
-    )
-)
+_ENABLE_PAPER_TRADING = runtime_config.ENABLE_PAPER_TRADING
+_PAPER_MIN_EDGE_CENTS = runtime_config.PAPER_MIN_EDGE_CENTS
+_PAPER_MAX_CONCURRENT_INTENTS = runtime_config.PAPER_MAX_CONCURRENT_INTENTS
+_PAPER_MAX_OPEN_ORDERS = runtime_config.PAPER_MAX_OPEN_ORDERS
+_PAPER_MAX_POS_PER_TICKER = runtime_config.PAPER_MAX_POS_PER_TICKER
+_PAPER_MAX_OPEN_POSITIONS = runtime_config.PAPER_MAX_OPEN_POSITIONS
+_PAPER_TAKE_PROFIT_CENTS_PER_CONTRACT = runtime_config.PAPER_TAKE_PROFIT_CENTS_PER_CONTRACT
 # Backward-compatible alias (semantics are cents PER CONTRACT).
-_PAPER_TAKE_PROFIT_CENTS = _PAPER_TAKE_PROFIT_CENTS_PER_CONTRACT
-_PAPER_MAX_HOLD_SECONDS = int(os.getenv("PAPER_MAX_HOLD_SECONDS", "600"))
-_PAPER_FILL_HORIZON_SECONDS = int(os.getenv("PAPER_FILL_HORIZON_SECONDS", "90"))
-_PAPER_POLL_INTERVAL_SECONDS = float(os.getenv("PAPER_POLL_INTERVAL_SECONDS", "3.0"))
-_PAPER_FILL_PROBABILITY = float(os.getenv("PAPER_FILL_PROBABILITY", "0.8"))
-_PAPER_FILL_PROBABILITY_AT_BEST = float(os.getenv("PAPER_FILL_PROBABILITY_AT_BEST", "0.15"))
-_PAPER_FILL_PROBABILITY_PRICE_IMPROVES = float(
-    os.getenv("PAPER_FILL_PROBABILITY_PRICE_IMPROVES", "0.05")
-)
-_PAPER_SIMULATED_VOLUME_PER_POLL = int(os.getenv("PAPER_SIMULATED_VOLUME_PER_POLL", "50"))
-_PAPER_MAX_INTENTS_PER_MINUTE = int(os.getenv("PAPER_MAX_INTENTS_PER_MINUTE", "10"))
-_PAPER_TICKER_COOLDOWN_SECONDS = int(os.getenv("PAPER_TICKER_COOLDOWN_SECONDS", "120"))
-_PAPER_MAX_DAILY_LOSS_CENTS = float(os.getenv("PAPER_MAX_DAILY_LOSS_CENTS", "0"))  # 0 = disabled
+_PAPER_TAKE_PROFIT_CENTS = runtime_config.PAPER_TAKE_PROFIT_CENTS
+_PAPER_MAX_HOLD_SECONDS = runtime_config.PAPER_MAX_HOLD_SECONDS
+_PAPER_FILL_HORIZON_SECONDS = runtime_config.PAPER_FILL_HORIZON_SECONDS
+_PAPER_POLL_INTERVAL_SECONDS = runtime_config.PAPER_POLL_INTERVAL_SECONDS
+_PAPER_FILL_PROBABILITY = runtime_config.PAPER_FILL_PROBABILITY
+_PAPER_FILL_PROBABILITY_AT_BEST = runtime_config.PAPER_FILL_PROBABILITY_AT_BEST
+_PAPER_FILL_PROBABILITY_PRICE_IMPROVES = runtime_config.PAPER_FILL_PROBABILITY_PRICE_IMPROVES
+_PAPER_SIMULATED_VOLUME_PER_POLL = runtime_config.PAPER_SIMULATED_VOLUME_PER_POLL
+_PAPER_MAX_INTENTS_PER_MINUTE = runtime_config.PAPER_MAX_INTENTS_PER_MINUTE
+_PAPER_TICKER_COOLDOWN_SECONDS = runtime_config.PAPER_TICKER_COOLDOWN_SECONDS
+_PAPER_MAX_DAILY_LOSS_CENTS = runtime_config.PAPER_MAX_DAILY_LOSS_CENTS
 
 # Paper trading state tracking
-_paper_store: PaperStore | None = None
-_paper_enabled: bool = False  # Runtime flag: starts disabled, can be toggled via API
-_paper_simulation_tasks: set[asyncio.Task[Any]] = set()
-_paper_pnl_snapshot_interval_ms = 30_000  # Take snapshot every 30 seconds
-_last_pnl_snapshot_ts_ms = 0
-_paper_ticker_cooldown: dict[str, int] = {}  # ticker -> cooldown_until_ms
-_paper_intent_timestamps: list[int] = []  # Timestamps of intents created in last minute
-_paper_daily_loss_breached: bool = False  # True if MAX_DAILY_LOSS breached
+_paper_store: PaperStore | None = runtime_state.paper_store
+_paper_enabled: bool = runtime_state.paper_enabled
+_paper_simulation_tasks: set[asyncio.Task[Any]] = runtime_state.paper_simulation_tasks
+_paper_pnl_snapshot_interval_ms = runtime_config.PAPER_PNL_SNAPSHOT_INTERVAL_MS
+_last_pnl_snapshot_ts_ms = runtime_state.last_pnl_snapshot_ts_ms
+_paper_ticker_cooldown: dict[str, int] = runtime_state.paper_ticker_cooldown
+_paper_intent_timestamps: list[int] = runtime_state.paper_intent_timestamps
+_paper_daily_loss_breached: bool = runtime_state.paper_daily_loss_breached
 
 PAPER_INTENT_STATUS_OPEN = "OPEN"
 PAPER_INTENT_STATUS_FILLED = "FILLED"
@@ -337,75 +311,115 @@ PAPER_INTENT_LEGACY_STATUSES = {
 PAPER_INTENT_ALLOWED_STATUSES = PAPER_INTENT_ACTIVE_STATUSES | PAPER_INTENT_LEGACY_STATUSES
 
 
-# Paper trading helpers
-def _init_paper_store() -> None:
-    """Initialize paper store if enabled."""
+def _sync_runtime_from_legacy() -> None:
+    runtime_config.ENABLE_PAPER_TRADING = _ENABLE_PAPER_TRADING
+    runtime_config.PAPER_MIN_EDGE_CENTS = _PAPER_MIN_EDGE_CENTS
+    runtime_config.PAPER_MAX_CONCURRENT_INTENTS = _PAPER_MAX_CONCURRENT_INTENTS
+    runtime_config.PAPER_MAX_OPEN_ORDERS = _PAPER_MAX_OPEN_ORDERS
+    runtime_config.PAPER_MAX_POS_PER_TICKER = _PAPER_MAX_POS_PER_TICKER
+    runtime_config.PAPER_MAX_OPEN_POSITIONS = _PAPER_MAX_OPEN_POSITIONS
+    runtime_config.PAPER_TAKE_PROFIT_CENTS_PER_CONTRACT = _PAPER_TAKE_PROFIT_CENTS_PER_CONTRACT
+    runtime_config.PAPER_TAKE_PROFIT_CENTS = _PAPER_TAKE_PROFIT_CENTS
+    runtime_config.PAPER_MAX_HOLD_SECONDS = _PAPER_MAX_HOLD_SECONDS
+    runtime_config.PAPER_FILL_HORIZON_SECONDS = _PAPER_FILL_HORIZON_SECONDS
+    runtime_config.PAPER_POLL_INTERVAL_SECONDS = _PAPER_POLL_INTERVAL_SECONDS
+    runtime_config.PAPER_FILL_PROBABILITY = _PAPER_FILL_PROBABILITY
+    runtime_config.PAPER_FILL_PROBABILITY_AT_BEST = _PAPER_FILL_PROBABILITY_AT_BEST
+    runtime_config.PAPER_FILL_PROBABILITY_PRICE_IMPROVES = _PAPER_FILL_PROBABILITY_PRICE_IMPROVES
+    runtime_config.PAPER_SIMULATED_VOLUME_PER_POLL = _PAPER_SIMULATED_VOLUME_PER_POLL
+    runtime_config.PAPER_MAX_INTENTS_PER_MINUTE = _PAPER_MAX_INTENTS_PER_MINUTE
+    runtime_config.PAPER_TICKER_COOLDOWN_SECONDS = _PAPER_TICKER_COOLDOWN_SECONDS
+    runtime_config.PAPER_MAX_DAILY_LOSS_CENTS = _PAPER_MAX_DAILY_LOSS_CENTS
+    runtime_config.PAPER_PNL_SNAPSHOT_INTERVAL_MS = _paper_pnl_snapshot_interval_ms
+
+    if _top_signals_snapshot is not None:
+        runtime_state.top_signals_snapshot = _top_signals_snapshot
+    runtime_state.paper_store = _paper_store
+    runtime_state.paper_enabled = _paper_enabled
+    runtime_state.paper_simulation_tasks = _paper_simulation_tasks
+    runtime_state.last_pnl_snapshot_ts_ms = _last_pnl_snapshot_ts_ms
+    runtime_state.paper_ticker_cooldown = _paper_ticker_cooldown
+    runtime_state.paper_intent_timestamps = _paper_intent_timestamps
+    runtime_state.paper_daily_loss_breached = _paper_daily_loss_breached
+
+
+def _sync_legacy_from_runtime() -> None:
+    global _ENABLE_PAPER_TRADING
+    global _PAPER_MIN_EDGE_CENTS
+    global _PAPER_MAX_CONCURRENT_INTENTS
+    global _PAPER_MAX_OPEN_ORDERS
+    global _PAPER_MAX_POS_PER_TICKER
+    global _PAPER_MAX_OPEN_POSITIONS
+    global _PAPER_TAKE_PROFIT_CENTS_PER_CONTRACT
+    global _PAPER_TAKE_PROFIT_CENTS
+    global _PAPER_MAX_HOLD_SECONDS
+    global _PAPER_FILL_HORIZON_SECONDS
+    global _PAPER_POLL_INTERVAL_SECONDS
+    global _PAPER_FILL_PROBABILITY
+    global _PAPER_FILL_PROBABILITY_AT_BEST
+    global _PAPER_FILL_PROBABILITY_PRICE_IMPROVES
+    global _PAPER_SIMULATED_VOLUME_PER_POLL
+    global _PAPER_MAX_INTENTS_PER_MINUTE
+    global _PAPER_TICKER_COOLDOWN_SECONDS
+    global _PAPER_MAX_DAILY_LOSS_CENTS
+    global _paper_pnl_snapshot_interval_ms
+    global _top_signals_snapshot
     global _paper_store
-    if _ENABLE_PAPER_TRADING and _paper_store is None:
-        try:
-            _paper_store = PaperStore()
-            logger.info("paper_store_initialized")
-        except Exception as e:
-            logger.exception("paper_store_init_error", extra={"error": str(e)})
+    global _paper_enabled
+    global _paper_simulation_tasks
+    global _last_pnl_snapshot_ts_ms
+    global _paper_ticker_cooldown
+    global _paper_intent_timestamps
+    global _paper_daily_loss_breached
+
+    _ENABLE_PAPER_TRADING = runtime_config.ENABLE_PAPER_TRADING
+    _PAPER_MIN_EDGE_CENTS = runtime_config.PAPER_MIN_EDGE_CENTS
+    _PAPER_MAX_CONCURRENT_INTENTS = runtime_config.PAPER_MAX_CONCURRENT_INTENTS
+    _PAPER_MAX_OPEN_ORDERS = runtime_config.PAPER_MAX_OPEN_ORDERS
+    _PAPER_MAX_POS_PER_TICKER = runtime_config.PAPER_MAX_POS_PER_TICKER
+    _PAPER_MAX_OPEN_POSITIONS = runtime_config.PAPER_MAX_OPEN_POSITIONS
+    _PAPER_TAKE_PROFIT_CENTS_PER_CONTRACT = runtime_config.PAPER_TAKE_PROFIT_CENTS_PER_CONTRACT
+    _PAPER_TAKE_PROFIT_CENTS = runtime_config.PAPER_TAKE_PROFIT_CENTS
+    _PAPER_MAX_HOLD_SECONDS = runtime_config.PAPER_MAX_HOLD_SECONDS
+    _PAPER_FILL_HORIZON_SECONDS = runtime_config.PAPER_FILL_HORIZON_SECONDS
+    _PAPER_POLL_INTERVAL_SECONDS = runtime_config.PAPER_POLL_INTERVAL_SECONDS
+    _PAPER_FILL_PROBABILITY = runtime_config.PAPER_FILL_PROBABILITY
+    _PAPER_FILL_PROBABILITY_AT_BEST = runtime_config.PAPER_FILL_PROBABILITY_AT_BEST
+    _PAPER_FILL_PROBABILITY_PRICE_IMPROVES = runtime_config.PAPER_FILL_PROBABILITY_PRICE_IMPROVES
+    _PAPER_SIMULATED_VOLUME_PER_POLL = runtime_config.PAPER_SIMULATED_VOLUME_PER_POLL
+    _PAPER_MAX_INTENTS_PER_MINUTE = runtime_config.PAPER_MAX_INTENTS_PER_MINUTE
+    _PAPER_TICKER_COOLDOWN_SECONDS = runtime_config.PAPER_TICKER_COOLDOWN_SECONDS
+    _PAPER_MAX_DAILY_LOSS_CENTS = runtime_config.PAPER_MAX_DAILY_LOSS_CENTS
+    _paper_pnl_snapshot_interval_ms = runtime_config.PAPER_PNL_SNAPSHOT_INTERVAL_MS
+
+    _top_signals_snapshot = runtime_state.top_signals_snapshot
+    _paper_store = runtime_state.paper_store
+    _paper_enabled = runtime_state.paper_enabled
+    _paper_simulation_tasks = runtime_state.paper_simulation_tasks
+    _last_pnl_snapshot_ts_ms = runtime_state.last_pnl_snapshot_ts_ms
+    _paper_ticker_cooldown = runtime_state.paper_ticker_cooldown
+    _paper_intent_timestamps = runtime_state.paper_intent_timestamps
+    _paper_daily_loss_breached = runtime_state.paper_daily_loss_breached
+
+
+def _init_paper_store() -> None:
+    _sync_runtime_from_legacy()
+    _runtime_init_paper_store()
+    _sync_legacy_from_runtime()
 
 
 def _can_create_intent(ticker: str, now_ms: int) -> bool:
-    """Check if a new intent can be created for ticker.
-
-    Enforces:
-    - Paper trading must be enabled
-    - MAX_DAILY_LOSS not breached (if configured)
-    - No more than max intents per minute
-    - Ticker not in cooldown
-
-    Args:
-        ticker: Market ticker.
-        now_ms: Current time in milliseconds.
-
-    Returns:
-        True if intent can be created, False otherwise.
-    """
-    # Check if paper trading is enabled
-    if not _paper_enabled:
-        return False
-
-    # Check MAX_DAILY_LOSS gate
-    if _paper_daily_loss_breached:
-        return False
-
-    # Check ticker cooldown
-    cooldown_until = _paper_ticker_cooldown.get(ticker)
-    if cooldown_until is not None and now_ms < cooldown_until:
-        return False
-
-    # Check rate limit (max intents per minute)
-    minute_ago_ms = now_ms - 60_000
-    _paper_intent_timestamps[:] = [
-        ts for ts in _paper_intent_timestamps if ts >= minute_ago_ms
-    ]  # Prune old timestamps
-
-    return len(_paper_intent_timestamps) < _PAPER_MAX_INTENTS_PER_MINUTE
+    _sync_runtime_from_legacy()
+    allowed = _runtime_can_create_intent(ticker, now_ms)
+    _sync_legacy_from_runtime()
+    return allowed
 
 
 def _get_rate_limit_or_cooldown_reason(ticker: str, now_ms: int) -> str | None:
-    """Get skip reason for intent gating by cooldown/rate-limit/safety gates."""
-    if not _paper_enabled:
-        return "paper_disabled"
-
-    if _paper_daily_loss_breached:
-        return "max_daily_loss_breached"
-
-    cooldown_until = _paper_ticker_cooldown.get(ticker)
-    if cooldown_until is not None and now_ms < cooldown_until:
-        return "cooldown"
-
-    minute_ago_ms = now_ms - 60_000
-    _paper_intent_timestamps[:] = [ts for ts in _paper_intent_timestamps if ts >= minute_ago_ms]
-
-    if len(_paper_intent_timestamps) >= _PAPER_MAX_INTENTS_PER_MINUTE:
-        return "rate_limit"
-
-    return None
+    _sync_runtime_from_legacy()
+    reason = _runtime_get_rate_limit_or_cooldown_reason(ticker, now_ms)
+    _sync_legacy_from_runtime()
+    return reason
 
 
 def _get_mark_price_for_position(
@@ -413,17 +427,7 @@ def _get_mark_price_for_position(
     side: str,
     snapshot: TopSignalsSnapshot | None,
 ) -> float | None:
-    """Get current mark price for a position from top-signals snapshot."""
-    if snapshot is None:
-        return None
-
-    for signal_resp in snapshot.signals:
-        if signal_resp.ticker != ticker:
-            continue
-        if side == "YES":
-            return signal_resp.cross_yes
-        return signal_resp.cross_no
-    return None
+    return _runtime_get_mark_price_for_position(ticker, side, snapshot)
 
 
 async def _fetch_mark_price_cents(
@@ -431,79 +435,13 @@ async def _fetch_mark_price_cents(
     ticker: str,
     side: str,
 ) -> float | None:
-    """Fetch current mark price from live orderbook for a ticker+side.
-
-    Returns:
-        Cross price in cents for the requested side, or None when unavailable.
-    """
-    try:
-        orderbook = await client.get_orderbook(ticker)
-        parsed_orderbook = parse_orderbook(orderbook)
-        if side == "YES":
-            return parsed_orderbook.cross_yes.price if parsed_orderbook.cross_yes else None
-        return parsed_orderbook.cross_no.price if parsed_orderbook.cross_no else None
-    except Exception as e:
-        logger.warning(
-            "paper_mark_price_fetch_failed",
-            extra={"ticker": ticker, "side": side, "error": str(e)},
-        )
-        return None
+    return await _runtime_fetch_mark_price_cents(client, ticker, side)
 
 
 async def _update_fill_30s_outcomes(*, client: KalshiClient, now_ms: int) -> None:
-    """Backfill 30s post-fill mark and side-aware short-horizon PnL telemetry."""
-    if _paper_store is None:
-        return
-
-    cutoff_ts_ms = now_ms - 30_000
-    pending = _paper_store.get_pending_fill_30s_outcome_updates(
-        cutoff_ts_ms=cutoff_ts_ms,
-        limit=200,
-    )
-    if not pending:
-        return
-
-    updated_count = 0
-    for row in pending:
-        mark_price = _get_mark_price_for_position(
-            ticker=row["ticker"],
-            side=row["side"],
-            snapshot=_top_signals_snapshot,
-        )
-        if mark_price is None:
-            mark_price = await _fetch_mark_price_cents(
-                client,
-                row["ticker"],
-                row["side"],
-            )
-        if mark_price is None:
-            continue
-
-        pnl_30s_after_fill_cents = PaperStore.compute_short_horizon_fill_pnl_cents(
-            side=str(row["side"]),
-            fill_price_cents=float(row["fill_price_cents"]),
-            fill_size=int(row["fill_size"]),
-            mark_price_cents=float(mark_price),
-            fill_fee_cents=(
-                float(row["fill_fee_cents"]) if row.get("fill_fee_cents") is not None else None
-            ),
-        )
-        did_update = _paper_store.update_fill_30s_outcome(
-            fill_id=str(row["fill_id"]),
-            mark_30s_after_fill_cents=float(mark_price),
-            pnl_30s_after_fill_cents=pnl_30s_after_fill_cents,
-        )
-        if did_update:
-            updated_count += 1
-
-    if updated_count > 0:
-        logger.info(
-            "paper_fill_30s_outcomes_updated",
-            extra={
-                "updated_count": updated_count,
-                "pending_count": len(pending),
-            },
-        )
+    _sync_runtime_from_legacy()
+    await _runtime_update_fill_30s_outcomes(client=client, now_ms=now_ms)
+    _sync_legacy_from_runtime()
 
 
 def _close_position(
@@ -518,105 +456,20 @@ def _close_position(
     now_ms: int,
     reason: str,
 ) -> bool:
-    """Close an open position and persist fill/position/intent lifecycle updates."""
-    if _paper_store is None or net_contracts <= 0 or mark_price_cents is None:
-        return False
-
-    intent_id = f"exit_intent:{reason}:{ticker}:{side}:{now_ms}"
-    _paper_store.insert_intent(
-        QuoteIntent(
-            id=intent_id,
-            ticker=ticker,
-            side=side,
-            quote_price_cents=mark_price_cents,
-            size_contracts=net_contracts,
-            created_ts_ms=now_ms,
-            net_edge=0.0,
-            inside_width=0.0,
-            imbalance_gap=None,
-            fee_mode="taker",
-            round_trip=False,
-        ),
-        entry_fee_cents=0.0,
-        take_profit_cents_per_contract=_PAPER_TAKE_PROFIT_CENTS_PER_CONTRACT,
-        max_hold_seconds=_PAPER_MAX_HOLD_SECONDS,
-    )
-
-    exit_fee_cents = estimate_taker_fee_cents(mark_price_cents, net_contracts)
-    price_delta = compute_price_delta_cents_per_contract(
+    _sync_runtime_from_legacy()
+    closed = _runtime_close_position(
+        ticker=ticker,
         side=side,
-        avg_entry_price_cents=avg_entry_price_cents,
-        mark_price_cents=mark_price_cents,
-    )
-    realized_increment_cents = compute_realized_exit_pnl_cents(
-        side=side,
-        avg_entry_price_cents=avg_entry_price_cents,
-        mark_price_cents=mark_price_cents,
         net_contracts=net_contracts,
-        exit_fee_cents=exit_fee_cents,
-    )
-
-    exit_fill_result = _paper_store.insert_fill_result(
-        fill_id=f"exit:{reason}:{ticker}:{side}:{now_ms}",
-        intent_id=intent_id,
-        fill_ts_ms=now_ms,
-        fill_price_cents=mark_price_cents,
-        fill_size=net_contracts,
-        remaining_size=0,
-        queue_ahead_at_fill=0,
-        fill_fee_cents=exit_fee_cents,
-        best_bid_at_fill_cents=mark_price_cents,
-        cross_at_fill_cents=mark_price_cents,
-        note=f"exit_{reason}",
-    )
-    if not exit_fill_result.inserted_new_fill:
-        if exit_fill_result.already_exists:
-            logger.info(
-                "paper_close_position_exit_fill_idempotent",
-                extra={"reason": reason, "ticker": ticker, "side": side},
-            )
-            return True
-        logger.warning(
-            "paper_close_position_exit_fill_rejected",
-            extra={
-                "reason": reason,
-                "ticker": ticker,
-                "side": side,
-                "insert_status": exit_fill_result.status,
-            },
-        )
-        return False
-
-    _paper_store.upsert_position(
-        ticker=ticker,
-        side=side,
-        net_contracts=0,
         avg_entry_price_cents=avg_entry_price_cents,
-        realized_pnl_cents=realized_pnl_cents + realized_increment_cents,
+        realized_pnl_cents=realized_pnl_cents,
         first_open_ts_ms=first_open_ts_ms,
-    )
-    _paper_store.mark_exited_intents_for_ticker_side(
-        ticker=ticker,
-        side=side,
-        exit_ts_ms=now_ms,
         mark_price_cents=mark_price_cents,
+        now_ms=now_ms,
+        reason=reason,
     )
-
-    logger.info(
-        "paper_position_closed",
-        extra={
-            "reason": reason,
-            "ticker": ticker,
-            "side": side,
-            "net_contracts": net_contracts,
-            "avg_entry_price_cents": avg_entry_price_cents,
-            "mark_price_cents": mark_price_cents,
-            "price_delta_cents": price_delta,
-            "exit_fee_cents": exit_fee_cents,
-            "realized_increment_cents": realized_increment_cents,
-        },
-    )
-    return True
+    _sync_legacy_from_runtime()
+    return closed
 
 
 def _maybe_close_position_take_profit(
@@ -630,19 +483,8 @@ def _maybe_close_position_take_profit(
     mark_price_cents: float,
     now_ms: int,
 ) -> bool:
-    """Legacy compatibility helper for tests; active loop uses `decide_position_exit`."""
-    if _paper_store is None or net_contracts <= 0:
-        return False
-
-    if not should_take_profit(
-        side=side,
-        avg_entry_price_cents=avg_entry_price_cents,
-        mark_price_cents=mark_price_cents,
-        take_profit_cents_per_contract=_PAPER_TAKE_PROFIT_CENTS,
-    ):
-        return False
-
-    return _close_position(
+    _sync_runtime_from_legacy()
+    closed = _runtime_maybe_close_position_take_profit(
         ticker=ticker,
         side=side,
         net_contracts=net_contracts,
@@ -651,686 +493,33 @@ def _maybe_close_position_take_profit(
         first_open_ts_ms=first_open_ts_ms,
         mark_price_cents=mark_price_cents,
         now_ms=now_ms,
-        reason="take_profit",
     )
+    _sync_legacy_from_runtime()
+    return closed
 
 
 async def _process_paper_intents(
     signal: Signal,
     client: KalshiClient,
 ) -> None:
-    """Process signal to create and simulate paper intents.
-
-    Args:
-        signal: Signal to process.
-        client: KalshiClient instance.
-    """
-    if not _ENABLE_PAPER_TRADING or _paper_store is None or not _paper_enabled:
-        return
-
-    now_ms = int(time.time() * 1000)
-
-    # Build intents from signal
-    intents = build_quote_intents(signal)
-
-    for task in list(_paper_simulation_tasks):
-        if task.done():
-            _paper_simulation_tasks.discard(task)
-
-    for intent in intents:
-        if intent.net_edge < _PAPER_MIN_EDGE_CENTS:
-            logger.info(
-                "paper_intent_skipped",
-                extra={
-                    "ticker": intent.ticker,
-                    "side": intent.side,
-                    "reason": "min_edge",
-                    "net_edge": intent.net_edge,
-                    "min_edge": _PAPER_MIN_EDGE_CENTS,
-                },
-            )
-            continue
-
-        open_intent_count = _paper_store.count_intents_by_status(PAPER_INTENT_STATUS_OPEN)
-        if open_intent_count >= _PAPER_MAX_OPEN_ORDERS:
-            logger.info(
-                "paper_intent_skipped",
-                extra={
-                    "ticker": intent.ticker,
-                    "side": intent.side,
-                    "reason": "max_open_orders",
-                },
-            )
-            continue
-
-        active_sim_tasks = len(_paper_simulation_tasks)
-        if active_sim_tasks >= _PAPER_MAX_CONCURRENT_INTENTS:
-            logger.info(
-                "paper_intent_skipped",
-                extra={
-                    "ticker": intent.ticker,
-                    "side": intent.side,
-                    "reason": "max_concurrent_intents",
-                },
-            )
-            continue
-
-        ticker_position_count = _paper_store.count_open_positions_for_ticker(intent.ticker)
-        if ticker_position_count >= _PAPER_MAX_POS_PER_TICKER:
-            logger.info(
-                "paper_intent_skipped",
-                extra={
-                    "ticker": intent.ticker,
-                    "side": intent.side,
-                    "reason": "max_pos_per_ticker",
-                },
-            )
-            continue
-
-        open_positions_count = len(_paper_store.get_positions())
-        if open_positions_count >= _PAPER_MAX_OPEN_POSITIONS:
-            logger.info(
-                "paper_intent_skipped",
-                extra={
-                    "ticker": intent.ticker,
-                    "side": intent.side,
-                    "reason": "max_open_positions",
-                },
-            )
-            continue
-
-        if _paper_store.has_open_intent_for_ticker_side(intent.ticker, intent.side):
-            logger.info(
-                "paper_intent_skipped",
-                extra={
-                    "ticker": intent.ticker,
-                    "side": intent.side,
-                    "reason": "duplicate_open_intent",
-                },
-            )
-            continue
-
-        gating_reason = _get_rate_limit_or_cooldown_reason(intent.ticker, now_ms)
-        if gating_reason is not None:
-            logger.info(
-                "paper_intent_skipped",
-                extra={
-                    "ticker": intent.ticker,
-                    "side": intent.side,
-                    "reason": gating_reason,
-                },
-            )
-            continue
-
-        # Store intent - precompute parameters first
-        try:
-            # Compute entry fee based on fee_mode
-            fee_func = (
-                estimate_maker_fee_cents if intent.fee_mode == "maker" else estimate_taker_fee_cents
-            )
-            entry_fee_cents = fee_func(intent.quote_price_cents, intent.size_contracts)
-
-            # Capture telemetry: best_bid and cross at submit time
-            best_bid_at_submit_cents: float | None = None
-            cross_at_submit_cents: float | None = None
-            try:
-                orderbook_snapshot = await client.get_orderbook(intent.ticker)
-                parsed_ob = parse_orderbook(orderbook_snapshot)
-                if intent.side == "YES":
-                    best_bid_at_submit_cents = (
-                        parsed_ob.bid_yes.price if parsed_ob.bid_yes else None
-                    )
-                    cross_at_submit_cents = (
-                        parsed_ob.cross_yes.price if parsed_ob.cross_yes else None
-                    )
-                else:
-                    best_bid_at_submit_cents = parsed_ob.bid_no.price if parsed_ob.bid_no else None
-                    cross_at_submit_cents = parsed_ob.cross_no.price if parsed_ob.cross_no else None
-            except Exception as e:
-                logger.warning(
-                    "paper_intent_telemetry_snapshot_failed",
-                    extra={"intent_id": intent.id, "error": str(e)},
-                )
-
-            # Persist intent with runtime parameters and telemetry
-            _paper_store.insert_intent(
-                intent,
-                entry_fee_cents=entry_fee_cents,
-                take_profit_cents_per_contract=_PAPER_TAKE_PROFIT_CENTS_PER_CONTRACT,
-                max_hold_seconds=_PAPER_MAX_HOLD_SECONDS,
-                best_bid_at_submit_cents=best_bid_at_submit_cents,
-                cross_at_submit_cents=cross_at_submit_cents,
-            )
-            _paper_store.update_intent_status(intent.id, PAPER_INTENT_STATUS_OPEN)
-            _paper_intent_timestamps.append(now_ms)
-            _paper_ticker_cooldown[intent.ticker] = now_ms + (_PAPER_TICKER_COOLDOWN_SECONDS * 1000)
-        except Exception as e:
-            logger.exception(
-                "paper_intent_store_error",
-                extra={"intent_id": intent.id, "error": str(e)},
-            )
-            continue
-
-        # Create background simulation task
-        async def _simulate_task(intent_param, entry_fee_param: float) -> None:
-            try:
-                entry_fee_cents = entry_fee_param
-
-                # Create OrderRequest for RealisticOrderSimulator
-                order_request = OrderRequest(
-                    id=intent_param.id,
-                    ticker=intent_param.ticker,
-                    side=intent_param.side,
-                    quote_price_cents=intent_param.quote_price_cents,
-                    size_contracts=intent_param.size_contracts,
-                    created_ts_ms=intent_param.created_ts_ms,
-                    net_edge=intent_param.net_edge,
-                    entry_fee_cents=entry_fee_cents,
-                    max_hold_seconds=_PAPER_MAX_HOLD_SECONDS,
-                    take_profit_cents_per_contract=_PAPER_TAKE_PROFIT_CENTS_PER_CONTRACT,
-                    entry_fee_per_contract_cents=(
-                        entry_fee_cents / intent_param.size_contracts
-                        if intent_param.size_contracts > 0
-                        else 0.0
-                    ),
-                )
-
-                # Run realistic fill simulation
-                simulator = RealisticOrderSimulator(
-                    poll_interval_seconds=_PAPER_POLL_INTERVAL_SECONDS,
-                    fill_probability_price_moved=_PAPER_FILL_PROBABILITY,
-                    fill_probability_at_best=_PAPER_FILL_PROBABILITY_AT_BEST,
-                    fill_probability_price_improves=_PAPER_FILL_PROBABILITY_PRICE_IMPROVES,
-                    simulated_volume_per_poll=_PAPER_SIMULATED_VOLUME_PER_POLL,
-                )
-
-                def _on_simulator_poll(runtime_update: dict[str, Any]) -> None:
-                    if _paper_store is None:
-                        return
-                    _paper_store.update_intent_status(
-                        intent_param.id,
-                        PAPER_INTENT_STATUS_OPEN,
-                        last_seen_best_bid=runtime_update.get("last_seen_best_bid"),
-                        queue_ahead=runtime_update.get("queue_ahead_contracts"),
-                    )
-
-                fills, order_state = await simulator.simulate_order_fills(
-                    client,
-                    order_request,
-                    horizon_seconds=_PAPER_FILL_HORIZON_SECONDS,
-                    on_poll=_on_simulator_poll,
-                )
-
-                # Process fills and update positions
-                total_filled = 0
-                for fill in fills:
-                    # Duplicate fill prevention: check if intent is already fully filled
-                    intent_record = _paper_store.get_intent_record(fill.order_id)
-                    if intent_record is None:
-                        logger.warning(
-                            "paper_fill_skip_intent_not_found",
-                            extra={"intent_id": fill.order_id},
-                        )
-                        continue
-
-                    size_contracts = int(intent_record["size_contracts"])
-                    filled_so_far = _paper_store.get_filled_size_for_intent(fill.order_id)
-
-                    if filled_so_far >= size_contracts:
-                        logger.warning(
-                            "paper_fill_skip_already_filled",
-                            extra={
-                                "intent_id": fill.order_id,
-                                "ticker": intent_param.ticker,
-                                "side": intent_param.side,
-                                "filled_so_far": filled_so_far,
-                                "size_contracts": size_contracts,
-                            },
-                        )
-                        continue
-
-                    # Calculate remaining after this fill
-                    remaining_after = max(0, size_contracts - (filled_so_far + fill.fill_size))
-
-                    # Insert fill to database with telemetry
-                    fill_insert_result = _paper_store.insert_fill_result(
-                        fill_id=fill.id,
-                        intent_id=fill.order_id,
-                        fill_ts_ms=fill.fill_ts_ms,
-                        fill_price_cents=fill.fill_price_cents,
-                        fill_size=fill.fill_size,
-                        remaining_size=remaining_after,
-                        queue_ahead_at_fill=fill.queue_ahead_at_fill,
-                        fill_fee_cents=fill.fill_fee_cents,
-                        best_bid_at_fill_cents=fill.best_bid_at_fill_cents,
-                        cross_at_fill_cents=fill.cross_at_fill_cents,
-                        note=(
-                            f"entry_{fill.fill_path_type}"
-                            if fill.fill_path_type is not None
-                            else None
-                        ),
-                    )
-
-                    if not fill_insert_result.inserted_new_fill:
-                        logger.warning(
-                            "paper_fill_insert_rejected_skip_position_mutation",
-                            extra={
-                                "intent_id": fill.order_id,
-                                "fill_id": fill.id,
-                                "ticker": intent_param.ticker,
-                                "side": intent_param.side,
-                                "fill_size": fill.fill_size,
-                                "insert_status": fill_insert_result.status,
-                            },
-                        )
-                        continue
-
-                    total_filled += fill.fill_size
-
-                    # Update position
-                    if fill.fill_size > 0:
-                        # Get current position
-                        positions = _paper_store.get_positions()
-                        current_pos = next(
-                            (
-                                p
-                                for p in positions
-                                if p["ticker"] == intent_param.ticker
-                                and p["side"] == intent_param.side
-                            ),
-                            None,
-                        )
-
-                        if current_pos:
-                            # Update average price (simple average for now)
-                            total_cost = (
-                                current_pos["avg_entry_price_cents"] * current_pos["net_contracts"]
-                                + fill.fill_price_cents * fill.fill_size
-                            )
-                            new_contracts = current_pos["net_contracts"] + fill.fill_size
-                            new_avg_price = total_cost / new_contracts if new_contracts > 0 else 0.0
-                            _paper_store.upsert_position(
-                                ticker=intent_param.ticker,
-                                side=intent_param.side,
-                                net_contracts=new_contracts,
-                                avg_entry_price_cents=new_avg_price,
-                                realized_pnl_cents=current_pos["realized_pnl_cents"],
-                                first_open_ts_ms=current_pos["first_open_ts_ms"],
-                            )
-                        else:
-                            # New position
-                            _paper_store.upsert_position(
-                                ticker=intent_param.ticker,
-                                side=intent_param.side,
-                                net_contracts=fill.fill_size,
-                                avg_entry_price_cents=fill.fill_price_cents,
-                                realized_pnl_cents=0.0,
-                                first_open_ts_ms=intent_param.created_ts_ms,
-                            )
-
-                # Update intent status based on fill status
-                entry_order_exit_reason = order_state.get("exit_reason", "timeout")
-                last_seen_best_bid = order_state.get("last_seen_best_bid")
-                queue_ahead_contracts = order_state.get("queue_ahead_contracts")
-
-                # Check if intent is now fully filled
-                total_filled_now = _paper_store.get_filled_size_for_intent(intent_param.id)
-                intent_size = intent_param.size_contracts
-                current_intent_status = _paper_store.get_intent_record(intent_param.id)
-
-                if total_filled_now >= intent_size:
-                    # Only mark as FILLED if not already filled
-                    existing_status = (
-                        current_intent_status.get("status", PAPER_INTENT_STATUS_OPEN)
-                        if current_intent_status
-                        else PAPER_INTENT_STATUS_OPEN
-                    )
-                    if existing_status != PAPER_INTENT_STATUS_FILLED:
-                        _paper_store.update_intent_status(
-                            intent_param.id,
-                            PAPER_INTENT_STATUS_FILLED,
-                            last_seen_best_bid=last_seen_best_bid,
-                            queue_ahead=queue_ahead_contracts,
-                        )
-                else:
-                    _paper_store.update_intent_status(
-                        intent_param.id,
-                        PAPER_INTENT_STATUS_EXPIRED,
-                        last_seen_best_bid=last_seen_best_bid,
-                        queue_ahead=queue_ahead_contracts,
-                    )
-
-                logger.info(
-                    "paper_order_simulation_complete",
-                    extra={
-                        "intent_id": intent_param.id,
-                        "ticker": intent_param.ticker,
-                        "side": intent_param.side,
-                        "total_filled": total_filled,
-                        "entry_order_exit_reason": entry_order_exit_reason,
-                    },
-                )
-
-            except Exception as e:
-                logger.exception(
-                    "paper_simulation_task_error",
-                    extra={"intent_id": intent_param.id, "error": str(e)},
-                )
-                _paper_store.update_intent_status(intent_param.id, PAPER_INTENT_STATUS_ERROR)
-
-        task = asyncio.create_task(_simulate_task(intent, entry_fee_cents))
-        _paper_simulation_tasks.add(task)
-
-        def _cleanup(t: asyncio.Task[Any]) -> None:
-            _paper_simulation_tasks.discard(t)
-
-        task.add_done_callback(_cleanup)
+    _sync_runtime_from_legacy()
+    _runtime_paper_runtime_module.build_quote_intents = build_quote_intents
+    _runtime_paper_runtime_module.RealisticOrderSimulator = RealisticOrderSimulator
+    await _runtime_process_paper_intents(signal, client)
+    _sync_legacy_from_runtime()
 
 
-# Background scanner
 async def _nba_scanner_loop(client: KalshiClient) -> None:
-    """Background loop that scans NBA markets incrementally with predictable cadence.
-
-    - Discovers NBA universe (cached for 60s)
-    - Each cycle, scans a rotating slice of N=100 tickers
-    - Skips tickers in cooldown after failure (60s TTL)
-    - Maintains predictable 2s target cycle time
-    - Updates top 20 signals from slice results
-    - Maintains scanner state for /scanner/status endpoint
-
-    Args:
-        client: KalshiClient instance.
-    """
-    global _top_signals_snapshot
-
-    TARGET_CYCLE_SECONDS = 2.0
-    COOLDOWN_MS = 60_000  # 60 seconds
-    scan_slice_size = 100
-    universe_refresh_ttl_ms = 300_000  # Refresh universe every 300s
-
-    logger.info("nba_scanner_loop_started")
-    _scanner_state.enabled = True
-
-    while True:
-        cycle_start_ms = int(time.time() * 1000)
-
-        try:
-            # Clean expired cooldowns
-            now_ms = int(time.time() * 1000)
-            expired_tickers = [
-                t for t, until_ms in _scanner_state.cooldown_until_ms.items() if now_ms >= until_ms
-            ]
-            for t in expired_tickers:
-                del _scanner_state.cooldown_until_ms[t]
-
-            # Determine if we need to refresh universe
-            should_refresh_universe = (
-                now_ms - _scanner_state.last_universe_refresh_ms > universe_refresh_ttl_ms
-            )
-
-            if should_refresh_universe or not _scanner_state.market_tickers:
-                logger.info("nba_scanner_refreshing_universe")
-                universe = await discover_nba_universe(client)
-                _scanner_state.market_tickers = universe.market_tickers
-                _scanner_state.markets_discovered = len(universe.market_tickers)
-                _scanner_state.last_universe_refresh_ms = now_ms
-                _scanner_state.rotating_index = 0
-
-            market_tickers = _scanner_state.market_tickers
-
-            if not market_tickers:
-                logger.warning("nba_scanner_no_markets")
-                _scanner_state.last_error = "No markets in universe"
-                cycle_end_ms = int(time.time() * 1000)
-                cycle_duration_ms = cycle_end_ms - cycle_start_ms
-                _scanner_state.last_cycle_duration_ms = cycle_duration_ms
-                sleep_ms = max(0, (TARGET_CYCLE_SECONDS * 1000) - cycle_duration_ms)
-                await asyncio.sleep(sleep_ms / 1000.0)
-                continue
-
-            # Build rotating slice, skipping cooldown tickers
-            _scanner_state.tickers_failed_last_cycle = []
-            _scanner_state.tickers_skipped_cooldown_last_cycle = []
-
-            start_idx = _scanner_state.rotating_index
-            available_tickers: list[str] = []
-            skipped_count = 0
-
-            # Collect tickers not in cooldown, with adaptive sizing to maintain slice_size
-            idx = start_idx
-            while len(available_tickers) < scan_slice_size and len(
-                available_tickers
-            ) + skipped_count < len(market_tickers):
-                ticker = market_tickers[idx % len(market_tickers)]
-                if ticker not in _scanner_state.cooldown_until_ms:
-                    available_tickers.append(ticker)
-                else:
-                    skipped_count += 1
-                    _scanner_state.tickers_skipped_cooldown_last_cycle.append(ticker)
-                idx += 1
-
-            # Update rotating index for next cycle
-            _scanner_state.rotating_index = idx % len(market_tickers)
-            slice_tickers = available_tickers
-
-            # Scan slice in batches with concurrency limit
-            semaphore = asyncio.Semaphore(5)
-            all_signals: list[Signal] = []
-
-            async def fetch_and_score(
-                ticker: str, sem: asyncio.Semaphore, api_client: KalshiClient
-            ) -> tuple[str, Signal | None]:
-                """Fetch orderbook and score signal. Returns (ticker, signal or None)."""
-                async with sem:
-                    try:
-                        orderbook = await api_client.get_orderbook(ticker)
-                        return (ticker, score_signal(ticker, orderbook))
-                    except Exception as e:
-                        logger.debug(
-                            "nba_scanner_ticker_failed",
-                            extra={"ticker": ticker, "error": str(e)},
-                        )
-                        return (ticker, None)
-
-            # Process slice tickers
-            results = await asyncio.gather(
-                *[fetch_and_score(t, semaphore, client) for t in slice_tickers]
-            )
-
-            # Track failures and update cooldowns (use fresh timestamp for accuracy)
-            for ticker, signal in results:
-                if signal is None:
-                    _scanner_state.tickers_failed_last_cycle.append(ticker)
-                    fail_now_ms = int(time.time() * 1000)
-                    _scanner_state.cooldown_until_ms[ticker] = fail_now_ms + COOLDOWN_MS
-                else:
-                    all_signals.append(signal)
-
-                    # Process paper trading if enabled
-                    if _ENABLE_PAPER_TRADING:
-                        await _process_paper_intents(signal, client)
-
-            _scanner_state.markets_scanned_last_cycle = len(slice_tickers)
-
-            # Sort by best edge and keep top 20
-            all_signals.sort(
-                key=lambda s: (
-                    -max(
-                        s.net_edge_yes if s.net_edge_yes is not None else float("-inf"),
-                        s.net_edge_no if s.net_edge_no is not None else float("-inf"),
-                    )
-                )
-            )
-            top_signals = all_signals[:20]
-
-            # Update snapshot
-            snapshot_ts_ms = int(time.time() * 1000)
-            _top_signals_snapshot = TopSignalsSnapshot(
-                timestamp_ms=snapshot_ts_ms,
-                signals=[SignalResponse(**_signal_to_response(s)) for s in top_signals],
-                market_count=len(market_tickers),
-            )
-
-            _scanner_state.last_scan_ms = snapshot_ts_ms
-            _scanner_state.last_error = None
-
-            # Compute cycle duration before logging
-            cycle_end_ms = int(time.time() * 1000)
-            cycle_duration_ms = cycle_end_ms - cycle_start_ms
-            _scanner_state.last_cycle_duration_ms = cycle_duration_ms
-
-            logger.info(
-                "nba_scanner_cycle_complete",
-                extra={
-                    "total_market_count": len(market_tickers),
-                    "slice_start": start_idx,
-                    "slice_size": len(slice_tickers),
-                    "signal_count": len(all_signals),
-                    "top_count": len(top_signals),
-                    "failed_count": len(_scanner_state.tickers_failed_last_cycle),
-                    "skipped_cooldown_count": len(
-                        _scanner_state.tickers_skipped_cooldown_last_cycle
-                    ),
-                    "duration_ms": cycle_duration_ms,
-                },
-            )
-
-            # Periodic PnL snapshot writer (every 30 seconds)
-            global _last_pnl_snapshot_ts_ms, _paper_daily_loss_breached
-            if (
-                _ENABLE_PAPER_TRADING
-                and _paper_store is not None
-                and snapshot_ts_ms - _last_pnl_snapshot_ts_ms >= _paper_pnl_snapshot_interval_ms
-            ):
-                try:
-                    # Get current open positions
-                    positions = _paper_store.get_positions()
-
-                    # Close positions that reached take-profit or time-stop.
-                    for pos in positions:
-                        mark_price = _get_mark_price_for_position(
-                            ticker=pos["ticker"],
-                            side=pos["side"],
-                            snapshot=_top_signals_snapshot,
-                        )
-                        if mark_price is None:
-                            mark_price = await _fetch_mark_price_cents(
-                                client,
-                                pos["ticker"],
-                                pos["side"],
-                            )
-                        if mark_price is None:
-                            continue
-
-                        exit_decision = decide_position_exit(
-                            side=pos["side"],
-                            avg_entry_price_cents=pos["avg_entry_price_cents"],
-                            mark_price_cents=mark_price,
-                            first_open_ts_ms=pos["first_open_ts_ms"],
-                            now_ms=snapshot_ts_ms,
-                            max_hold_seconds=_PAPER_MAX_HOLD_SECONDS,
-                            take_profit_cents_per_contract=_PAPER_TAKE_PROFIT_CENTS_PER_CONTRACT,
-                        )
-                        if exit_decision.should_close and exit_decision.reason is not None:
-                            _close_position(
-                                ticker=pos["ticker"],
-                                side=pos["side"],
-                                net_contracts=pos["net_contracts"],
-                                avg_entry_price_cents=pos["avg_entry_price_cents"],
-                                realized_pnl_cents=pos.get("realized_pnl_cents", 0.0),
-                                first_open_ts_ms=pos["first_open_ts_ms"],
-                                mark_price_cents=mark_price,
-                                now_ms=snapshot_ts_ms,
-                                reason=exit_decision.reason,
-                            )
-
-                    # Reload open positions after optional TP closes.
-                    positions = _paper_store.get_positions()
-
-                    # Build mark_price_dict from top_signals_snapshot for metric computation
-                    mark_price_dict: dict[str, dict[str, float]] = {}
-                    if _top_signals_snapshot:
-                        for signal_resp in _top_signals_snapshot.signals:
-                            ticker = signal_resp.ticker
-                            if ticker not in mark_price_dict:
-                                mark_price_dict[ticker] = {}
-                            if signal_resp.cross_yes is not None:
-                                mark_price_dict[ticker]["YES"] = signal_resp.cross_yes
-                            if signal_resp.cross_no is not None:
-                                mark_price_dict[ticker]["NO"] = signal_resp.cross_no
-
-                    # Update 30s post-fill outcome telemetry for eligible fills.
-                    await _update_fill_30s_outcomes(client=client, now_ms=snapshot_ts_ms)
-
-                    # Compute all metrics from authoritative source using compute_paper_metrics
-                    metrics = _paper_store.compute_paper_metrics(mark_price_dict or None)
-                    realized_pnl_cents = metrics["realized_pnl_cents"]
-                    unrealized_pnl_cents = metrics["unrealized_pnl_cents"]
-                    total_pnl_cents = metrics["total_pnl_cents"]
-                    open_positions_count = metrics["open_positions_count"]
-                    open_orders_count = metrics["open_orders_count"]
-
-                    # Check MAX_DAILY_LOSS gate (if configured)
-                    if (
-                        _PAPER_MAX_DAILY_LOSS_CENTS > 0
-                        and total_pnl_cents < -_PAPER_MAX_DAILY_LOSS_CENTS
-                        and not _paper_daily_loss_breached
-                    ):
-                        _paper_daily_loss_breached = True
-                        logger.warning(
-                            "paper_max_daily_loss_breached",
-                            extra={
-                                "total_pnl_cents": total_pnl_cents,
-                                "max_daily_loss_cents": _PAPER_MAX_DAILY_LOSS_CENTS,
-                                "notice": "Stopping new intent creation due to MAX_DAILY_LOSS breach",
-                            },
-                        )
-
-                    # Insert PnL snapshot - ensures invariant: total = realized + unrealized
-                    _paper_store.insert_pnl_snapshot(
-                        ts_ms=snapshot_ts_ms,
-                        realized_pnl_cents=realized_pnl_cents,
-                        unrealized_pnl_cents=unrealized_pnl_cents,
-                        open_positions_count=open_positions_count,
-                        open_orders_count=open_orders_count,
-                    )
-
-                    _last_pnl_snapshot_ts_ms = snapshot_ts_ms
-
-                    logger.info(
-                        "paper_pnl_snapshot_recorded",
-                        extra={
-                            "realized_pnl_cents": realized_pnl_cents,
-                            "unrealized_pnl_cents": unrealized_pnl_cents,
-                            "total_pnl_cents": total_pnl_cents,
-                            "open_positions_count": open_positions_count,
-                            "open_orders_count": open_orders_count,
-                            "daily_loss_breached": _paper_daily_loss_breached,
-                        },
-                    )
-                except Exception as e:
-                    logger.exception(
-                        "paper_pnl_snapshot_error",
-                        extra={"error": str(e)},
-                    )
-
-        except asyncio.CancelledError:
-            logger.info("scanner_cancelled")
-            break
-
-        except Exception as e:
-            logger.exception(
-                "nba_scanner_loop_error",
-                extra={"error": str(e)},
-            )
-            _scanner_state.last_error = str(e)
-
-        # Compute cycle duration once, then sleep to maintain target cadence
-        cycle_end_ms = int(time.time() * 1000)
-        cycle_duration_ms = cycle_end_ms - cycle_start_ms
-        _scanner_state.last_cycle_duration_ms = cycle_duration_ms
-        sleep_ms = max(0, (TARGET_CYCLE_SECONDS * 1000) - cycle_duration_ms)
-        await asyncio.sleep(sleep_ms / 1000.0)
+    _sync_runtime_from_legacy()
+    try:
+        await _runtime_nba_scanner_loop(
+            client,
+            signal_to_response=_signal_to_response,
+            signal_response_model=SignalResponse,
+            top_signals_snapshot_model=TopSignalsSnapshot,
+        )
+    finally:
+        _sync_legacy_from_runtime()
 
 
 # Helper functions
@@ -1770,21 +959,23 @@ async def get_top_signals(n: int = 20) -> dict[str, Any]:
     Raises:
         HTTPException: If snapshot is not available yet.
     """
-    global _top_signals_snapshot
-
-    if _top_signals_snapshot is None:
+    snapshot = runtime_state.top_signals_snapshot
+    if snapshot is None and _top_signals_snapshot is not None:
+        snapshot = _top_signals_snapshot
+        runtime_state.top_signals_snapshot = snapshot
+    if snapshot is None:
         raise HTTPException(
             status_code=503,
             detail="Signal snapshot not available yet (scanner starting up)",
         )
 
     # Limit to requested count
-    signals = _top_signals_snapshot.signals[:n]
+    signals = snapshot.signals[:n]
 
     return {
-        "timestamp_ms": _top_signals_snapshot.timestamp_ms,
+        "timestamp_ms": snapshot.timestamp_ms,
         "signals": [s.model_dump() for s in signals],
-        "market_count": _top_signals_snapshot.market_count,
+        "market_count": snapshot.market_count,
     }
 
 
@@ -1797,6 +988,7 @@ async def start_scanner(request: Request) -> dict[str, Any]:
     Returns:
         Response indicating whether scanner was started or if it was already running.
     """
+    _sync_runtime_from_legacy()
     # Check if a valid task is already running
     current_task = getattr(request.app.state, "scanner_task", None)
     if current_task and not current_task.done():
@@ -1809,6 +1001,7 @@ async def start_scanner(request: Request) -> dict[str, Any]:
     scanner_task = asyncio.create_task(_nba_scanner_loop(client))
     request.app.state.scanner_task = scanner_task
     _scanner_state.enabled = True
+    _sync_runtime_from_legacy()
 
     logger.info("NBA scanner started via POST /scanner/start")
     return {"started": True}
@@ -1822,6 +1015,7 @@ async def stop_scanner(request: Request) -> dict[str, Any]:
     Returns:
         Response indicating whether scanner was stopped or if it wasn't running.
     """
+    _sync_runtime_from_legacy()
     current_task = getattr(request.app.state, "scanner_task", None)
     if not current_task:
         logger.info("No scanner task found, ignoring stop request")
@@ -1844,6 +1038,8 @@ async def stop_scanner(request: Request) -> dict[str, Any]:
     request.app.state.scanner_task = None
     global _top_signals_snapshot
     _top_signals_snapshot = None
+    runtime_state.top_signals_snapshot = None
+    _sync_legacy_from_runtime()
 
     logger.info("NBA scanner stopped via POST /scanner/stop")
     return {"stopped": True}
@@ -1860,6 +1056,7 @@ async def start_paper_trading() -> dict[str, Any]:
         Response indicating whether paper trading was started.
     """
     global _paper_enabled
+    _sync_runtime_from_legacy()
 
     if not _ENABLE_PAPER_TRADING or _paper_store is None:
         logger.info("Paper trading not available (not enabled or no store)")
@@ -1870,6 +1067,8 @@ async def start_paper_trading() -> dict[str, Any]:
         return {"started": False, "reason": "already_running"}
 
     _paper_enabled = True
+    _sync_runtime_from_legacy()
+    _sync_legacy_from_runtime()
     logger.info("Paper trading started via POST /paper/start")
     return {"started": True}
 
@@ -1883,12 +1082,14 @@ async def stop_paper_trading() -> dict[str, Any]:
         Response indicating whether paper trading was stopped.
     """
     global _paper_enabled
+    _sync_runtime_from_legacy()
 
     if not _paper_enabled:
         logger.info("Paper trading not running, ignoring stop request")
         return {"stopped": False, "reason": "not_running"}
 
     _paper_enabled = False
+    _sync_runtime_from_legacy()
 
     # Cancel all pending simulation tasks
     for task in list(_paper_simulation_tasks):
@@ -1900,6 +1101,9 @@ async def stop_paper_trading() -> dict[str, Any]:
         await asyncio.gather(*_paper_simulation_tasks, return_exceptions=True)
         logger.info("paper_trading_tasks_cancelled", extra={"count": len(_paper_simulation_tasks)})
         _paper_simulation_tasks.clear()
+
+    _sync_runtime_from_legacy()
+    _sync_legacy_from_runtime()
 
     logger.info("Paper trading stopped via POST /paper/stop")
     return {"stopped": True}
@@ -2276,11 +1480,15 @@ async def get_scanner_status(request: Request) -> dict[str, Any]:
         Scanner status including enabled flag, market counts, timing,
         failure tracking, and snapshot age.
     """
+    snapshot = runtime_state.top_signals_snapshot
+    if snapshot is None and _top_signals_snapshot is not None:
+        snapshot = _top_signals_snapshot
+        runtime_state.top_signals_snapshot = snapshot
     now_ms = int(time.time() * 1000)
     snapshot_age_ms: int | None = None
 
-    if _top_signals_snapshot is not None:
-        snapshot_age_ms = now_ms - _top_signals_snapshot.timestamp_ms
+    if snapshot is not None:
+        snapshot_age_ms = now_ms - snapshot.timestamp_ms
 
     # Enabled only if state says so AND task exists and is running
     task_running = False
@@ -2296,9 +1504,7 @@ async def get_scanner_status(request: Request) -> dict[str, Any]:
         "last_cycle_duration_ms": _scanner_state.last_cycle_duration_ms,
         "tickers_failed_last_cycle": _scanner_state.tickers_failed_last_cycle,
         "tickers_skipped_cooldown_last_cycle": _scanner_state.tickers_skipped_cooldown_last_cycle,
-        "snapshot_timestamp_ms": _top_signals_snapshot.timestamp_ms
-        if _top_signals_snapshot
-        else None,
+        "snapshot_timestamp_ms": snapshot.timestamp_ms if snapshot else None,
         "snapshot_age_ms": snapshot_age_ms,
         "last_error": _scanner_state.last_error,
     }
@@ -2312,6 +1518,7 @@ async def lifespan_production(app: FastAPI) -> Any:
     # Note: scanner task may be started here via auto-start, or later via POST /scanner/start.
     # Always check app.state.scanner_task in shutdown, not a local variable.
     try:
+        _sync_runtime_from_legacy()
         client = KalshiClient()
         app.state.kalshi_client = client
         app.state.scanner_task = None  # Initialize scanner_task; may be updated below
@@ -2322,8 +1529,7 @@ async def lifespan_production(app: FastAPI) -> Any:
             _init_paper_store()
 
         # Check if NBA scanner is enabled via environment variable
-        enable_scanner_str = os.getenv("ENABLE_NBA_SCANNER", "false").lower()
-        enable_scanner = enable_scanner_str in ("true", "1", "yes")
+        enable_scanner = runtime_config.is_nba_scanner_enabled_from_env()
 
         if enable_scanner:
             # Start background NBA scanner
@@ -2342,6 +1548,7 @@ async def lifespan_production(app: FastAPI) -> Any:
 
     # Shutdown
     try:
+        _sync_runtime_from_legacy()
         # Cancel paper trading simulation tasks
         for task in _paper_simulation_tasks:
             if not task.done():
@@ -2364,6 +1571,7 @@ async def lifespan_production(app: FastAPI) -> Any:
         if hasattr(app.state, "kalshi_client"):
             await app.state.kalshi_client.aclose()
             logger.info("KalshiClient closed on shutdown")
+        _sync_legacy_from_runtime()
     except Exception as e:
         logger.exception("Error during shutdown", extra={"error": str(e)})
 
