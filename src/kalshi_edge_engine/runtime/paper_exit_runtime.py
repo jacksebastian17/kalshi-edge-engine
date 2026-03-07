@@ -34,10 +34,7 @@ def _get_mark_price_for_position(
     for signal_resp in signals:
         if signal_resp.ticker != ticker:
             continue
-        if side == "YES":
-            mark_price = signal_resp.cross_yes
-        else:
-            mark_price = signal_resp.cross_no
+        mark_price = signal_resp.cross_yes if side == "YES" else signal_resp.cross_no
 
         if mark_price is None:
             return None
