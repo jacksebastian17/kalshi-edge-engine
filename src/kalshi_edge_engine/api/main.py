@@ -965,10 +965,13 @@ async def get_top_signals(n: int = 20) -> dict[str, Any]:
     Raises:
         HTTPException: If snapshot is not available yet.
     """
-    snapshot = runtime_state.top_signals_snapshot
-    if snapshot is None and _top_signals_snapshot is not None:
+    snapshot: TopSignalsSnapshot | None
+    if _top_signals_snapshot is not None:
         snapshot = _top_signals_snapshot
-        runtime_state.top_signals_snapshot = snapshot
+    elif _scanner_state.last_scan_ms is not None:
+        snapshot = runtime_state.top_signals_snapshot
+    else:
+        snapshot = None
     if snapshot is None:
         raise HTTPException(
             status_code=503,
@@ -1486,10 +1489,13 @@ async def get_scanner_status(request: Request) -> dict[str, Any]:
         Scanner status including enabled flag, market counts, timing,
         failure tracking, and snapshot age.
     """
-    snapshot = runtime_state.top_signals_snapshot
-    if snapshot is None and _top_signals_snapshot is not None:
+    snapshot: TopSignalsSnapshot | None
+    if _top_signals_snapshot is not None:
         snapshot = _top_signals_snapshot
-        runtime_state.top_signals_snapshot = snapshot
+    elif _scanner_state.last_scan_ms is not None:
+        snapshot = runtime_state.top_signals_snapshot
+    else:
+        snapshot = None
     now_ms = int(time.time() * 1000)
     snapshot_age_ms: int | None = None
 
