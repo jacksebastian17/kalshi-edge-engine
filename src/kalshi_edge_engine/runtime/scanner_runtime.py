@@ -19,8 +19,44 @@ from kalshi_edge_engine.runtime.paper_exit_runtime import (
     _update_fill_30s_outcomes,
 )
 from kalshi_edge_engine.runtime.paper_runtime import _process_paper_intents
+from kalshi_edge_engine.universes.cbb import discover_cbb_universe
 
 logger = logging.getLogger(__name__)
+
+
+async def _discover_enabled_universe_markets(
+    client: KalshiClient,
+) -> tuple[list[str], dict[str, str], dict[str, int], list[str]]:
+    """Discover and merge market tickers across enabled universes.
+
+    Returns:
+        merged_tickers: Deduplicated sorted list of tickers.
+        ticker_universe_map: Ticker -> universe key (first discovered owner).
+        discovered_universe_counts: universe key -> discovered market count.
+        enabled_universes: normalized enabled universe list.
+    """
+    enabled_universes = runtime_config.get_enabled_universes()
+    discovered_universe_counts: dict[str, int] = {}
+    ticker_universe_map: dict[str, str] = {}
+    merged_set: set[str] = set()
+
+    if "NBA" in enabled_universes:
+        nba_universe = await discover_nba_universe(client)
+        discovered_universe_counts["NBA"] = len(nba_universe.market_tickers)
+        for ticker in nba_universe.market_tickers:
+            if ticker not in merged_set:
+                ticker_universe_map[ticker] = "NBA"
+            merged_set.add(ticker)
+
+    if "CBB" in enabled_universes:
+        cbb_universe = await discover_cbb_universe(client)
+        discovered_universe_counts["CBB"] = len(cbb_universe.market_tickers)
+        for ticker in cbb_universe.market_tickers:
+            if ticker not in merged_set:
+                ticker_universe_map[ticker] = "CBB"
+            merged_set.add(ticker)
+
+    return sorted(merged_set), ticker_universe_map, discovered_universe_counts, enabled_universes
 
 
 async def _nba_scanner_loop(
@@ -30,9 +66,9 @@ async def _nba_scanner_loop(
     signal_response_model: type,
     top_signals_snapshot_model: type,
 ) -> None:
-    """Background loop that scans NBA markets incrementally with predictable cadence.
+    """Background loop that scans enabled universes with predictable cadence.
 
-    - Discovers NBA universe (cached for 60s)
+    - Discovers enabled universes (NBA/CBB)
     - Each cycle, scans a rotating slice of N=100 tickers
     - Skips tickers in cooldown after failure (60s TTL)
     - Maintains predictable 2s target cycle time
@@ -47,7 +83,7 @@ async def _nba_scanner_loop(
     scan_slice_size = 100
     universe_refresh_ttl_ms = 300_000
 
-    logger.info("nba_scanner_loop_started")
+    logger.info("multi_universe_scanner_loop_started")
     runtime_state.scanner_state.enabled = True
 
     while True:
@@ -69,17 +105,25 @@ async def _nba_scanner_loop(
             )
 
             if should_refresh_universe or not runtime_state.scanner_state.market_tickers:
-                logger.info("nba_scanner_refreshing_universe")
-                universe = await discover_nba_universe(client)
-                runtime_state.scanner_state.market_tickers = universe.market_tickers
-                runtime_state.scanner_state.markets_discovered = len(universe.market_tickers)
+                logger.info("multi_universe_scanner_refreshing_universe")
+                (
+                    merged_tickers,
+                    ticker_universe_map,
+                    discovered_universe_counts,
+                    enabled_universes,
+                ) = await _discover_enabled_universe_markets(client)
+                runtime_state.scanner_state.market_tickers = merged_tickers
+                runtime_state.scanner_state.ticker_universe_map = ticker_universe_map
+                runtime_state.scanner_state.enabled_universes = enabled_universes
+                runtime_state.scanner_state.discovered_universe_counts = discovered_universe_counts
+                runtime_state.scanner_state.markets_discovered = len(merged_tickers)
                 runtime_state.scanner_state.last_universe_refresh_ms = now_ms
                 runtime_state.scanner_state.rotating_index = 0
 
             market_tickers = runtime_state.scanner_state.market_tickers
 
             if not market_tickers:
-                logger.warning("nba_scanner_no_markets")
+                logger.warning("multi_universe_scanner_no_markets")
                 runtime_state.scanner_state.last_error = "No markets in universe"
                 cycle_end_ms = int(time.time() * 1000)
                 cycle_duration_ms = cycle_end_ms - cycle_start_ms
@@ -120,10 +164,17 @@ async def _nba_scanner_loop(
                 async with sem:
                     try:
                         orderbook = await api_client.get_orderbook(ticker)
-                        return (ticker, score_signal(ticker, orderbook))
+                        universe_key = runtime_state.scanner_state.ticker_universe_map.get(
+                            ticker,
+                            "UNKNOWN",
+                        )
+                        return (
+                            ticker,
+                            score_signal(ticker, orderbook, universe=universe_key),
+                        )
                     except Exception as e:
                         logger.debug(
-                            "nba_scanner_ticker_failed",
+                            "multi_universe_scanner_ticker_failed",
                             extra={"ticker": ticker, "error": str(e)},
                         )
                         return (ticker, None)
@@ -172,9 +223,11 @@ async def _nba_scanner_loop(
             runtime_state.scanner_state.last_cycle_duration_ms = cycle_duration_ms
 
             logger.info(
-                "nba_scanner_cycle_complete",
+                "multi_universe_scanner_cycle_complete",
                 extra={
                     "total_market_count": len(market_tickers),
+                    "enabled_universes": runtime_state.scanner_state.enabled_universes,
+                    "discovered_universe_counts": runtime_state.scanner_state.discovered_universe_counts,
                     "slice_start": start_idx,
                     "slice_size": len(slice_tickers),
                     "signal_count": len(all_signals),
@@ -305,7 +358,7 @@ async def _nba_scanner_loop(
 
         except Exception as e:
             logger.exception(
-                "nba_scanner_loop_error",
+                "multi_universe_scanner_loop_error",
                 extra={"error": str(e)},
             )
             runtime_state.scanner_state.last_error = str(e)

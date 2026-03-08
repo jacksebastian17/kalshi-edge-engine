@@ -7,6 +7,8 @@ import pytest
 
 from kalshi_edge_engine.db.paper_store import PaperStore
 from kalshi_edge_engine.engine.fees import estimate_taker_fee_cents
+from kalshi_edge_engine.runtime import state as runtime_state
+from kalshi_edge_engine.runtime.paper_exit_runtime import _close_position
 
 
 class TestPnLEndpointConsistency:
@@ -300,3 +302,85 @@ class TestPnLEndpointConsistency:
         assert total_realized == pytest.approx(realized_pnl)
 
         # TEST: get_positions() should NOT include closed positions
+
+    def test_close_position_realized_includes_persisted_entry_and_exit_fees(
+        self, paper_store: PaperStore
+    ) -> None:
+        """Closing an open position should realize gross minus entry and exit fees."""
+        now_ms = int(time.time() * 1000)
+        ticker = "TEST_CLOSE_FEE"
+        side = "YES"
+        entry_price = 50.0
+        mark_price = 54.0
+        contracts = 3
+        first_open_ts_ms = now_ms - 5_000
+
+        entry_intent_id = "intent-close-entry"
+        with sqlite3.connect(paper_store.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO quote_intents
+                (id, ticker, side, quote_price_cents, size_contracts, created_ts_ms,
+                 net_edge, inside_width, imbalance_gap, fee_mode, round_trip, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    entry_intent_id,
+                    ticker,
+                    side,
+                    entry_price,
+                    contracts,
+                    first_open_ts_ms,
+                    1.0,
+                    1.0,
+                    None,
+                    "taker",
+                    False,
+                    "FILLED",
+                ),
+            )
+            conn.commit()
+
+        entry_fee = estimate_taker_fee_cents(entry_price, contracts)
+        paper_store.insert_fill(
+            fill_id="close-entry-fill",
+            intent_id=entry_intent_id,
+            fill_ts_ms=first_open_ts_ms,
+            fill_price_cents=entry_price,
+            fill_size=contracts,
+            remaining_size=0,
+            queue_ahead_at_fill=0,
+            fill_fee_cents=entry_fee,
+            note="entry_queue_cleared",
+        )
+
+        paper_store.upsert_position(
+            ticker=ticker,
+            side=side,
+            net_contracts=contracts,
+            avg_entry_price_cents=entry_price,
+            realized_pnl_cents=0.0,
+            first_open_ts_ms=first_open_ts_ms,
+        )
+
+        prior_store = runtime_state.paper_store
+        runtime_state.paper_store = paper_store
+        try:
+            closed = _close_position(
+                ticker=ticker,
+                side=side,
+                net_contracts=contracts,
+                avg_entry_price_cents=entry_price,
+                realized_pnl_cents=0.0,
+                first_open_ts_ms=first_open_ts_ms,
+                mark_price_cents=mark_price,
+                now_ms=now_ms,
+                reason="take_profit",
+            )
+            assert closed is True
+        finally:
+            runtime_state.paper_store = prior_store
+
+        exit_fee = estimate_taker_fee_cents(mark_price, contracts)
+        expected_realized = ((mark_price - entry_price) * contracts) - entry_fee - exit_fee
+        assert paper_store.get_total_realized_pnl_cents() == pytest.approx(expected_realized)

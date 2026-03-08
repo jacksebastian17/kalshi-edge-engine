@@ -171,6 +171,12 @@ def _close_position(
         net_contracts=net_contracts,
         exit_fee_cents=exit_fee_cents,
     )
+    entry_fees_cents = runtime_state.paper_store.get_open_lifecycle_entry_fees_cents(
+        ticker=ticker,
+        side=side,
+        first_open_ts_ms=first_open_ts_ms,
+    )
+    realized_increment_cents -= entry_fees_cents
 
     exit_fill_result = runtime_state.paper_store.insert_fill_result(
         fill_id=f"exit:{reason}:{ticker}:{side}:{now_ms}",
@@ -229,6 +235,7 @@ def _close_position(
             "mark_price_cents": mark_price_cents,
             "price_delta_cents": price_delta,
             "exit_fee_cents": exit_fee_cents,
+            "entry_fees_cents": entry_fees_cents,
             "realized_increment_cents": realized_increment_cents,
         },
     )

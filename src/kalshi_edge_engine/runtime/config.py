@@ -6,12 +6,46 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.lower() in ("true", "1", "yes")
+
+
+ENABLE_UNIVERSE_NBA = _env_bool("ENABLE_UNIVERSE_NBA", True)
+ENABLE_UNIVERSE_CBB = _env_bool("ENABLE_UNIVERSE_CBB", False)
+
 ENABLE_PAPER_TRADING = os.getenv("ENABLE_PAPER_TRADING", "false").lower() in (
     "true",
     "1",
     "yes",
 )
 PAPER_MIN_EDGE_CENTS = float(os.getenv("PAPER_MIN_EDGE_CENTS", "1.0"))
+PAPER_ALLOW_YES_ENTRIES = os.getenv("PAPER_ALLOW_YES_ENTRIES", "true").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+PAPER_ALLOW_NO_ENTRIES = os.getenv("PAPER_ALLOW_NO_ENTRIES", "true").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+PAPER_MIN_TOP_LIQUIDITY = int(os.getenv("PAPER_MIN_TOP_LIQUIDITY", "0"))
+PAPER_REQUIRE_SIGNAL_VALID_ONLY = os.getenv("PAPER_REQUIRE_SIGNAL_VALID_ONLY", "true").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+PAPER_MIN_CAPTURABLE_EDGE_TO_CROSS_CENTS = float(
+    os.getenv("PAPER_MIN_CAPTURABLE_EDGE_TO_CROSS_CENTS", "0")
+)
+PAPER_MIN_ABS_DISTANCE_FROM_50_CENTS = float(os.getenv("PAPER_MIN_ABS_DISTANCE_FROM_50_CENTS", "0"))
+PAPER_MIN_REENTRY_DELAY_SECONDS_SAME_TICKER_SIDE = int(
+    os.getenv("PAPER_MIN_REENTRY_DELAY_SECONDS_SAME_TICKER_SIDE", "0")
+)
 PAPER_MAX_CONCURRENT_INTENTS = int(os.getenv("PAPER_MAX_CONCURRENT_INTENTS", "5"))
 PAPER_MAX_OPEN_ORDERS = int(os.getenv("PAPER_MAX_OPEN_ORDERS", "20"))
 PAPER_MAX_POS_PER_TICKER = int(os.getenv("PAPER_MAX_POS_PER_TICKER", "3"))
@@ -42,3 +76,13 @@ PAPER_PNL_SNAPSHOT_INTERVAL_MS = 30_000
 def is_nba_scanner_enabled_from_env() -> bool:
     """Return whether NBA scanner autostart is enabled via environment."""
     return os.getenv("ENABLE_NBA_SCANNER", "false").lower() in ("true", "1", "yes")
+
+
+def get_enabled_universes() -> list[str]:
+    """Return enabled universes in deterministic normalized order."""
+    enabled: list[str] = []
+    if ENABLE_UNIVERSE_NBA:
+        enabled.append("NBA")
+    if ENABLE_UNIVERSE_CBB:
+        enabled.append("CBB")
+    return enabled

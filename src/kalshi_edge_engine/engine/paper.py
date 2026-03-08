@@ -57,6 +57,7 @@ class QuoteIntent:
     imbalance_gap: float | None  # imbalance_gap from signal
     fee_mode: str  # "maker" or "taker"
     round_trip: bool  # Whether round-trip fees were modeled
+    universe: str = "NBA"
     capturable_edge_to_cross_cents: float | None = None
     net_edge_after_entry_fee_cents: float | None = None
     net_edge_after_round_trip_fee_cents: float | None = None
@@ -132,6 +133,7 @@ def build_quote_intents(
         intent = QuoteIntent(
             id=str(uuid.uuid4()),
             ticker=signal.ticker,
+            universe=signal.universe,
             side="YES",
             quote_price_cents=float(yes_quote_price_cents),
             size_contracts=1,
@@ -175,6 +177,7 @@ def build_quote_intents(
         intent = QuoteIntent(
             id=str(uuid.uuid4()),
             ticker=signal.ticker,
+            universe=signal.universe,
             side="NO",
             quote_price_cents=float(no_quote_price_cents),
             size_contracts=1,

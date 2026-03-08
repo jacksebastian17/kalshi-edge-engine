@@ -49,6 +49,22 @@ function formatLiquidity(value: number): string {
   return value.toLocaleString()
 }
 
+function UniversePill({ universe }: { universe?: string }) {
+  const value = universe?.trim().toUpperCase() || '—'
+  const classes =
+    value === 'NBA'
+      ? 'bg-blue-900/60 text-blue-200 border-blue-700/50'
+      : value === 'CBB'
+        ? 'bg-amber-900/60 text-amber-200 border-amber-700/50'
+        : 'bg-zinc-800 text-zinc-300 border-white/10'
+
+  return (
+    <span className={`inline-block px-2 py-0.5 text-[11px] rounded border ${classes}`}>
+      {value}
+    </span>
+  )
+}
+
 export function SignalsTable({
   signals,
   isLoading,
@@ -78,7 +94,7 @@ export function SignalsTable({
 
       {signals.length === 0 && !isLoading && (
         <div className="flex-1 flex items-center justify-center text-zinc-500">
-          <p className="text-sm">No signals. Enter tickers and click Scan.</p>
+          <p className="text-sm">No scanner snapshot yet. Start the scanner to populate signals.</p>
         </div>
       )}
 
@@ -89,6 +105,9 @@ export function SignalsTable({
               <tr className="border-b border-white/10">
                 <th className="px-4 py-2 text-left text-zinc-300">
                   Ticker
+                </th>
+                <th className="px-4 py-2 text-left text-zinc-300">
+                  Universe
                 </th>
                 <th className="px-4 py-2 text-left text-zinc-300">
                   Reason
@@ -122,6 +141,9 @@ export function SignalsTable({
                 >
                   <td className="px-4 py-2 text-zinc-100 font-bold">
                     {signal.ticker}
+                  </td>
+                  <td className="px-4 py-2">
+                    <UniversePill universe={signal.universe} />
                   </td>
                   <td className="px-4 py-2">
                     <ReasonCodePill code={signal.reason_code} />

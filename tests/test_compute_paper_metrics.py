@@ -688,3 +688,136 @@ class TestComputePaperMetrics:
         metrics = paper_store.compute_paper_metrics({ticker: {side: 55.0}})
         # Price PnL = (55 - 50) * 1 = 5.0; only new-cycle fee 1.0 should apply.
         assert metrics["unrealized_pnl_cents"] == pytest.approx(4.0)
+
+    def test_compute_metrics_entry_only_metrics_exclude_exit_intents(
+        self, paper_store: PaperStore
+    ) -> None:
+        """Entry-only metrics should ignore synthetic exit_intent:* rows."""
+        now_ms = int(time.time() * 1000)
+
+        with sqlite3.connect(paper_store.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO quote_intents
+                (id, ticker, side, quote_price_cents, size_contracts, created_ts_ms,
+                 net_edge, inside_width, imbalance_gap, fee_mode, round_trip, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "entry-intent-full",
+                    "NBA_ENTRY_ONLY",
+                    "YES",
+                    50.0,
+                    2,
+                    now_ms,
+                    1.0,
+                    1.0,
+                    None,
+                    "maker",
+                    False,
+                    "FILLED",
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO quote_intents
+                (id, ticker, side, quote_price_cents, size_contracts, created_ts_ms,
+                 net_edge, inside_width, imbalance_gap, fee_mode, round_trip, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "entry-intent-partial",
+                    "NBA_ENTRY_ONLY",
+                    "NO",
+                    49.0,
+                    2,
+                    now_ms,
+                    1.0,
+                    1.0,
+                    None,
+                    "maker",
+                    False,
+                    "OPEN",
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO quote_intents
+                (id, ticker, side, quote_price_cents, size_contracts, created_ts_ms,
+                 net_edge, inside_width, imbalance_gap, fee_mode, round_trip, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "exit_intent:take_profit:NBA_ENTRY_ONLY:YES:1",
+                    "NBA_ENTRY_ONLY",
+                    "YES",
+                    55.0,
+                    2,
+                    now_ms,
+                    0.0,
+                    0.0,
+                    None,
+                    "taker",
+                    False,
+                    "FILLED",
+                ),
+            )
+            conn.commit()
+
+        paper_store.insert_fill(
+            fill_id="entry-full-fill-1",
+            intent_id="entry-intent-full",
+            fill_ts_ms=now_ms + 1_000,
+            fill_price_cents=50.0,
+            fill_size=1,
+            remaining_size=1,
+            queue_ahead_at_fill=0,
+            fill_fee_cents=0.1,
+            note="entry_queue_cleared",
+        )
+        paper_store.insert_fill(
+            fill_id="entry-full-fill-2",
+            intent_id="entry-intent-full",
+            fill_ts_ms=now_ms + 3_000,
+            fill_price_cents=50.0,
+            fill_size=1,
+            remaining_size=0,
+            queue_ahead_at_fill=0,
+            fill_fee_cents=0.1,
+            note="entry_queue_cleared",
+        )
+        paper_store.insert_fill(
+            fill_id="entry-partial-fill-1",
+            intent_id="entry-intent-partial",
+            fill_ts_ms=now_ms + 2_000,
+            fill_price_cents=49.0,
+            fill_size=1,
+            remaining_size=1,
+            queue_ahead_at_fill=0,
+            fill_fee_cents=0.1,
+            note="entry_queue_cleared",
+        )
+        paper_store.insert_fill(
+            fill_id="exit-fill-ignored",
+            intent_id="exit_intent:take_profit:NBA_ENTRY_ONLY:YES:1",
+            fill_ts_ms=now_ms + 4_000,
+            fill_price_cents=55.0,
+            fill_size=2,
+            remaining_size=0,
+            queue_ahead_at_fill=0,
+            fill_fee_cents=0.2,
+            note="exit_take_profit",
+        )
+
+        metrics = paper_store.compute_paper_metrics()
+
+        assert metrics["entry_intents_created"] == 2
+        assert metrics["entry_fills"] == 3
+        assert metrics["entry_intents_with_at_least_one_fill"] == 2
+        assert metrics["entry_intent_fill_rate"] == pytest.approx(1.0)
+        assert metrics["entry_fully_filled_intents"] == 1
+        assert metrics["entry_partial_fill_intents"] == 1
+        assert metrics["entry_average_time_to_first_fill_seconds"] == pytest.approx(1.5)
+        assert metrics["entry_median_time_to_first_fill_seconds"] == pytest.approx(1.5)
+        assert metrics["entry_average_time_to_full_fill_seconds"] == pytest.approx(3.0)
+        assert metrics["entry_median_time_to_full_fill_seconds"] == pytest.approx(3.0)

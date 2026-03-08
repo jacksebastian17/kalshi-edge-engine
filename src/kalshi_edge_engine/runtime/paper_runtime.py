@@ -10,7 +10,7 @@ from kalshi_edge_engine.engine.fees import estimate_maker_fee_cents, estimate_ta
 from kalshi_edge_engine.engine.orderbook import parse_orderbook
 from kalshi_edge_engine.engine.paper import build_quote_intents
 from kalshi_edge_engine.engine.paper_sim import OrderRequest, RealisticOrderSimulator
-from kalshi_edge_engine.engine.signal import Signal
+from kalshi_edge_engine.engine.signal import SIGNAL_VALID, Signal
 from kalshi_edge_engine.kalshi.client import KalshiClient
 from kalshi_edge_engine.runtime import config as runtime_config
 from kalshi_edge_engine.runtime import state as runtime_state
@@ -109,6 +109,17 @@ async def _process_paper_intents(
 
     now_ms = int(time.time() * 1000)
 
+    if runtime_config.PAPER_REQUIRE_SIGNAL_VALID_ONLY and signal.reason_code != SIGNAL_VALID:
+        logger.info(
+            "paper_intent_skipped",
+            extra={
+                "ticker": signal.ticker,
+                "reason": "signal_not_valid",
+                "signal_reason_code": signal.reason_code,
+            },
+        )
+        return
+
     intents = build_quote_intents(signal)
 
     for task in list(runtime_state.paper_simulation_tasks):
@@ -116,6 +127,89 @@ async def _process_paper_intents(
             runtime_state.paper_simulation_tasks.discard(task)
 
     for intent in intents:
+        if intent.side == "YES" and not runtime_config.PAPER_ALLOW_YES_ENTRIES:
+            logger.info(
+                "paper_intent_skipped",
+                extra={
+                    "ticker": intent.ticker,
+                    "side": intent.side,
+                    "reason": "side_disabled",
+                },
+            )
+            continue
+
+        if intent.side == "NO" and not runtime_config.PAPER_ALLOW_NO_ENTRIES:
+            logger.info(
+                "paper_intent_skipped",
+                extra={
+                    "ticker": intent.ticker,
+                    "side": intent.side,
+                    "reason": "side_disabled",
+                },
+            )
+            continue
+
+        if intent.side == "YES":
+            capturable_edge_to_cross = signal.capturable_edge_to_cross_yes_cents
+            intended_quote = signal.intended_quote_yes_cents
+
+            if capturable_edge_to_cross is None or intended_quote is None:
+                logger.info(
+                    "paper_intent_skipped",
+                    extra={
+                        "ticker": intent.ticker,
+                        "side": intent.side,
+                        "reason": "missing_entry_selectivity_metric",
+                        "capturable_edge_to_cross_yes_cents": capturable_edge_to_cross,
+                        "intended_quote_yes_cents": intended_quote,
+                    },
+                )
+                continue
+
+            if capturable_edge_to_cross < runtime_config.PAPER_MIN_CAPTURABLE_EDGE_TO_CROSS_CENTS:
+                logger.info(
+                    "paper_intent_skipped",
+                    extra={
+                        "ticker": intent.ticker,
+                        "side": intent.side,
+                        "reason": "min_capturable_edge_to_cross",
+                        "capturable_edge_to_cross_yes_cents": capturable_edge_to_cross,
+                        "min_capturable_edge_to_cross_cents": (
+                            runtime_config.PAPER_MIN_CAPTURABLE_EDGE_TO_CROSS_CENTS
+                        ),
+                    },
+                )
+                continue
+
+            abs_distance_from_50_cents = abs(float(intended_quote) - 50.0)
+            if abs_distance_from_50_cents < runtime_config.PAPER_MIN_ABS_DISTANCE_FROM_50_CENTS:
+                logger.info(
+                    "paper_intent_skipped",
+                    extra={
+                        "ticker": intent.ticker,
+                        "side": intent.side,
+                        "reason": "min_abs_distance_from_50",
+                        "abs_distance_from_50_cents": abs_distance_from_50_cents,
+                        "min_abs_distance_from_50_cents": (
+                            runtime_config.PAPER_MIN_ABS_DISTANCE_FROM_50_CENTS
+                        ),
+                    },
+                )
+                continue
+
+        if signal.top_liquidity < runtime_config.PAPER_MIN_TOP_LIQUIDITY:
+            logger.info(
+                "paper_intent_skipped",
+                extra={
+                    "ticker": intent.ticker,
+                    "side": intent.side,
+                    "reason": "min_top_liquidity",
+                    "top_liquidity": signal.top_liquidity,
+                    "min_top_liquidity": runtime_config.PAPER_MIN_TOP_LIQUIDITY,
+                },
+            )
+            continue
+
         if intent.net_edge < runtime_config.PAPER_MIN_EDGE_CENTS:
             logger.info(
                 "paper_intent_skipped",
@@ -192,6 +286,31 @@ async def _process_paper_intents(
             )
             continue
 
+        min_reentry_delay_seconds = runtime_config.PAPER_MIN_REENTRY_DELAY_SECONDS_SAME_TICKER_SIDE
+        if min_reentry_delay_seconds > 0:
+            latest_entry_created_ts_ms = (
+                runtime_state.paper_store.get_latest_entry_created_ts_ms_for_ticker_side(
+                    intent.ticker,
+                    intent.side,
+                )
+            )
+            if latest_entry_created_ts_ms is not None:
+                elapsed_ms = now_ms - int(latest_entry_created_ts_ms)
+                if elapsed_ms < (int(min_reentry_delay_seconds) * 1000):
+                    logger.info(
+                        "paper_intent_skipped",
+                        extra={
+                            "ticker": intent.ticker,
+                            "side": intent.side,
+                            "reason": "reentry_delay_same_ticker_side",
+                            "elapsed_ms": elapsed_ms,
+                            "min_reentry_delay_seconds_same_ticker_side": (
+                                min_reentry_delay_seconds
+                            ),
+                        },
+                    )
+                    continue
+
         gating_reason = _get_rate_limit_or_cooldown_reason(intent.ticker, now_ms)
         if gating_reason is not None:
             logger.info(
@@ -233,6 +352,7 @@ async def _process_paper_intents(
 
             runtime_state.paper_store.insert_intent(
                 intent,
+                universe=intent.universe,
                 entry_fee_cents=entry_fee_cents,
                 take_profit_cents_per_contract=runtime_config.PAPER_TAKE_PROFIT_CENTS_PER_CONTRACT,
                 max_hold_seconds=runtime_config.PAPER_MAX_HOLD_SECONDS,

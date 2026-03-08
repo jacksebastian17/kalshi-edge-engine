@@ -251,6 +251,7 @@ class TestTopSignalsEndpoint:
         import kalshi_edge_engine.api.main as main_module
 
         main_module._top_signals_snapshot = None
+        main_module.runtime_state.top_signals_snapshot = None
 
         response = client.get("/signals/top")
 
@@ -329,7 +330,7 @@ class TestTopSignalsEndpoint:
             ],
             market_count=100,
         )
-        main_module._top_signals_snapshot = snapshot
+        main_module.runtime_state.top_signals_snapshot = snapshot
 
         response = client.get("/signals/top")
 
@@ -647,7 +648,7 @@ class TestPaperDebugEndpoints:
             ],
             market_count=50,
         )
-        main_module._top_signals_snapshot = snapshot
+        main_module.runtime_state.top_signals_snapshot = snapshot
 
         response = client.get("/signals/top?n=5")
 
@@ -960,6 +961,420 @@ class TestPaperMetricsEndpoint:
                 with contextlib.suppress(OSError):
                     os.unlink(db_path)
 
+    def test_paper_outcome_audit_excludes_exit_intents(self, client: TestClient) -> None:
+        """GET /paper/metrics/outcomes/audit should return ENTRY rows only."""
+        import kalshi_edge_engine.api.main as main_module
+
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            store = PaperStore(db_path=db_path)
+            main_module._paper_store = store
+
+            now_ms = int(time.time() * 1000)
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO quote_intents
+                    (id, ticker, side, quote_price_cents, size_contracts, created_ts_ms,
+                     net_edge, inside_width, imbalance_gap, fee_mode, round_trip, status,
+                     best_bid_at_submit_cents, cross_at_submit_cents)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "entry-audit-intent",
+                        "KXNBAGAME-AUDIT-ENTRY",
+                        "YES",
+                        50.0,
+                        1,
+                        now_ms - 60_000,
+                        1.2,
+                        2.0,
+                        0.0,
+                        "maker",
+                        True,
+                        "FILLED",
+                        49.0,
+                        52.0,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO quote_intents
+                    (id, ticker, side, quote_price_cents, size_contracts, created_ts_ms,
+                     net_edge, inside_width, imbalance_gap, fee_mode, round_trip, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "exit_intent:take_profit:KXNBAGAME-AUDIT-ENTRY:YES:1",
+                        "KXNBAGAME-AUDIT-ENTRY",
+                        "YES",
+                        54.0,
+                        1,
+                        now_ms - 50_000,
+                        0.0,
+                        0.0,
+                        None,
+                        "taker",
+                        False,
+                        "FILLED",
+                    ),
+                )
+                conn.commit()
+
+            assert store.insert_fill(
+                fill_id="fill-audit-entry",
+                intent_id="entry-audit-intent",
+                fill_ts_ms=now_ms - 40_000,
+                fill_price_cents=50.0,
+                fill_size=1,
+                remaining_size=0,
+                queue_ahead_at_fill=0,
+                fill_fee_cents=0.1,
+                best_bid_at_fill_cents=50.0,
+                cross_at_fill_cents=52.0,
+                note="entry_queue_cleared",
+                mark_30s_after_fill_cents=50.9,
+                pnl_30s_after_fill_cents=0.8,
+            )
+            assert store.insert_fill(
+                fill_id="fill-audit-exit",
+                intent_id="exit_intent:take_profit:KXNBAGAME-AUDIT-ENTRY:YES:1",
+                fill_ts_ms=now_ms - 30_000,
+                fill_price_cents=54.0,
+                fill_size=1,
+                remaining_size=0,
+                queue_ahead_at_fill=0,
+                fill_fee_cents=0.1,
+                note="exit_take_profit",
+                mark_30s_after_fill_cents=54.1,
+                pnl_30s_after_fill_cents=-0.1,
+            )
+
+            response = client.get("/paper/metrics/outcomes/audit?limit=50")
+            assert response.status_code == 200
+            data = response.json()
+            assert data["count"] == 1
+            assert len(data["fills"]) == 1
+
+            row = data["fills"][0]
+            assert row["intent_id"] == "entry-audit-intent"
+            assert row["ticker"] == "KXNBAGAME-AUDIT-ENTRY"
+            assert row["side"] == "YES"
+            assert row["fill_price_cents"] == 50.0
+            assert row["best_bid_at_fill_cents"] == 50.0
+            assert row["cross_at_fill_cents"] == 52.0
+            assert row["mark_30s_after_fill_cents"] == 50.9
+            assert row["pnl_30s_after_fill_cents"] == 0.8
+            assert row["note"] == "entry_queue_cleared"
+            assert row["net_edge_at_entry"] == pytest.approx(1.2)
+            assert row["created_ts_ms"] == now_ms - 60_000
+            assert row["fill_ts_ms"] == now_ms - 40_000
+            assert row["intended_quote_cents"] == pytest.approx(50.0)
+            assert row["abs_distance_from_50_cents"] == pytest.approx(0.0)
+            assert row["capturable_edge_to_cross_at_entry"] == pytest.approx(2.0)
+            assert row["minutes_since_previous_entry_same_ticker_side"] is None
+            assert row["previous_entry_same_ticker_side_pnl_30s_cents"] is None
+            assert row["previous_entry_same_ticker_side_net_edge"] is None
+        finally:
+            main_module._paper_store = None
+            gc.collect()
+            if os.path.exists(db_path):
+                with contextlib.suppress(OSError):
+                    os.unlink(db_path)
+
+    def test_paper_outcome_audit_includes_previous_same_ticker_side_fields(
+        self, client: TestClient
+    ) -> None:
+        """Audit should include previous same ticker+side timing and outcome fields."""
+        import kalshi_edge_engine.api.main as main_module
+
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            store = PaperStore(db_path=db_path)
+            main_module._paper_store = store
+
+            now_ms = int(time.time() * 1000)
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO quote_intents
+                    (id, ticker, side, quote_price_cents, size_contracts, created_ts_ms,
+                     net_edge, inside_width, imbalance_gap, fee_mode, round_trip, status,
+                     best_bid_at_submit_cents, cross_at_submit_cents)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "entry-audit-prev-1",
+                        "KXNBAGAME-AUDIT-PREV",
+                        "YES",
+                        49.0,
+                        1,
+                        now_ms - 180_000,
+                        0.8,
+                        2.0,
+                        0.0,
+                        "maker",
+                        True,
+                        "FILLED",
+                        48.0,
+                        50.0,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO quote_intents
+                    (id, ticker, side, quote_price_cents, size_contracts, created_ts_ms,
+                     net_edge, inside_width, imbalance_gap, fee_mode, round_trip, status,
+                     best_bid_at_submit_cents, cross_at_submit_cents)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "entry-audit-prev-2",
+                        "KXNBAGAME-AUDIT-PREV",
+                        "YES",
+                        51.0,
+                        1,
+                        now_ms - 120_000,
+                        1.4,
+                        2.0,
+                        0.0,
+                        "maker",
+                        True,
+                        "FILLED",
+                        50.0,
+                        52.0,
+                    ),
+                )
+                conn.commit()
+
+            assert store.insert_fill(
+                fill_id="fill-audit-prev-1",
+                intent_id="entry-audit-prev-1",
+                fill_ts_ms=now_ms - 150_000,
+                fill_price_cents=49.0,
+                fill_size=1,
+                remaining_size=0,
+                queue_ahead_at_fill=0,
+                fill_fee_cents=0.1,
+                note="entry_queue_cleared",
+                mark_30s_after_fill_cents=49.6,
+                pnl_30s_after_fill_cents=0.5,
+            )
+            assert store.insert_fill(
+                fill_id="fill-audit-prev-2",
+                intent_id="entry-audit-prev-2",
+                fill_ts_ms=now_ms - 90_000,
+                fill_price_cents=51.0,
+                fill_size=1,
+                remaining_size=0,
+                queue_ahead_at_fill=0,
+                fill_fee_cents=0.1,
+                note="entry_queue_cleared",
+                mark_30s_after_fill_cents=51.3,
+                pnl_30s_after_fill_cents=0.2,
+            )
+
+            response = client.get("/paper/metrics/outcomes/audit?limit=10")
+            assert response.status_code == 200
+            rows = response.json()["fills"]
+            assert len(rows) == 2
+
+            latest = rows[0]
+            assert latest["intent_id"] == "entry-audit-prev-2"
+            assert latest["minutes_since_previous_entry_same_ticker_side"] == pytest.approx(1.0)
+            assert latest["previous_entry_same_ticker_side_pnl_30s_cents"] == pytest.approx(0.5)
+            assert latest["previous_entry_same_ticker_side_net_edge"] == pytest.approx(0.8)
+
+            earliest = rows[1]
+            assert earliest["intent_id"] == "entry-audit-prev-1"
+            assert earliest["minutes_since_previous_entry_same_ticker_side"] is None
+            assert earliest["previous_entry_same_ticker_side_pnl_30s_cents"] is None
+            assert earliest["previous_entry_same_ticker_side_net_edge"] is None
+        finally:
+            main_module._paper_store = None
+            gc.collect()
+            if os.path.exists(db_path):
+                with contextlib.suppress(OSError):
+                    os.unlink(db_path)
+
+    def test_paper_outcome_concentration_endpoint(self, client: TestClient) -> None:
+        """Concentration endpoint should aggregate entry-only fill concentration metrics."""
+        import kalshi_edge_engine.api.main as main_module
+
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            store = PaperStore(db_path=db_path)
+            main_module._paper_store = store
+
+            now_ms = int(time.time() * 1000)
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO quote_intents
+                    (id, ticker, side, quote_price_cents, size_contracts, created_ts_ms,
+                     net_edge, inside_width, imbalance_gap, fee_mode, round_trip, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "entry-conc-1",
+                        "KXNBAGAME-CONC-A",
+                        "YES",
+                        50.0,
+                        1,
+                        now_ms - 40_000,
+                        1.0,
+                        2.0,
+                        0.0,
+                        "maker",
+                        True,
+                        "FILLED",
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO quote_intents
+                    (id, ticker, side, quote_price_cents, size_contracts, created_ts_ms,
+                     net_edge, inside_width, imbalance_gap, fee_mode, round_trip, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "entry-conc-2",
+                        "KXNBAGAME-CONC-A",
+                        "YES",
+                        51.0,
+                        1,
+                        now_ms - 35_000,
+                        2.0,
+                        2.0,
+                        0.0,
+                        "maker",
+                        True,
+                        "FILLED",
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO quote_intents
+                    (id, ticker, side, quote_price_cents, size_contracts, created_ts_ms,
+                     net_edge, inside_width, imbalance_gap, fee_mode, round_trip, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "entry-conc-3",
+                        "KXNBAGAME-CONC-B",
+                        "NO",
+                        48.0,
+                        1,
+                        now_ms - 30_000,
+                        0.5,
+                        2.0,
+                        0.0,
+                        "maker",
+                        True,
+                        "FILLED",
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO quote_intents
+                    (id, ticker, side, quote_price_cents, size_contracts, created_ts_ms,
+                     net_edge, inside_width, imbalance_gap, fee_mode, round_trip, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "exit_intent:take_profit:KXNBAGAME-CONC-A:YES:1",
+                        "KXNBAGAME-CONC-A",
+                        "YES",
+                        54.0,
+                        1,
+                        now_ms - 20_000,
+                        0.0,
+                        0.0,
+                        None,
+                        "taker",
+                        False,
+                        "FILLED",
+                    ),
+                )
+                conn.commit()
+
+            assert store.insert_fill(
+                fill_id="fill-conc-1",
+                intent_id="entry-conc-1",
+                fill_ts_ms=now_ms - 35_000,
+                fill_price_cents=50.0,
+                fill_size=1,
+                remaining_size=0,
+                queue_ahead_at_fill=0,
+                fill_fee_cents=0.1,
+                note="entry_queue_cleared",
+                pnl_30s_after_fill_cents=0.3,
+            )
+            assert store.insert_fill(
+                fill_id="fill-conc-2",
+                intent_id="entry-conc-2",
+                fill_ts_ms=now_ms - 25_000,
+                fill_price_cents=51.0,
+                fill_size=1,
+                remaining_size=0,
+                queue_ahead_at_fill=0,
+                fill_fee_cents=0.1,
+                note="entry_queue_cleared",
+                pnl_30s_after_fill_cents=-0.2,
+            )
+            assert store.insert_fill(
+                fill_id="fill-conc-3",
+                intent_id="entry-conc-3",
+                fill_ts_ms=now_ms - 15_000,
+                fill_price_cents=48.0,
+                fill_size=1,
+                remaining_size=0,
+                queue_ahead_at_fill=0,
+                fill_fee_cents=0.1,
+                note="entry_moved_through",
+                pnl_30s_after_fill_cents=0.4,
+            )
+            assert store.insert_fill(
+                fill_id="fill-conc-exit",
+                intent_id="exit_intent:take_profit:KXNBAGAME-CONC-A:YES:1",
+                fill_ts_ms=now_ms - 10_000,
+                fill_price_cents=54.0,
+                fill_size=1,
+                remaining_size=0,
+                queue_ahead_at_fill=0,
+                fill_fee_cents=0.1,
+                note="exit_take_profit",
+                pnl_30s_after_fill_cents=1.0,
+            )
+
+            response = client.get("/paper/metrics/outcomes/concentration?window_seconds=3600")
+            assert response.status_code == 200
+            data = response.json()
+
+            assert data["total_entry_samples"] == 3
+            assert data["unique_tickers"] == 2
+            assert data["unique_ticker_side_pairs"] == 2
+
+            assert data["top_tickers_by_sample_count"][0]["ticker"] == "KXNBAGAME-CONC-A"
+            assert data["top_tickers_by_sample_count"][0]["sample_count"] == 2
+            assert data["top_tickers_by_sample_count"][0]["avg_pnl_30s_cents"] == pytest.approx(
+                0.05
+            )
+            assert data["top_tickers_by_sample_count"][0]["win_rate_30s"] == pytest.approx(0.5)
+
+            assert data["top_ticker_sides_by_sample_count"][0]["ticker"] == "KXNBAGAME-CONC-A"
+            assert data["top_ticker_sides_by_sample_count"][0]["side"] == "YES"
+            assert data["top_ticker_sides_by_sample_count"][0]["sample_count"] == 2
+        finally:
+            main_module._paper_store = None
+            gc.collect()
+            if os.path.exists(db_path):
+                with contextlib.suppress(OSError):
+                    os.unlink(db_path)
+
 
 class TestPaperConfigAndSummaryEndpoints:
     """Tests for /paper/config and /paper/summary consistency."""
@@ -988,6 +1403,31 @@ class TestPaperConfigAndSummaryEndpoints:
 
         main_module._paper_enabled = False
         main_module._paper_simulation_tasks = set()
+
+    def test_paper_config_exposes_entry_gating_fields(self, client: TestClient) -> None:
+        """GET /paper/config should include side and selectivity gate settings."""
+        import kalshi_edge_engine.api.main as main_module
+
+        main_module._paper_enabled = True
+        main_module._paper_simulation_tasks = set()
+        main_module._PAPER_ALLOW_YES_ENTRIES = True
+        main_module._PAPER_ALLOW_NO_ENTRIES = False
+        main_module._PAPER_MIN_TOP_LIQUIDITY = 150
+        main_module._PAPER_REQUIRE_SIGNAL_VALID_ONLY = True
+        main_module._PAPER_MIN_CAPTURABLE_EDGE_TO_CROSS_CENTS = 0.75
+        main_module._PAPER_MIN_ABS_DISTANCE_FROM_50_CENTS = 1.25
+        main_module._PAPER_MIN_REENTRY_DELAY_SECONDS_SAME_TICKER_SIDE = 90
+
+        response = client.get("/paper/config")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["allow_yes_entries"] is True
+        assert data["allow_no_entries"] is False
+        assert data["min_top_liquidity"] == 150
+        assert data["require_signal_valid_only"] is True
+        assert data["min_capturable_edge_to_cross_cents"] == pytest.approx(0.75)
+        assert data["min_abs_distance_from_50_cents"] == pytest.approx(1.25)
+        assert data["min_reentry_delay_seconds_same_ticker_side"] == 90
 
     def test_paper_summary_uses_total_intent_count(self, client: TestClient) -> None:
         """GET /paper/summary should use total COUNT(*) and not be capped by status list limits."""
@@ -1099,6 +1539,123 @@ class TestPaperConfigAndSummaryEndpoints:
             response = client.get("/paper/summary")
             assert response.status_code == 200
             assert response.json()["total_fills"] == 1005
+        finally:
+            main_module._paper_store = None
+            main_module._paper_enabled = False
+            gc.collect()
+            if os.path.exists(db_path):
+                with contextlib.suppress(OSError):
+                    os.unlink(db_path)
+
+    def test_paper_summary_exposes_entry_only_metrics(self, client: TestClient) -> None:
+        """GET /paper/summary should include entry-only metrics excluding exit intents."""
+        import kalshi_edge_engine.api.main as main_module
+
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            store = PaperStore(db_path=db_path)
+            main_module._paper_store = store
+            main_module._paper_enabled = True
+
+            now_ms = int(time.time() * 1000)
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO quote_intents
+                    (id, ticker, side, quote_price_cents, size_contracts, created_ts_ms,
+                     net_edge, inside_width, imbalance_gap, fee_mode, round_trip, status,
+                     cross_at_submit_cents)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "entry-summary-a",
+                        "KXNBAGAME-SUM-ENTRY",
+                        "YES",
+                        50.0,
+                        2,
+                        now_ms,
+                        1.0,
+                        1.0,
+                        None,
+                        "maker",
+                        True,
+                        "FILLED",
+                        52.0,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO quote_intents
+                    (id, ticker, side, quote_price_cents, size_contracts, created_ts_ms,
+                     net_edge, inside_width, imbalance_gap, fee_mode, round_trip, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "exit_intent:take_profit:KXNBAGAME-SUM-ENTRY:YES:1",
+                        "KXNBAGAME-SUM-ENTRY",
+                        "YES",
+                        55.0,
+                        2,
+                        now_ms,
+                        0.0,
+                        0.0,
+                        None,
+                        "taker",
+                        False,
+                        "FILLED",
+                    ),
+                )
+                conn.commit()
+
+            assert store.insert_fill(
+                fill_id="entry-summary-fill-1",
+                intent_id="entry-summary-a",
+                fill_ts_ms=now_ms + 1000,
+                fill_price_cents=50.0,
+                fill_size=1,
+                remaining_size=1,
+                queue_ahead_at_fill=0,
+                fill_fee_cents=0.1,
+                note="entry_queue_cleared",
+            )
+            assert store.insert_fill(
+                fill_id="exit-summary-fill-1",
+                intent_id="exit_intent:take_profit:KXNBAGAME-SUM-ENTRY:YES:1",
+                fill_ts_ms=now_ms + 2000,
+                fill_price_cents=55.0,
+                fill_size=2,
+                remaining_size=0,
+                queue_ahead_at_fill=0,
+                fill_fee_cents=0.2,
+                note="exit_take_profit",
+            )
+
+            response = client.get("/paper/summary")
+            assert response.status_code == 200
+            data = response.json()
+
+            assert data["entry_intents_created"] == 1
+            assert data["entry_yes_intents_created"] == 1
+            assert data["entry_no_intents_created"] == 0
+            assert data["entry_fills"] == 1
+            assert data["entry_yes_fills"] == 1
+            assert data["entry_no_fills"] == 0
+            assert data["entry_intents_with_at_least_one_fill"] == 1
+            assert data["entry_intent_fill_rate"] == pytest.approx(1.0)
+            assert data["entry_fully_filled_intents"] == 0
+            assert data["entry_partial_fill_intents"] == 1
+            assert data["entry_average_time_to_first_fill_seconds"] == pytest.approx(1.0)
+            assert data["entry_median_time_to_first_fill_seconds"] == pytest.approx(1.0)
+            assert data["entry_average_time_to_full_fill_seconds"] is None
+            assert data["entry_median_time_to_full_fill_seconds"] is None
+            assert data["entry_avg_net_edge_at_entry"] == pytest.approx(1.0)
+            assert data["entry_avg_capturable_edge_to_cross_at_entry"] == pytest.approx(2.0)
+            assert data["entry_avg_abs_distance_from_50_at_entry"] == pytest.approx(0.0)
+            assert data["unique_entry_tickers_count"] == 1
+            assert data["unique_entry_ticker_side_pairs_count"] == 1
+            assert data["unique_filled_entry_tickers_count"] == 1
+            assert data["unique_filled_entry_ticker_side_pairs_count"] == 1
         finally:
             main_module._paper_store = None
             main_module._paper_enabled = False

@@ -208,6 +208,51 @@ class TestPaperStore:
         assert stats["total_pnl_cents"] == 0.0
         assert stats["avg_pnl_cents"] == 0.0
 
+    def test_universe_metadata_persists_in_intents_fills_and_outcomes(
+        self,
+        paper_store: PaperStore,
+    ) -> None:
+        """Universe metadata should survive storage and be visible in analytics views."""
+        now_ms = int(time.time() * 1000)
+        intent = QuoteIntent(
+            id="intent-cbb-1",
+            ticker="KXCBBGAME-TEST",
+            universe="CBB",
+            side="YES",
+            quote_price_cents=47.0,
+            size_contracts=1,
+            created_ts_ms=now_ms,
+            net_edge=1.2,
+            inside_width=3.0,
+            imbalance_gap=6.0,
+            fee_mode="maker",
+            round_trip=False,
+        )
+        paper_store.insert_intent(intent)
+
+        intent_record = paper_store.get_intent_record(intent.id)
+        assert intent_record is not None
+        assert intent_record["universe"] == "CBB"
+
+        inserted = paper_store.insert_fill(
+            fill_id="fill-cbb-1",
+            intent_id=intent.id,
+            fill_ts_ms=now_ms + 100,
+            fill_price_cents=47.0,
+            fill_size=1,
+            note="entry_queue_cleared",
+            mark_30s_after_fill_cents=48.0,
+            pnl_30s_after_fill_cents=1.0,
+        )
+        assert inserted is True
+
+        recent_fills = paper_store.get_recent_fills(limit=1)
+        assert recent_fills[0]["universe"] == "CBB"
+
+        outcome_metrics = paper_store.get_short_horizon_outcome_metrics(window_seconds=3600)
+        assert outcome_metrics["by_universe"]["CBB"]["sample_count"] == 1
+        assert outcome_metrics["entry_only_by_universe"]["CBB"]["sample_count"] == 1
+
     def test_insert_multiple_outcomes_and_aggregate_stats(self, paper_store: PaperStore) -> None:
         """Test aggregating stats from multiple outcomes."""
         now_ms = int(time.time() * 1000)
@@ -1616,3 +1661,73 @@ class TestShortHorizonOutcomeTelemetry:
         assert (1.0, 2.0) in bucket_ranges
         assert bucket_ranges[(0.0, 1.0)]["sample_count"] == 1
         assert bucket_ranges[(1.0, 2.0)]["sample_count"] == 2
+        assert metrics["entry_only_sample_count"] == 3
+        assert metrics["entry_only_by_side"]["YES"]["sample_count"] == 2
+        assert metrics["entry_only_by_side"]["NO"]["sample_count"] == 1
+        assert metrics["entry_only_by_fill_path"]["queue_cleared"]["sample_count"] == 2
+        assert metrics["entry_only_by_fill_path"]["price_improves"]["sample_count"] == 1
+
+    def test_short_horizon_outcome_metrics_entry_only_excludes_exit_notes(
+        self, paper_store: PaperStore
+    ) -> None:
+        """Entry-only outcome breakdowns should exclude exit-path rows."""
+        now_ms = int(time.time() * 1000)
+        intent = QuoteIntent(
+            id="intent-metrics-entry-only",
+            ticker="KXNBAGAME-METRICS-ENTRY-ONLY",
+            side="YES",
+            quote_price_cents=50.0,
+            size_contracts=1,
+            created_ts_ms=now_ms - 80_000,
+            net_edge=1.1,
+            inside_width=2.0,
+            imbalance_gap=0.0,
+            fee_mode="maker",
+            round_trip=True,
+        )
+        exit_intent = QuoteIntent(
+            id="exit_intent:take_profit:KXNBAGAME-METRICS-ENTRY-ONLY:YES:1",
+            ticker="KXNBAGAME-METRICS-ENTRY-ONLY",
+            side="YES",
+            quote_price_cents=50.0,
+            size_contracts=1,
+            created_ts_ms=now_ms - 75_000,
+            net_edge=0.0,
+            inside_width=0.0,
+            imbalance_gap=None,
+            fee_mode="taker",
+            round_trip=False,
+        )
+        paper_store.insert_intent(intent)
+        paper_store.insert_intent(exit_intent)
+
+        assert paper_store.insert_fill(
+            fill_id="fill-entry-only-1",
+            intent_id=intent.id,
+            fill_ts_ms=now_ms - 50_000,
+            fill_price_cents=50.0,
+            fill_size=1,
+            remaining_size=0,
+            fill_fee_cents=0.1,
+            note="entry_queue_cleared",
+            mark_30s_after_fill_cents=50.6,
+            pnl_30s_after_fill_cents=0.5,
+        )
+        assert paper_store.insert_fill(
+            fill_id="fill-entry-only-2",
+            intent_id=exit_intent.id,
+            fill_ts_ms=now_ms - 45_000,
+            fill_price_cents=50.0,
+            fill_size=1,
+            remaining_size=0,
+            fill_fee_cents=0.1,
+            note="exit_take_profit",
+            mark_30s_after_fill_cents=49.8,
+            pnl_30s_after_fill_cents=-0.2,
+        )
+
+        metrics = paper_store.get_short_horizon_outcome_metrics(window_seconds=3600)
+        assert metrics["total_samples"] == 2
+        assert metrics["entry_only_sample_count"] == 1
+        assert "queue_cleared" in metrics["entry_only_by_fill_path"]
+        assert "unknown" not in metrics["entry_only_by_fill_path"]

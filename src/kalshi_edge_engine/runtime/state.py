@@ -20,6 +20,9 @@ class _ScannerState:
         self.last_error: str | None = None
         self.rotating_index = 0
         self.market_tickers: list[str] = []
+        self.ticker_universe_map: dict[str, str] = {}
+        self.enabled_universes: list[str] = []
+        self.discovered_universe_counts: dict[str, int] = {}
         self.last_universe_refresh_ms = 0
         self.cooldown_until_ms: dict[str, int] = {}
 
@@ -34,6 +37,9 @@ class _ScannerState:
         self.last_error = None
         self.rotating_index = 0
         self.market_tickers = []
+        self.ticker_universe_map = {}
+        self.enabled_universes = []
+        self.discovered_universe_counts = {}
         self.last_universe_refresh_ms = 0
         self.cooldown_until_ms = {}
 

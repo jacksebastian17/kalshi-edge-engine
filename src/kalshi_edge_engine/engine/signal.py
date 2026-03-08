@@ -102,11 +102,13 @@ class Signal:
     net_edge_after_entry_fee_no_cents: float | None = None
     net_edge_after_round_trip_fee_yes_cents: float | None = None
     net_edge_after_round_trip_fee_no_cents: float | None = None
+    universe: str = "NBA"
 
 
 def score_signal(
     ticker: str,
     orderbook: dict[str, Any],
+    universe: str = "NBA",
     fee_mode: Literal["maker", "taker"] = "maker",  # Fee mode (maker or taker)
     contracts_for_fee: int = 1,  # Number of contracts for fee calculation
     round_trip: bool = False,  # If True, model both entry and exit fees
@@ -312,6 +314,7 @@ def score_signal(
 
     return Signal(
         ticker=ticker,
+        universe=universe,
         reason_code=reason_code,
         net_edge_yes=net_edge_yes,
         net_edge_no=net_edge_no,

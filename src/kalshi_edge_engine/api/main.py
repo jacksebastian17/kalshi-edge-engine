@@ -9,7 +9,7 @@ from typing import Any
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from kalshi_edge_engine.db.paper_store import PaperStore
 from kalshi_edge_engine.engine.paper import build_quote_intents
@@ -87,6 +87,7 @@ class SignalResponse(BaseModel):
     """Signal scoring response."""
 
     ticker: str
+    universe: str = "NBA"
     reason_code: str
     net_edge_yes: float | None
     net_edge_no: float | None
@@ -142,6 +143,8 @@ class ScannerStatusResponse(BaseModel):
     enabled: bool
     last_scan_ms: int | None
     markets_discovered: int
+    enabled_universes: list[str] = Field(default_factory=list)
+    discovered_universe_counts: dict[str, int] = Field(default_factory=dict)
     markets_scanned_last_cycle: int
     last_cycle_duration_ms: int | None
     tickers_failed_last_cycle: list[str]
@@ -192,6 +195,7 @@ class PaperIntentResponse(BaseModel):
 
     id: str
     ticker: str
+    universe: str | None = None
     side: str
     quote_price_cents: float
     size_contracts: int
@@ -207,6 +211,7 @@ class PaperFillResponse(BaseModel):
 
     id: str
     intent_id: str
+    universe: str | None = None
     fill_ts_ms: int
     fill_price_cents: float
     fill_size: int
@@ -265,6 +270,15 @@ _scanner_state = runtime_state.scanner_state
 # Paper trading configuration (v2 - realistic)
 _ENABLE_PAPER_TRADING = runtime_config.ENABLE_PAPER_TRADING
 _PAPER_MIN_EDGE_CENTS = runtime_config.PAPER_MIN_EDGE_CENTS
+_PAPER_ALLOW_YES_ENTRIES = runtime_config.PAPER_ALLOW_YES_ENTRIES
+_PAPER_ALLOW_NO_ENTRIES = runtime_config.PAPER_ALLOW_NO_ENTRIES
+_PAPER_MIN_TOP_LIQUIDITY = runtime_config.PAPER_MIN_TOP_LIQUIDITY
+_PAPER_REQUIRE_SIGNAL_VALID_ONLY = runtime_config.PAPER_REQUIRE_SIGNAL_VALID_ONLY
+_PAPER_MIN_CAPTURABLE_EDGE_TO_CROSS_CENTS = runtime_config.PAPER_MIN_CAPTURABLE_EDGE_TO_CROSS_CENTS
+_PAPER_MIN_ABS_DISTANCE_FROM_50_CENTS = runtime_config.PAPER_MIN_ABS_DISTANCE_FROM_50_CENTS
+_PAPER_MIN_REENTRY_DELAY_SECONDS_SAME_TICKER_SIDE = (
+    runtime_config.PAPER_MIN_REENTRY_DELAY_SECONDS_SAME_TICKER_SIDE
+)
 _PAPER_MAX_CONCURRENT_INTENTS = runtime_config.PAPER_MAX_CONCURRENT_INTENTS
 _PAPER_MAX_OPEN_ORDERS = runtime_config.PAPER_MAX_OPEN_ORDERS
 _PAPER_MAX_POS_PER_TICKER = runtime_config.PAPER_MAX_POS_PER_TICKER
@@ -318,6 +332,17 @@ PAPER_INTENT_ALLOWED_STATUSES = PAPER_INTENT_ACTIVE_STATUSES | PAPER_INTENT_LEGA
 def _sync_runtime_from_legacy() -> None:
     runtime_config.ENABLE_PAPER_TRADING = _ENABLE_PAPER_TRADING
     runtime_config.PAPER_MIN_EDGE_CENTS = _PAPER_MIN_EDGE_CENTS
+    runtime_config.PAPER_ALLOW_YES_ENTRIES = _PAPER_ALLOW_YES_ENTRIES
+    runtime_config.PAPER_ALLOW_NO_ENTRIES = _PAPER_ALLOW_NO_ENTRIES
+    runtime_config.PAPER_MIN_TOP_LIQUIDITY = _PAPER_MIN_TOP_LIQUIDITY
+    runtime_config.PAPER_REQUIRE_SIGNAL_VALID_ONLY = _PAPER_REQUIRE_SIGNAL_VALID_ONLY
+    runtime_config.PAPER_MIN_CAPTURABLE_EDGE_TO_CROSS_CENTS = (
+        _PAPER_MIN_CAPTURABLE_EDGE_TO_CROSS_CENTS
+    )
+    runtime_config.PAPER_MIN_ABS_DISTANCE_FROM_50_CENTS = _PAPER_MIN_ABS_DISTANCE_FROM_50_CENTS
+    runtime_config.PAPER_MIN_REENTRY_DELAY_SECONDS_SAME_TICKER_SIDE = (
+        _PAPER_MIN_REENTRY_DELAY_SECONDS_SAME_TICKER_SIDE
+    )
     runtime_config.PAPER_MAX_CONCURRENT_INTENTS = _PAPER_MAX_CONCURRENT_INTENTS
     runtime_config.PAPER_MAX_OPEN_ORDERS = _PAPER_MAX_OPEN_ORDERS
     runtime_config.PAPER_MAX_POS_PER_TICKER = _PAPER_MAX_POS_PER_TICKER
@@ -336,8 +361,6 @@ def _sync_runtime_from_legacy() -> None:
     runtime_config.PAPER_MAX_DAILY_LOSS_CENTS = _PAPER_MAX_DAILY_LOSS_CENTS
     runtime_config.PAPER_PNL_SNAPSHOT_INTERVAL_MS = _paper_pnl_snapshot_interval_ms
 
-    if _top_signals_snapshot is not None:
-        runtime_state.top_signals_snapshot = _top_signals_snapshot
     runtime_state.paper_store = _paper_store
     runtime_state.paper_enabled = _paper_enabled
     runtime_state.paper_simulation_tasks = _paper_simulation_tasks
@@ -350,6 +373,13 @@ def _sync_runtime_from_legacy() -> None:
 def _sync_legacy_from_runtime() -> None:
     global _ENABLE_PAPER_TRADING
     global _PAPER_MIN_EDGE_CENTS
+    global _PAPER_ALLOW_YES_ENTRIES
+    global _PAPER_ALLOW_NO_ENTRIES
+    global _PAPER_MIN_TOP_LIQUIDITY
+    global _PAPER_REQUIRE_SIGNAL_VALID_ONLY
+    global _PAPER_MIN_CAPTURABLE_EDGE_TO_CROSS_CENTS
+    global _PAPER_MIN_ABS_DISTANCE_FROM_50_CENTS
+    global _PAPER_MIN_REENTRY_DELAY_SECONDS_SAME_TICKER_SIDE
     global _PAPER_MAX_CONCURRENT_INTENTS
     global _PAPER_MAX_OPEN_ORDERS
     global _PAPER_MAX_POS_PER_TICKER
@@ -378,6 +408,17 @@ def _sync_legacy_from_runtime() -> None:
 
     _ENABLE_PAPER_TRADING = runtime_config.ENABLE_PAPER_TRADING
     _PAPER_MIN_EDGE_CENTS = runtime_config.PAPER_MIN_EDGE_CENTS
+    _PAPER_ALLOW_YES_ENTRIES = runtime_config.PAPER_ALLOW_YES_ENTRIES
+    _PAPER_ALLOW_NO_ENTRIES = runtime_config.PAPER_ALLOW_NO_ENTRIES
+    _PAPER_MIN_TOP_LIQUIDITY = runtime_config.PAPER_MIN_TOP_LIQUIDITY
+    _PAPER_REQUIRE_SIGNAL_VALID_ONLY = runtime_config.PAPER_REQUIRE_SIGNAL_VALID_ONLY
+    _PAPER_MIN_CAPTURABLE_EDGE_TO_CROSS_CENTS = (
+        runtime_config.PAPER_MIN_CAPTURABLE_EDGE_TO_CROSS_CENTS
+    )
+    _PAPER_MIN_ABS_DISTANCE_FROM_50_CENTS = runtime_config.PAPER_MIN_ABS_DISTANCE_FROM_50_CENTS
+    _PAPER_MIN_REENTRY_DELAY_SECONDS_SAME_TICKER_SIDE = (
+        runtime_config.PAPER_MIN_REENTRY_DELAY_SECONDS_SAME_TICKER_SIDE
+    )
     _PAPER_MAX_CONCURRENT_INTENTS = runtime_config.PAPER_MAX_CONCURRENT_INTENTS
     _PAPER_MAX_OPEN_ORDERS = runtime_config.PAPER_MAX_OPEN_ORDERS
     _PAPER_MAX_POS_PER_TICKER = runtime_config.PAPER_MAX_POS_PER_TICKER
@@ -533,6 +574,7 @@ def _signal_to_response(signal: Signal) -> dict[str, Any]:
     """Convert Signal dataclass to API response payload."""
     return {
         "ticker": signal.ticker,
+        "universe": signal.universe,
         "reason_code": signal.reason_code,
         "net_edge_yes": signal.net_edge_yes,
         "net_edge_no": signal.net_edge_no,
@@ -965,13 +1007,7 @@ async def get_top_signals(n: int = 20) -> dict[str, Any]:
     Raises:
         HTTPException: If snapshot is not available yet.
     """
-    snapshot: TopSignalsSnapshot | None
-    if _top_signals_snapshot is not None:
-        snapshot = _top_signals_snapshot
-    elif _scanner_state.last_scan_ms is not None:
-        snapshot = runtime_state.top_signals_snapshot
-    else:
-        snapshot = None
+    snapshot = runtime_state.top_signals_snapshot
     if snapshot is None:
         raise HTTPException(
             status_code=503,
@@ -1233,6 +1269,45 @@ async def get_paper_summary() -> dict[str, Any]:
         "median_time_to_first_fill_seconds": metrics.get("median_time_to_first_fill_seconds"),
         "average_time_to_full_fill_seconds": metrics.get("average_time_to_full_fill_seconds"),
         "median_time_to_full_fill_seconds": metrics.get("median_time_to_full_fill_seconds"),
+        "entry_intents_created": metrics.get("entry_intents_created", 0),
+        "entry_yes_intents_created": metrics.get("entry_yes_intents_created", 0),
+        "entry_no_intents_created": metrics.get("entry_no_intents_created", 0),
+        "entry_fills": metrics.get("entry_fills", 0),
+        "entry_yes_fills": metrics.get("entry_yes_fills", 0),
+        "entry_no_fills": metrics.get("entry_no_fills", 0),
+        "entry_intents_with_at_least_one_fill": metrics.get(
+            "entry_intents_with_at_least_one_fill", 0
+        ),
+        "entry_intent_fill_rate": metrics.get("entry_intent_fill_rate", 0.0),
+        "entry_fully_filled_intents": metrics.get("entry_fully_filled_intents", 0),
+        "entry_partial_fill_intents": metrics.get("entry_partial_fill_intents", 0),
+        "entry_average_time_to_first_fill_seconds": metrics.get(
+            "entry_average_time_to_first_fill_seconds"
+        ),
+        "entry_median_time_to_first_fill_seconds": metrics.get(
+            "entry_median_time_to_first_fill_seconds"
+        ),
+        "entry_average_time_to_full_fill_seconds": metrics.get(
+            "entry_average_time_to_full_fill_seconds"
+        ),
+        "entry_median_time_to_full_fill_seconds": metrics.get(
+            "entry_median_time_to_full_fill_seconds"
+        ),
+        "entry_avg_net_edge_at_entry": metrics.get("entry_avg_net_edge_at_entry"),
+        "entry_avg_capturable_edge_to_cross_at_entry": metrics.get(
+            "entry_avg_capturable_edge_to_cross_at_entry"
+        ),
+        "entry_avg_abs_distance_from_50_at_entry": metrics.get(
+            "entry_avg_abs_distance_from_50_at_entry"
+        ),
+        "unique_entry_tickers_count": metrics.get("unique_entry_tickers_count", 0),
+        "unique_entry_ticker_side_pairs_count": metrics.get(
+            "unique_entry_ticker_side_pairs_count", 0
+        ),
+        "unique_filled_entry_tickers_count": metrics.get("unique_filled_entry_tickers_count", 0),
+        "unique_filled_entry_ticker_side_pairs_count": metrics.get(
+            "unique_filled_entry_ticker_side_pairs_count", 0
+        ),
         "unrealized_marks_available": metrics.get("unrealized_marks_available", False),
         "unrealized_pnl_status": metrics.get("unrealized_pnl_status", "marks_unavailable"),
         "unrealized_marked_positions_count": metrics.get("unrealized_marked_positions_count", 0),
@@ -1267,6 +1342,23 @@ async def get_paper_outcome_metrics(window_seconds: int = 86_400) -> dict[str, A
     return _paper_store.get_short_horizon_outcome_metrics(window_seconds=window_seconds)
 
 
+async def get_paper_outcome_audit(limit: int = 50) -> dict[str, Any]:
+    """Get recent entry-fill outcome rows for manual side/path audit."""
+    if not _paper_store:
+        raise HTTPException(status_code=503, detail="Paper trading not enabled")
+
+    rows = _paper_store.get_recent_entry_outcome_audit(limit=limit)
+    return {"fills": rows, "count": len(rows)}
+
+
+async def get_paper_outcome_concentration(window_seconds: int = 3600) -> dict[str, Any]:
+    """Get entry-fill concentration metrics for duplicate-pattern analysis."""
+    if not _paper_store:
+        raise HTTPException(status_code=503, detail="Paper trading not enabled")
+
+    return _paper_store.get_entry_outcome_concentration_metrics(window_seconds=window_seconds)
+
+
 async def get_paper_config() -> dict[str, Any]:
     """Return current paper trading configuration.
 
@@ -1285,6 +1377,15 @@ async def get_paper_config() -> dict[str, Any]:
         "enabled": _paper_enabled,
         "active": active,
         "min_edge_cents": _PAPER_MIN_EDGE_CENTS,
+        "allow_yes_entries": _PAPER_ALLOW_YES_ENTRIES,
+        "allow_no_entries": _PAPER_ALLOW_NO_ENTRIES,
+        "min_top_liquidity": _PAPER_MIN_TOP_LIQUIDITY,
+        "require_signal_valid_only": _PAPER_REQUIRE_SIGNAL_VALID_ONLY,
+        "min_capturable_edge_to_cross_cents": _PAPER_MIN_CAPTURABLE_EDGE_TO_CROSS_CENTS,
+        "min_abs_distance_from_50_cents": _PAPER_MIN_ABS_DISTANCE_FROM_50_CENTS,
+        "min_reentry_delay_seconds_same_ticker_side": (
+            _PAPER_MIN_REENTRY_DELAY_SECONDS_SAME_TICKER_SIDE
+        ),
         "fill_horizon_seconds": _PAPER_FILL_HORIZON_SECONDS,
         "poll_interval_seconds": _PAPER_POLL_INTERVAL_SECONDS,
         "fill_probability_price_moved": _PAPER_FILL_PROBABILITY,
@@ -1489,13 +1590,7 @@ async def get_scanner_status(request: Request) -> dict[str, Any]:
         Scanner status including enabled flag, market counts, timing,
         failure tracking, and snapshot age.
     """
-    snapshot: TopSignalsSnapshot | None
-    if _top_signals_snapshot is not None:
-        snapshot = _top_signals_snapshot
-    elif _scanner_state.last_scan_ms is not None:
-        snapshot = runtime_state.top_signals_snapshot
-    else:
-        snapshot = None
+    snapshot = runtime_state.top_signals_snapshot
     now_ms = int(time.time() * 1000)
     snapshot_age_ms: int | None = None
 
@@ -1512,6 +1607,8 @@ async def get_scanner_status(request: Request) -> dict[str, Any]:
         "enabled": _scanner_state.enabled and task_running,
         "last_scan_ms": _scanner_state.last_scan_ms,
         "markets_discovered": _scanner_state.markets_discovered,
+        "enabled_universes": _scanner_state.enabled_universes,
+        "discovered_universe_counts": _scanner_state.discovered_universe_counts,
         "markets_scanned_last_cycle": _scanner_state.markets_scanned_last_cycle,
         "last_cycle_duration_ms": _scanner_state.last_cycle_duration_ms,
         "tickers_failed_last_cycle": _scanner_state.tickers_failed_last_cycle,
@@ -1628,6 +1725,8 @@ def create_app(testing: bool = False) -> FastAPI:
     app_instance.get("/version", response_model=VersionResponse)(version)
     app_instance.get("/debug/orderbook/{ticker}")(debug_orderbook)
     app_instance.get("/signals/live", response_model=SignalResponse)(get_live_signal)
+    # Legacy manual-watchlist endpoint kept for compatibility; primary UX uses
+    # internal scanner snapshots via /signals/top.
     app_instance.get("/signals/scan", response_model=list[SignalResponse])(scan_live_signals)
     app_instance.get("/signals/top")(get_top_signals)
     app_instance.get("/universe/nba", response_model=NBAUniverseResponse)(get_nba_universe)
@@ -1645,6 +1744,8 @@ def create_app(testing: bool = False) -> FastAPI:
     app_instance.get("/paper/summary")(get_paper_summary)
     app_instance.get("/paper/metrics")(get_paper_metrics)
     app_instance.get("/paper/metrics/outcomes")(get_paper_outcome_metrics)
+    app_instance.get("/paper/metrics/outcomes/audit")(get_paper_outcome_audit)
+    app_instance.get("/paper/metrics/outcomes/concentration")(get_paper_outcome_concentration)
     app_instance.get("/paper/config")(get_paper_config)
     app_instance.get("/paper/debug/intent/{intent_id}")(get_paper_debug_intent)
     app_instance.post("/paper/debug/force-fill")(post_paper_debug_force_fill)

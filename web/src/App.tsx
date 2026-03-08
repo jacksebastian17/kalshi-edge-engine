@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   api,
   PaperConfigResponse,
@@ -12,10 +12,9 @@ import {
   ScannerStatusResponse,
   SignalResponse,
 } from './lib/api'
-import { WatchlistInput } from './components/WatchlistInput'
-import { SignalsTable } from './components/SignalsTable'
 import { OrderbookDrawer } from './components/OrderbookDrawer'
-import { StatusBanner, APIErrorBanner, useHealthCheck } from './components/StatusBanner'
+import { SignalsTable } from './components/SignalsTable'
+import { APIErrorBanner, StatusBanner, useHealthCheck } from './components/StatusBanner'
 import { loadPersistedState, savePersistedState } from './lib/localStorage'
 
 const MAX_CHART_POINTS = 300
@@ -29,7 +28,6 @@ type EdgePoint = {
   gap: number | null
 }
 
-type UIMode = 'landing' | 'scanner' | 'manual'
 type ScannerState = 'stopped' | 'starting' | 'running' | 'stopping' | 'error'
 type PaperTradingState = 'stopped' | 'starting' | 'running' | 'stopping' | 'error'
 type PaperTab = 'summary' | 'intents' | 'fills' | 'positions' | 'config'
@@ -82,6 +80,27 @@ function failedCount(value: ScannerStatusResponse['tickers_failed_last_cycle'] |
     return value
   }
   return null
+}
+
+function formatUniverse(universe: string | null | undefined): string {
+  const normalized = universe?.trim().toUpperCase()
+  return normalized && normalized.length > 0 ? normalized : '—'
+}
+
+function UniverseBadge({ universe }: { universe: string | null | undefined }) {
+  const value = formatUniverse(universe)
+  const classes =
+    value === 'NBA'
+      ? 'bg-blue-900/60 text-blue-200 border-blue-700/50'
+      : value === 'CBB'
+        ? 'bg-amber-900/60 text-amber-200 border-amber-700/50'
+        : 'bg-zinc-800 text-zinc-300 border-white/10'
+
+  return (
+    <span className={`inline-block px-2 py-0.5 text-[11px] rounded border ${classes}`}>
+      {value}
+    </span>
+  )
 }
 
 function ScannerStatusStrip({
@@ -166,12 +185,7 @@ function MiniPnlChart({ points }: { points: PnlHistoryPoint[] }) {
 
 export default function App() {
   const [signals, setSignals] = useState<SignalResponse[]>([])
-  const [isLoading, setIsLoading] = useState(false)
-  const [watchlist, setWatchlist] = useState('')
-  const [pollInterval, setPollInterval] = useState(2000)
-  const [isPaused, setIsPaused] = useState(false)
-  const [uiMode, setUiMode] = useState<UIMode>('landing')
-  const [preferredMode, setPreferredMode] = useState<'scanner' | 'manual'>('scanner')
+  const [isSignalsLoading, setIsSignalsLoading] = useState(false)
   const [scannerState, setScannerState] = useState<ScannerState>('stopped')
   const [paperTradingState, setPaperTradingState] = useState<PaperTradingState>('stopped')
   const [activePaperTab, setActivePaperTab] = useState<PaperTab>('summary')
@@ -193,15 +207,11 @@ export default function App() {
   const [selectedSignal, setSelectedSignal] = useState<SignalResponse | null>(null)
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [apiError, setApiError] = useState<string | null>(null)
-  const [currentTickers, setCurrentTickers] = useState<string[]>([])
   const [chartByTicker, setChartByTicker] = useState<Record<string, EdgePoint[]>>({})
   const [lastUpdated, setLastUpdated] = useState<number | null>(null)
-  const [effectiveManualPollInterval, setEffectiveManualPollInterval] = useState(2000)
 
   const hasRestoredRef = useRef(false)
-  const consecutiveErrorsRef = useRef(0)
 
-  const manualInFlightRef = useRef(false)
   const statusInFlightRef = useRef(false)
   const topSignalsInFlightRef = useRef(false)
   const paperSummaryInFlightRef = useRef(false)
@@ -212,7 +222,6 @@ export default function App() {
   const paperConfigInFlightRef = useRef(false)
   const paperMetricsInFlightRef = useRef(false)
 
-  const manualPollAbortRef = useRef<AbortController | null>(null)
   const statusPollAbortRef = useRef<AbortController | null>(null)
   const topSignalsPollAbortRef = useRef<AbortController | null>(null)
   const paperSummaryAbortRef = useRef<AbortController | null>(null)
@@ -224,7 +233,6 @@ export default function App() {
   const paperMetricsAbortRef = useRef<AbortController | null>(null)
   const paperDebugAbortRef = useRef<AbortController | null>(null)
 
-  const manualIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const statusIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const topSignalsIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const paperSummaryIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -236,17 +244,6 @@ export default function App() {
   const paperMetricsIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const { isConnected, lastHeartbeat, error: healthError } = useHealthCheck(5000)
-
-  const clearManualPolling = useCallback(() => {
-    if (manualIntervalRef.current) {
-      clearInterval(manualIntervalRef.current)
-      manualIntervalRef.current = null
-    }
-    manualPollAbortRef.current?.abort()
-    manualPollAbortRef.current = null
-    manualInFlightRef.current = false
-    setIsLoading(false)
-  }, [])
 
   const clearScannerPolling = useCallback(() => {
     if (statusIntervalRef.current) {
@@ -263,6 +260,7 @@ export default function App() {
     topSignalsPollAbortRef.current = null
     statusInFlightRef.current = false
     topSignalsInFlightRef.current = false
+    setIsSignalsLoading(false)
   }, [])
 
   const clearPaperPolling = useCallback(() => {
@@ -369,107 +367,44 @@ export default function App() {
     hasRestoredRef.current = true
 
     const restored = loadPersistedState()
-    setWatchlist(restored.watchlist)
-    setPollInterval(restored.pollInterval)
-    setIsPaused(restored.isPaused)
     setSelectedTicker(restored.selectedTicker)
-    setPreferredMode(restored.preferredMode)
-    setUiMode('landing')
-
-    if (restored.watchlist.trim() && !restored.isPaused) {
-      const tickers = restored.watchlist
-        .split(',')
-        .map((t) => t.trim().toUpperCase())
-        .filter((t) => t.length > 0)
-
-      if (tickers.length > 0) {
-        setCurrentTickers(tickers)
-      }
-    }
+    setActivePaperTab(restored.activePaperTab)
   }, [])
 
   useEffect(() => {
     if (!hasRestoredRef.current) return
     savePersistedState({
-      watchlist,
-      pollInterval,
-      isPaused,
       selectedTicker,
-      preferredMode,
+      activePaperTab,
     })
-  }, [watchlist, pollInterval, isPaused, selectedTicker, preferredMode])
+  }, [selectedTicker, activePaperTab])
 
   useEffect(() => {
-    if (uiMode !== 'manual') {
-      clearManualPolling()
-      return
-    }
+    let active = true
 
-    if (isPaused || currentTickers.length === 0) {
-      clearManualPolling()
-      return
-    }
-
-    const pollManualSignals = async () => {
-      if (manualInFlightRef.current) {
-        return
-      }
-
-      manualInFlightRef.current = true
-      setIsLoading(true)
-      manualPollAbortRef.current?.abort()
-      const pollController = new AbortController()
-      manualPollAbortRef.current = pollController
-
+    const hydrateScannerState = async () => {
       try {
-        const response = await api.scanSignals(currentTickers, {
-          signal: pollController.signal,
-        })
-        updateSignals(response)
-        setApiError(null)
-        consecutiveErrorsRef.current = 0
-        setEffectiveManualPollInterval(pollInterval)
+        const status = await api.getScannerStatus()
+        if (!active) return
+
+        setScannerStatus(status)
+        setScannerState(status.enabled ? 'running' : 'stopped')
       } catch (err) {
-        if (pollController.signal.aborted) {
-          return
-        }
-
-        const message = err instanceof Error ? err.message : 'Failed to fetch signals'
+        if (!active) return
+        const message = err instanceof Error ? err.message : 'Failed to fetch scanner status'
         setApiError(message)
-
-        consecutiveErrorsRef.current += 1
-        const backoffIntervals = [2000, 5000, 10000]
-        const idx = Math.min(consecutiveErrorsRef.current - 1, backoffIntervals.length - 1)
-        setEffectiveManualPollInterval(backoffIntervals[idx])
-      } finally {
-        manualInFlightRef.current = false
-        setIsLoading(false)
       }
     }
 
-    pollManualSignals()
-    manualIntervalRef.current = setInterval(pollManualSignals, effectiveManualPollInterval)
+    hydrateScannerState()
 
     return () => {
-      clearManualPolling()
+      active = false
     }
-  }, [
-    uiMode,
-    isPaused,
-    currentTickers,
-    pollInterval,
-    effectiveManualPollInterval,
-    updateSignals,
-    clearManualPolling,
-  ])
+  }, [])
 
   useEffect(() => {
-    consecutiveErrorsRef.current = 0
-    setEffectiveManualPollInterval(pollInterval)
-  }, [currentTickers, pollInterval])
-
-  useEffect(() => {
-    if (uiMode !== 'scanner' || scannerState !== 'running') {
+    if (scannerState !== 'running') {
       clearScannerPolling()
       return
     }
@@ -511,6 +446,7 @@ export default function App() {
       topSignalsPollAbortRef.current?.abort()
       const controller = new AbortController()
       topSignalsPollAbortRef.current = controller
+      setIsSignalsLoading(true)
 
       try {
         const snapshot = await api.topSignals({ signal: controller.signal })
@@ -534,6 +470,7 @@ export default function App() {
       } finally {
         topSignalsPollAbortRef.current = null
         topSignalsInFlightRef.current = false
+        setIsSignalsLoading(false)
       }
     }
 
@@ -546,10 +483,10 @@ export default function App() {
       active = false
       clearScannerPolling()
     }
-  }, [uiMode, scannerState, updateSignals, clearScannerPolling])
+  }, [scannerState, updateSignals, clearScannerPolling])
 
   useEffect(() => {
-    if (uiMode !== 'scanner' || paperTradingState !== 'running') {
+    if (paperTradingState !== 'running') {
       clearPaperPolling()
       return
     }
@@ -745,10 +682,10 @@ export default function App() {
       active = false
       clearPaperPolling()
     }
-  }, [uiMode, paperTradingState, clearPaperPolling])
+  }, [paperTradingState, clearPaperPolling])
 
   useEffect(() => {
-    if (!selectedIntentId || uiMode !== 'scanner' || paperTradingState !== 'running') {
+    if (!selectedIntentId || paperTradingState !== 'running') {
       paperDebugAbortRef.current?.abort()
       paperDebugAbortRef.current = null
       setPaperIntentDebug(null)
@@ -782,27 +719,9 @@ export default function App() {
     return () => {
       controller.abort()
     }
-  }, [selectedIntentId, uiMode, paperTradingState])
-
-  const handleScan = useCallback((tickers: string[], watchlistStr: string) => {
-    setPreferredMode('manual')
-    setUiMode('manual')
-    setIsPaused(false)
-    setCurrentTickers(tickers)
-    setWatchlist(watchlistStr)
-    setSignals([])
-    setApiError(null)
-
-    if (selectedTicker && !tickers.includes(selectedTicker)) {
-      setSelectedTicker(null)
-      setSelectedSignal(null)
-      setDrawerOpen(false)
-    }
-  }, [selectedTicker])
+  }, [selectedIntentId, paperTradingState])
 
   const handleStartScanner = useCallback(async () => {
-    setPreferredMode('scanner')
-    setUiMode('scanner')
     if (scannerState === 'running' || scannerState === 'starting' || scannerState === 'stopping') {
       return
     }
@@ -838,9 +757,7 @@ export default function App() {
 
     try {
       const response = await api.startPaperTrading()
-      if (response.reason === 'already_running') {
-        // Already running, just show running state
-      } else if (response.reason === 'not_available') {
+      if (response.reason === 'not_available') {
         setApiError('Paper trading not available (not enabled or not initialized)')
         setPaperTradingState('stopped')
         return
@@ -862,10 +779,7 @@ export default function App() {
     setApiError(null)
 
     try {
-      const response = await api.stopPaperTrading()
-      if (response.reason === 'not_running') {
-        // Not running, just show stopped state
-      }
+      await api.stopPaperTrading()
       setPaperTradingState('stopped')
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to stop paper trading'
@@ -873,20 +787,6 @@ export default function App() {
       setPaperTradingState('error')
     }
   }, [paperTradingState, clearPaperPolling])
-
-  const handleSwitchToManual = useCallback(() => {
-    clearScannerPolling()
-    clearPaperPolling()
-    setSelectedIntentId(null)
-    setPreferredMode('manual')
-    setUiMode('manual')
-  }, [clearScannerPolling, clearPaperPolling])
-
-  const handleSwitchToScanner = useCallback(() => {
-    clearManualPolling()
-    setPreferredMode('scanner')
-    setUiMode('scanner')
-  }, [clearManualPolling])
 
   const handleRowClick = useCallback((signal: SignalResponse) => {
     setSelectedTicker(signal.ticker)
@@ -899,6 +799,22 @@ export default function App() {
     const delta = a.fill_ts_ms - b.fill_ts_ms
     return paperFillSortDirection === 'desc' ? -delta : delta
   })
+  const discoveredUniverseEntries = Object.entries(scannerStatus?.discovered_universe_counts ?? {})
+  const summaryIntentsByUniverse = Object.entries(
+    paperSummary?.entry_intents_created_by_universe ?? {}
+  )
+  const summaryFillsByUniverse = Object.entries(
+    paperSummary?.entry_fills_by_universe ?? {}
+  )
+  const showSummaryUniverseBreakdown =
+    summaryIntentsByUniverse.length > 0 || summaryFillsByUniverse.length > 0
+  const debugIntentUniverse =
+    paperIntentDebug?.intent &&
+    typeof paperIntentDebug.intent === 'object' &&
+    'universe' in paperIntentDebug.intent
+      ? (paperIntentDebug.intent.universe as string | null | undefined)
+      : undefined
+
   const paperTabs: { key: PaperTab; label: string }[] = [
     { key: 'summary', label: 'Summary' },
     { key: 'intents', label: 'Intents' },
@@ -906,9 +822,11 @@ export default function App() {
     { key: 'positions', label: 'Positions' },
     { key: 'config', label: 'Config' },
   ]
+
   const handleIntentDebugOpen = (intentId: string) => {
     setSelectedIntentId(intentId)
   }
+
   const handleFillIntentDebugOpen = (intentId: string) => {
     setActivePaperTab('intents')
     setSelectedIntentId(intentId)
@@ -917,9 +835,9 @@ export default function App() {
   return (
     <div className="h-screen w-screen bg-zinc-950 text-zinc-100 flex flex-col font-mono">
       <div className="bg-zinc-900/60 border-b border-white/10 px-6 py-4">
-        <h1 className="text-2xl font-bold text-zinc-100">Kalshi Edge Dashboard</h1>
+        <h1 className="text-2xl font-bold text-zinc-100">Kalshi Edge Bot Dashboard</h1>
         <p className="text-xs text-zinc-400 mt-1">
-          Real-time signal scanning & orderbook inspection
+          Automated market scanning, paper trading, and observability
         </p>
       </div>
 
@@ -927,426 +845,407 @@ export default function App() {
       <APIErrorBanner show={!!(healthError || apiError)} message={healthError || apiError || ''} />
 
       <div className="flex-1 flex flex-col overflow-y-auto">
-        {uiMode === 'landing' && (
-          <div className="flex-1 flex items-center justify-center px-6">
-            <div className="w-full max-w-2xl border border-white/10 bg-zinc-900/50 rounded p-8 space-y-6">
-              <div>
-                <h2 className="text-2xl font-semibold text-zinc-100">Mode Select</h2>
-                <p className="text-sm text-zinc-400 mt-2">
-                  Choose scanner mode for NBA market snapshots or manual watchlist mode.
-                </p>
-              </div>
-              <div className="flex flex-col sm:flex-row gap-3">
+        <div className="border-b border-white/10 bg-zinc-900/60 p-6 space-y-4">
+          <div>
+            <h2 className="text-lg font-semibold text-zinc-100">Automated Scanner Engine</h2>
+            <p className="text-xs text-zinc-400 mt-1">
+              Internal bot scanner status every 2s and top-signal snapshot every 10s
+            </p>
+          </div>
+
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <div className="text-xs text-zinc-300">
+              State:{' '}
+              <span className="font-semibold text-zinc-100 uppercase tracking-wide">
+                {scannerState}
+              </span>
+            </div>
+
+            <div className="flex gap-2">
+              {(scannerState === 'stopped' || scannerState === 'error') && (
                 <button
                   onClick={handleStartScanner}
-                  className={`px-4 py-3 rounded text-sm font-semibold transition ${
-                    preferredMode === 'scanner'
-                      ? 'bg-emerald-700 hover:bg-emerald-600 text-white'
-                      : 'bg-zinc-800 hover:bg-zinc-700 border border-white/10 text-zinc-100'
-                  }`}
+                  className="px-4 py-2 bg-emerald-700 hover:bg-emerald-600 border border-emerald-500/30 rounded text-sm text-white transition"
                 >
-                  Start NBA Scanner
+                  Start Scanner
                 </button>
+              )}
+
+              {(scannerState === 'running' || scannerState === 'starting' || scannerState === 'stopping') && (
                 <button
-                  onClick={handleSwitchToManual}
-                  className={`px-4 py-3 rounded text-sm transition ${
-                    preferredMode === 'manual'
-                      ? 'bg-zinc-200 text-zinc-900 hover:bg-white'
-                      : 'bg-zinc-800 hover:bg-zinc-700 border border-white/10 text-zinc-100'
-                  }`}
+                  onClick={handleStopScanner}
+                  disabled={scannerState === 'stopping'}
+                  className="px-4 py-2 bg-red-900/50 hover:bg-red-900/70 disabled:bg-zinc-700 border border-red-700/40 rounded text-sm text-red-100 transition"
                 >
-                  Manual Watchlist Mode
+                  {scannerState === 'stopping' ? 'Stopping...' : 'Stop Scanner'}
                 </button>
-              </div>
+              )}
             </div>
           </div>
-        )}
 
-        {uiMode === 'scanner' && (
-          <>
-            <div className="border-b border-white/10 bg-zinc-900/60 p-6 space-y-4">
-              <div>
-                <h2 className="text-lg font-semibold text-zinc-100">NBA Scanner</h2>
-                <p className="text-xs text-zinc-400 mt-1">
-                  Polling scanner status every 2s and top signals every 10s
-                </p>
-              </div>
+          <ScannerStatusStrip status={scannerStatus} />
 
-              <div className="flex items-center justify-between gap-3 flex-wrap">
-                <div className="text-xs text-zinc-300">
-                  State:{' '}
-                  <span className="font-semibold text-zinc-100 uppercase tracking-wide">
-                    {scannerState}
+          <div className="text-xs text-zinc-400 flex flex-wrap items-center gap-3">
+            <span>
+              Enabled universes:{' '}
+              <span className="text-zinc-200">
+                {scannerStatus?.enabled_universes?.length
+                  ? scannerStatus.enabled_universes.join(', ')
+                  : '—'}
+              </span>
+            </span>
+            <span className="text-zinc-500">|</span>
+            <span className="flex items-center gap-1.5">
+              <span>Discovered:</span>
+              {discoveredUniverseEntries.length > 0 ? (
+                discoveredUniverseEntries.map(([universe, count]) => (
+                  <span key={universe} className="px-1.5 py-0.5 rounded border border-white/10 bg-zinc-900/50 text-zinc-300 tabular-nums">
+                    {formatUniverse(universe)} {count}
                   </span>
-                </div>
-
-                <div className="flex gap-2">
-                  {(scannerState === 'stopped' || scannerState === 'error') && (
-                    <button
-                      onClick={handleStartScanner}
-                      className="px-4 py-2 bg-emerald-700 hover:bg-emerald-600 border border-emerald-500/30 rounded text-sm text-white transition"
-                    >
-                      Start
-                    </button>
-                  )}
-
-                  {(scannerState === 'running' || scannerState === 'starting' || scannerState === 'stopping') && (
-                    <button
-                      onClick={handleStopScanner}
-                      disabled={scannerState === 'stopping'}
-                      className="px-4 py-2 bg-red-900/50 hover:bg-red-900/70 disabled:bg-zinc-700 border border-red-700/40 rounded text-sm text-red-100 transition"
-                    >
-                      {scannerState === 'stopping' ? 'Stopping...' : 'Stop'}
-                    </button>
-                  )}
-
-                  <button
-                    onClick={handleSwitchToManual}
-                    className="px-4 py-2 bg-zinc-800 hover:bg-zinc-700 border border-white/10 rounded text-sm text-zinc-100 transition"
-                  >
-                    Switch to Manual
-                  </button>
-                </div>
-              </div>
-
-              <ScannerStatusStrip status={scannerStatus} />
-
-              {scannerInfoMessage && (
-                <p className="text-xs text-amber-300">{scannerInfoMessage}</p>
+                ))
+              ) : (
+                <span className="text-zinc-200">—</span>
               )}
+            </span>
+          </div>
+
+          {scannerInfoMessage && (
+            <p className="text-xs text-amber-300">{scannerInfoMessage}</p>
+          )}
+        </div>
+
+        <div className="border-b border-white/10 bg-zinc-900/40 p-6 space-y-3">
+          <div>
+            <h3 className="text-sm font-semibold text-zinc-100">Paper Trading</h3>
+            <p className="text-xs text-zinc-400 mt-1">
+              Start/stop automated paper execution simulation and lifecycle tracking
+            </p>
+          </div>
+
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <div className="text-xs text-zinc-300">
+              State:{' '}
+              <span className="font-semibold text-zinc-100 uppercase tracking-wide">
+                {paperTradingState}
+              </span>
             </div>
 
-            <div className="border-b border-white/10 bg-zinc-900/40 p-6 space-y-3">
-              <div>
-                <h3 className="text-sm font-semibold text-zinc-100">Paper Trading</h3>
-                <p className="text-xs text-zinc-400 mt-1">
-                  Start/stop automated order simulation and filled order tracking
-                </p>
-              </div>
-
-              <div className="flex items-center justify-between gap-3 flex-wrap">
-                <div className="text-xs text-zinc-300">
-                  State:{' '}
-                  <span className="font-semibold text-zinc-100 uppercase tracking-wide">
-                    {paperTradingState}
-                  </span>
-                </div>
-
-                <div className="flex gap-2">
-                  {(paperTradingState === 'stopped' || paperTradingState === 'error') && (
-                    <button
-                      onClick={handleStartPaperTrading}
-                      className="px-4 py-2 bg-blue-700 hover:bg-blue-600 border border-blue-500/30 rounded text-sm text-white transition"
-                    >
-                      Start Paper Trading
-                    </button>
-                  )}
-
-                  {(paperTradingState === 'running' || paperTradingState === 'starting' || paperTradingState === 'stopping') && (
-                    <button
-                      onClick={handleStopPaperTrading}
-                      disabled={paperTradingState === 'stopping'}
-                      className="px-4 py-2 bg-red-900/50 hover:bg-red-900/70 disabled:bg-zinc-700 border border-red-700/40 rounded text-sm text-red-100 transition"
-                    >
-                      {paperTradingState === 'stopping' ? 'Stopping...' : 'Stop Paper Trading'}
-                    </button>
-                  )}
-                </div>
-              </div>
-            </div>
-
-            <div className="border-b border-white/10 bg-zinc-900/30 p-6 space-y-4">
-              <div className="flex items-center justify-between gap-3 flex-wrap">
-                <div>
-                  <h3 className="text-sm font-semibold text-zinc-100">Paper</h3>
-                  <p className="text-xs text-zinc-400 mt-1">Live paper observability (polling while paper engine is running)</p>
-                </div>
-                {paperMetrics && (
-                  <div className="text-xs text-zinc-300 flex items-center gap-4">
-                    <span>Fill rate: <span className="tabular-nums text-zinc-100">{(paperMetrics.fill_rate * 100).toFixed(1)}%</span></span>
-                    <span>Avg fill: <span className="tabular-nums text-zinc-100">{paperMetrics.avg_time_to_fill_seconds == null ? '—' : `${paperMetrics.avg_time_to_fill_seconds.toFixed(1)}s`}</span></span>
-                    <span>Fills 1h: <span className="tabular-nums text-zinc-100">{paperMetrics.fills_last_1h}</span></span>
-                    <span>Intents 1h: <span className="tabular-nums text-zinc-100">{paperMetrics.intents_last_1h}</span></span>
-                  </div>
-                )}
-              </div>
-
-              <div className="flex gap-2 flex-wrap">
-                {paperTabs.map((tab) => (
-                  <button
-                    key={tab.key}
-                    onClick={() => setActivePaperTab(tab.key)}
-                    className={`px-3 py-1.5 rounded text-xs border transition ${
-                      activePaperTab === tab.key
-                        ? 'bg-zinc-200 text-zinc-900 border-zinc-100'
-                        : 'bg-zinc-800 text-zinc-100 border-white/10 hover:bg-zinc-700'
-                    }`}
-                  >
-                    {tab.label}
-                  </button>
-                ))}
-              </div>
-
-              {activePaperTab === 'summary' && (
-                <div className="space-y-4">
-                  <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 text-xs">
-                    <div className="border border-white/10 rounded p-3 bg-zinc-900/40">
-                      <p className="text-zinc-500">Total Intents</p>
-                      <p className="text-zinc-100 tabular-nums mt-1">{formatMetric(paperSummary?.total_intents_created)}</p>
-                    </div>
-                    <div className="border border-white/10 rounded p-3 bg-zinc-900/40">
-                      <p className="text-zinc-500">Total Fills</p>
-                      <p className="text-zinc-100 tabular-nums mt-1">{formatMetric(paperSummary?.total_fills)}</p>
-                    </div>
-                    <div className="border border-white/10 rounded p-3 bg-zinc-900/40">
-                      <p className="text-zinc-500">Realized PnL</p>
-                      <p className="text-zinc-100 tabular-nums mt-1">{formatCurrencyCents(paperPnlSnapshot?.realized_pnl_cents ?? paperSummary?.realized_pnl_cents)}</p>
-                    </div>
-                    <div className="border border-white/10 rounded p-3 bg-zinc-900/40">
-                      <p className="text-zinc-500">Unrealized PnL</p>
-                      <p className="text-zinc-100 tabular-nums mt-1">{formatCurrencyCents(paperPnlSnapshot?.unrealized_pnl_cents ?? paperSummary?.unrealized_pnl_cents)}</p>
-                    </div>
-                    <div className="border border-white/10 rounded p-3 bg-zinc-900/40">
-                      <p className="text-zinc-500">Total PnL</p>
-                      <p className="text-zinc-100 tabular-nums mt-1">{formatCurrencyCents(paperPnlSnapshot?.total_pnl_cents ?? paperSummary?.total_pnl_cents)}</p>
-                    </div>
-                    <div className="border border-white/10 rounded p-3 bg-zinc-900/40">
-                      <p className="text-zinc-500">Open Pos / Orders</p>
-                      <p className="text-zinc-100 tabular-nums mt-1">
-                        {formatMetric(paperPnlSnapshot?.open_positions_count)} / {formatMetric(paperPnlSnapshot?.open_orders_count)}
-                      </p>
-                    </div>
-                  </div>
-
-                  <MiniPnlChart points={paperPnlHistory} />
-
-                  <div className="border border-white/10 rounded bg-zinc-900/40 overflow-hidden">
-                    <div className="px-3 py-2 border-b border-white/10 text-xs text-zinc-400">Recent fills</div>
-                    <div className="max-h-56 overflow-auto">
-                      <table className="w-full text-xs">
-                        <thead className="bg-zinc-900 sticky top-0">
-                          <tr className="text-zinc-500">
-                            <th className="text-left px-3 py-2">Time</th>
-                            <th className="text-left px-3 py-2">Ticker</th>
-                            <th className="text-left px-3 py-2">Side</th>
-                            <th className="text-left px-3 py-2">Price</th>
-                            <th className="text-left px-3 py-2">Size</th>
-                            <th className="text-left px-3 py-2">Intent</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {sortedPaperFills.slice(0, 20).map((fill) => (
-                            <tr key={fill.id} className="border-t border-white/5 hover:bg-white/5">
-                              <td className="px-3 py-2 tabular-nums">{formatTimestamp(fill.fill_ts_ms)}</td>
-                              <td className="px-3 py-2">{fill.ticker}</td>
-                              <td className="px-3 py-2">{fill.side}</td>
-                              <td className="px-3 py-2 tabular-nums">{fill.fill_price_cents.toFixed(2)}</td>
-                              <td className="px-3 py-2 tabular-nums">{fill.fill_size}</td>
-                              <td className="px-3 py-2">
-                                <button
-                                  onClick={() => handleFillIntentDebugOpen(fill.intent_id)}
-                                  className="text-blue-300 hover:text-blue-200"
-                                >
-                                  {fill.intent_id}
-                                </button>
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  </div>
-                </div>
+            <div className="flex gap-2">
+              {(paperTradingState === 'stopped' || paperTradingState === 'error') && (
+                <button
+                  onClick={handleStartPaperTrading}
+                  className="px-4 py-2 bg-blue-700 hover:bg-blue-600 border border-blue-500/30 rounded text-sm text-white transition"
+                >
+                  Start Paper Trading
+                </button>
               )}
 
-              {activePaperTab === 'intents' && (
-                <div className="border border-white/10 rounded bg-zinc-900/40 overflow-hidden">
-                  <div className="px-3 py-2 border-b border-white/10 text-xs text-zinc-400">Open intents</div>
-                  <div className="max-h-64 overflow-auto">
-                    <table className="w-full text-xs">
-                      <thead className="bg-zinc-900 sticky top-0">
-                        <tr className="text-zinc-500">
-                          <th className="text-left px-3 py-2">Ticker</th>
-                          <th className="text-left px-3 py-2">Side</th>
-                          <th className="text-left px-3 py-2">Price</th>
-                          <th className="text-left px-3 py-2">Queue Ahead</th>
-                          <th className="text-left px-3 py-2">Age</th>
-                          <th className="text-left px-3 py-2">Status</th>
-                          <th className="text-left px-3 py-2">Intent</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {paperOpenIntents.map((intent) => (
-                          <tr
-                            key={intent.id}
-                            className="border-t border-white/5 hover:bg-white/5 cursor-pointer"
-                            onClick={() => handleIntentDebugOpen(intent.id)}
-                          >
-                            <td className="px-3 py-2">{intent.ticker}</td>
-                            <td className="px-3 py-2">{intent.side}</td>
-                            <td className="px-3 py-2 tabular-nums">{intent.quote_price_cents.toFixed(2)}</td>
-                            <td className="px-3 py-2 tabular-nums">{formatMetric(intent.queue_ahead_contracts)}</td>
-                            <td className="px-3 py-2 tabular-nums">{formatAgeMs(intent.created_ts_ms)}</td>
-                            <td className="px-3 py-2">{intent.status}</td>
-                            <td className="px-3 py-2 text-blue-300">{intent.id}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                </div>
-              )}
-
-              {activePaperTab === 'fills' && (
-                <div className="border border-white/10 rounded bg-zinc-900/40 overflow-hidden">
-                  <div className="px-3 py-2 border-b border-white/10 text-xs text-zinc-400 flex items-center justify-between">
-                    <span>Recent fills</span>
-                    <button
-                      onClick={() =>
-                        setPaperFillSortDirection((prev) => (prev === 'desc' ? 'asc' : 'desc'))
-                      }
-                      className="text-zinc-300 hover:text-zinc-100"
-                    >
-                      Time: {paperFillSortDirection.toUpperCase()}
-                    </button>
-                  </div>
-                  <div className="max-h-64 overflow-auto">
-                    <table className="w-full text-xs">
-                      <thead className="bg-zinc-900 sticky top-0">
-                        <tr className="text-zinc-500">
-                          <th className="text-left px-3 py-2">Time</th>
-                          <th className="text-left px-3 py-2">Ticker</th>
-                          <th className="text-left px-3 py-2">Side</th>
-                          <th className="text-left px-3 py-2">Price</th>
-                          <th className="text-left px-3 py-2">Size</th>
-                          <th className="text-left px-3 py-2">Queue@Fill</th>
-                          <th className="text-left px-3 py-2">Intent</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {sortedPaperFills.map((fill) => (
-                          <tr key={fill.id} className="border-t border-white/5 hover:bg-white/5">
-                            <td className="px-3 py-2 tabular-nums">{formatTimestamp(fill.fill_ts_ms)}</td>
-                            <td className="px-3 py-2">{fill.ticker}</td>
-                            <td className="px-3 py-2">{fill.side}</td>
-                            <td className="px-3 py-2 tabular-nums">{fill.fill_price_cents.toFixed(2)}</td>
-                            <td className="px-3 py-2 tabular-nums">{fill.fill_size}</td>
-                            <td className="px-3 py-2 tabular-nums">{formatMetric(fill.queue_ahead_at_fill)}</td>
-                            <td className="px-3 py-2">
-                              <button
-                                onClick={() => handleFillIntentDebugOpen(fill.intent_id)}
-                                className="text-blue-300 hover:text-blue-200"
-                              >
-                                {fill.intent_id}
-                              </button>
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                </div>
-              )}
-
-              {activePaperTab === 'positions' && (
-                <div className="border border-white/10 rounded bg-zinc-900/40 overflow-hidden">
-                  <div className="px-3 py-2 border-b border-white/10 text-xs text-zinc-400">Positions</div>
-                  <div className="max-h-64 overflow-auto">
-                    <table className="w-full text-xs">
-                      <thead className="bg-zinc-900 sticky top-0">
-                        <tr className="text-zinc-500">
-                          <th className="text-left px-3 py-2">Ticker</th>
-                          <th className="text-left px-3 py-2">Side</th>
-                          <th className="text-left px-3 py-2">Net Contracts</th>
-                          <th className="text-left px-3 py-2">Avg Entry</th>
-                          <th className="text-left px-3 py-2">Realized PnL</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {paperPositions.map((position) => (
-                          <tr key={`${position.ticker}-${position.side}`} className="border-t border-white/5">
-                            <td className="px-3 py-2">{position.ticker}</td>
-                            <td className="px-3 py-2">{position.side}</td>
-                            <td className="px-3 py-2 tabular-nums">{position.net_contracts}</td>
-                            <td className="px-3 py-2 tabular-nums">{position.avg_entry_price_cents.toFixed(2)}</td>
-                            <td className="px-3 py-2 tabular-nums">{formatCurrencyCents(position.realized_pnl_cents)}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                </div>
-              )}
-
-              {activePaperTab === 'config' && (
-                <div className="space-y-3">
-                  {paperConfig && (
-                    <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
-                      <div className="border border-white/10 rounded p-3 bg-zinc-900/40">
-                        <p className="text-zinc-500">Min Edge</p>
-                        <p className="text-zinc-100 tabular-nums mt-1">{paperConfig.min_edge_cents}</p>
-                      </div>
-                      <div className="border border-white/10 rounded p-3 bg-zinc-900/40">
-                        <p className="text-zinc-500">Fill Horizon s</p>
-                        <p className="text-zinc-100 tabular-nums mt-1">{paperConfig.fill_horizon_seconds}</p>
-                      </div>
-                      <div className="border border-white/10 rounded p-3 bg-zinc-900/40">
-                        <p className="text-zinc-500">Max Open Orders</p>
-                        <p className="text-zinc-100 tabular-nums mt-1">{paperConfig.max_open_orders}</p>
-                      </div>
-                      <div className="border border-white/10 rounded p-3 bg-zinc-900/40">
-                        <p className="text-zinc-500">Max Pos / Ticker</p>
-                        <p className="text-zinc-100 tabular-nums mt-1">{paperConfig.max_pos_per_ticker}</p>
-                      </div>
-                    </div>
-                  )}
-
-                  <pre className="border border-white/10 rounded bg-zinc-900/40 p-3 text-xs text-zinc-300 overflow-auto max-h-72">
-                    {JSON.stringify(paperConfig, null, 2)}
-                  </pre>
-                </div>
+              {(paperTradingState === 'running' || paperTradingState === 'starting' || paperTradingState === 'stopping') && (
+                <button
+                  onClick={handleStopPaperTrading}
+                  disabled={paperTradingState === 'stopping'}
+                  className="px-4 py-2 bg-red-900/50 hover:bg-red-900/70 disabled:bg-zinc-700 border border-red-700/40 rounded text-sm text-red-100 transition"
+                >
+                  {paperTradingState === 'stopping' ? 'Stopping...' : 'Stop Paper Trading'}
+                </button>
               )}
             </div>
+          </div>
+        </div>
 
-            <SignalsTable
-              signals={signals}
-              isLoading={isLoading || scannerState === 'starting'}
-              lastUpdated={lastUpdated}
-              onRowClick={handleRowClick}
-            />
-          </>
-        )}
+        <div className="border-b border-white/10 bg-zinc-900/30 p-6 space-y-4">
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <div>
+              <h3 className="text-sm font-semibold text-zinc-100">Paper Telemetry</h3>
+              <p className="text-xs text-zinc-400 mt-1">Live paper observability while the paper engine is running</p>
+            </div>
+            {paperMetrics && (
+              <div className="text-xs text-zinc-300 flex items-center gap-4">
+                <span>Fill rate: <span className="tabular-nums text-zinc-100">{(paperMetrics.fill_rate * 100).toFixed(1)}%</span></span>
+                <span>Avg fill: <span className="tabular-nums text-zinc-100">{paperMetrics.avg_time_to_fill_seconds == null ? '—' : `${paperMetrics.avg_time_to_fill_seconds.toFixed(1)}s`}</span></span>
+                <span>Fills 1h: <span className="tabular-nums text-zinc-100">{paperMetrics.fills_last_1h}</span></span>
+                <span>Intents 1h: <span className="tabular-nums text-zinc-100">{paperMetrics.intents_last_1h}</span></span>
+              </div>
+            )}
+          </div>
 
-        {uiMode === 'manual' && (
-          <>
-            <WatchlistInput
-              watchlist={watchlist}
-              onWatchlistChange={setWatchlist}
-              onScan={handleScan}
-              isLoading={isLoading}
-              pollInterval={pollInterval}
-              onPollIntervalChange={setPollInterval}
-              isPaused={isPaused}
-              onPausedChange={setIsPaused}
-            />
-
-            <div className="border-b border-white/10 bg-zinc-900/40 px-6 py-3 flex items-center justify-end">
+          <div className="flex gap-2 flex-wrap">
+            {paperTabs.map((tab) => (
               <button
-                onClick={handleSwitchToScanner}
-                className="px-4 py-2 bg-zinc-800 hover:bg-zinc-700 border border-white/10 rounded text-sm text-zinc-100 transition"
+                key={tab.key}
+                onClick={() => setActivePaperTab(tab.key)}
+                className={`px-3 py-1.5 rounded text-xs border transition ${
+                  activePaperTab === tab.key
+                    ? 'bg-zinc-200 text-zinc-900 border-zinc-100'
+                    : 'bg-zinc-800 text-zinc-100 border-white/10 hover:bg-zinc-700'
+                }`}
               >
-                Switch to Scanner
+                {tab.label}
               </button>
-            </div>
+            ))}
+          </div>
 
-            <SignalsTable
-              signals={signals}
-              isLoading={isLoading}
-              lastUpdated={lastUpdated}
-              onRowClick={handleRowClick}
-            />
-          </>
-        )}
+          {activePaperTab === 'summary' && (
+            <div className="space-y-4">
+              <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 text-xs">
+                <div className="border border-white/10 rounded p-3 bg-zinc-900/40">
+                  <p className="text-zinc-500">Total Intents</p>
+                  <p className="text-zinc-100 tabular-nums mt-1">{formatMetric(paperSummary?.total_intents_created)}</p>
+                </div>
+                <div className="border border-white/10 rounded p-3 bg-zinc-900/40">
+                  <p className="text-zinc-500">Total Fills</p>
+                  <p className="text-zinc-100 tabular-nums mt-1">{formatMetric(paperSummary?.total_fills)}</p>
+                </div>
+                <div className="border border-white/10 rounded p-3 bg-zinc-900/40">
+                  <p className="text-zinc-500">Realized PnL</p>
+                  <p className="text-zinc-100 tabular-nums mt-1">{formatCurrencyCents(paperPnlSnapshot?.realized_pnl_cents ?? paperSummary?.realized_pnl_cents)}</p>
+                </div>
+                <div className="border border-white/10 rounded p-3 bg-zinc-900/40">
+                  <p className="text-zinc-500">Unrealized PnL</p>
+                  <p className="text-zinc-100 tabular-nums mt-1">{formatCurrencyCents(paperPnlSnapshot?.unrealized_pnl_cents ?? paperSummary?.unrealized_pnl_cents)}</p>
+                </div>
+                <div className="border border-white/10 rounded p-3 bg-zinc-900/40">
+                  <p className="text-zinc-500">Total PnL</p>
+                  <p className="text-zinc-100 tabular-nums mt-1">{formatCurrencyCents(paperPnlSnapshot?.total_pnl_cents ?? paperSummary?.total_pnl_cents)}</p>
+                </div>
+                <div className="border border-white/10 rounded p-3 bg-zinc-900/40">
+                  <p className="text-zinc-500">Open Pos / Orders</p>
+                  <p className="text-zinc-100 tabular-nums mt-1">
+                    {formatMetric(paperPnlSnapshot?.open_positions_count)} / {formatMetric(paperPnlSnapshot?.open_orders_count)}
+                  </p>
+                </div>
+              </div>
+
+              <MiniPnlChart points={paperPnlHistory} />
+
+              {showSummaryUniverseBreakdown && (
+                <div className="border border-white/10 rounded bg-zinc-900/40 p-3 text-xs space-y-2">
+                  <p className="text-zinc-400">Universe breakdown</p>
+                  {summaryIntentsByUniverse.length > 0 && (
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-zinc-500">Entry intents:</span>
+                      {summaryIntentsByUniverse.map(([universe, count]) => (
+                        <span key={`intent-${universe}`} className="px-1.5 py-0.5 rounded border border-white/10 bg-zinc-900/50 text-zinc-300 tabular-nums">
+                          {formatUniverse(universe)} {count}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  {summaryFillsByUniverse.length > 0 && (
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-zinc-500">Entry fills:</span>
+                      {summaryFillsByUniverse.map(([universe, count]) => (
+                        <span key={`fill-${universe}`} className="px-1.5 py-0.5 rounded border border-white/10 bg-zinc-900/50 text-zinc-300 tabular-nums">
+                          {formatUniverse(universe)} {count}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              <div className="border border-white/10 rounded bg-zinc-900/40 overflow-hidden">
+                <div className="px-3 py-2 border-b border-white/10 text-xs text-zinc-400">Recent fills</div>
+                <div className="max-h-56 overflow-auto">
+                  <table className="w-full text-xs">
+                    <thead className="bg-zinc-900 sticky top-0">
+                      <tr className="text-zinc-500">
+                        <th className="text-left px-3 py-2">Time</th>
+                        <th className="text-left px-3 py-2">Ticker</th>
+                        <th className="text-left px-3 py-2">Universe</th>
+                        <th className="text-left px-3 py-2">Side</th>
+                        <th className="text-left px-3 py-2">Price</th>
+                        <th className="text-left px-3 py-2">Size</th>
+                        <th className="text-left px-3 py-2">Intent</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {sortedPaperFills.slice(0, 20).map((fill) => (
+                        <tr key={fill.id} className="border-t border-white/5 hover:bg-white/5">
+                          <td className="px-3 py-2 tabular-nums">{formatTimestamp(fill.fill_ts_ms)}</td>
+                          <td className="px-3 py-2">{fill.ticker}</td>
+                          <td className="px-3 py-2"><UniverseBadge universe={fill.universe} /></td>
+                          <td className="px-3 py-2">{fill.side}</td>
+                          <td className="px-3 py-2 tabular-nums">{fill.fill_price_cents.toFixed(2)}</td>
+                          <td className="px-3 py-2 tabular-nums">{fill.fill_size}</td>
+                          <td className="px-3 py-2">
+                            <button
+                              onClick={() => handleFillIntentDebugOpen(fill.intent_id)}
+                              className="text-blue-300 hover:text-blue-200"
+                            >
+                              {fill.intent_id}
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {activePaperTab === 'intents' && (
+            <div className="border border-white/10 rounded bg-zinc-900/40 overflow-hidden">
+              <div className="px-3 py-2 border-b border-white/10 text-xs text-zinc-400">Open intents</div>
+              <div className="max-h-64 overflow-auto">
+                <table className="w-full text-xs">
+                  <thead className="bg-zinc-900 sticky top-0">
+                    <tr className="text-zinc-500">
+                      <th className="text-left px-3 py-2">Ticker</th>
+                        <th className="text-left px-3 py-2">Universe</th>
+                      <th className="text-left px-3 py-2">Side</th>
+                      <th className="text-left px-3 py-2">Price</th>
+                      <th className="text-left px-3 py-2">Queue Ahead</th>
+                      <th className="text-left px-3 py-2">Age</th>
+                      <th className="text-left px-3 py-2">Status</th>
+                      <th className="text-left px-3 py-2">Intent</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {paperOpenIntents.map((intent) => (
+                      <tr
+                        key={intent.id}
+                        className="border-t border-white/5 hover:bg-white/5 cursor-pointer"
+                        onClick={() => handleIntentDebugOpen(intent.id)}
+                      >
+                        <td className="px-3 py-2">{intent.ticker}</td>
+                        <td className="px-3 py-2"><UniverseBadge universe={intent.universe} /></td>
+                        <td className="px-3 py-2">{intent.side}</td>
+                        <td className="px-3 py-2 tabular-nums">{intent.quote_price_cents.toFixed(2)}</td>
+                        <td className="px-3 py-2 tabular-nums">{formatMetric(intent.queue_ahead_contracts)}</td>
+                        <td className="px-3 py-2 tabular-nums">{formatAgeMs(intent.created_ts_ms)}</td>
+                        <td className="px-3 py-2">{intent.status}</td>
+                        <td className="px-3 py-2 text-blue-300">{intent.id}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {activePaperTab === 'fills' && (
+            <div className="border border-white/10 rounded bg-zinc-900/40 overflow-hidden">
+              <div className="px-3 py-2 border-b border-white/10 text-xs text-zinc-400 flex items-center justify-between">
+                <span>Recent fills</span>
+                <button
+                  onClick={() =>
+                    setPaperFillSortDirection((prev) => (prev === 'desc' ? 'asc' : 'desc'))
+                  }
+                  className="text-zinc-300 hover:text-zinc-100"
+                >
+                  Time: {paperFillSortDirection.toUpperCase()}
+                </button>
+              </div>
+              <div className="max-h-64 overflow-auto">
+                <table className="w-full text-xs">
+                  <thead className="bg-zinc-900 sticky top-0">
+                    <tr className="text-zinc-500">
+                      <th className="text-left px-3 py-2">Time</th>
+                      <th className="text-left px-3 py-2">Ticker</th>
+                      <th className="text-left px-3 py-2">Universe</th>
+                      <th className="text-left px-3 py-2">Side</th>
+                      <th className="text-left px-3 py-2">Price</th>
+                      <th className="text-left px-3 py-2">Size</th>
+                      <th className="text-left px-3 py-2">Queue@Fill</th>
+                      <th className="text-left px-3 py-2">Intent</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {sortedPaperFills.map((fill) => (
+                      <tr key={fill.id} className="border-t border-white/5 hover:bg-white/5">
+                        <td className="px-3 py-2 tabular-nums">{formatTimestamp(fill.fill_ts_ms)}</td>
+                        <td className="px-3 py-2">{fill.ticker}</td>
+                        <td className="px-3 py-2"><UniverseBadge universe={fill.universe} /></td>
+                        <td className="px-3 py-2">{fill.side}</td>
+                        <td className="px-3 py-2 tabular-nums">{fill.fill_price_cents.toFixed(2)}</td>
+                        <td className="px-3 py-2 tabular-nums">{fill.fill_size}</td>
+                        <td className="px-3 py-2 tabular-nums">{formatMetric(fill.queue_ahead_at_fill)}</td>
+                        <td className="px-3 py-2">
+                          <button
+                            onClick={() => handleFillIntentDebugOpen(fill.intent_id)}
+                            className="text-blue-300 hover:text-blue-200"
+                          >
+                            {fill.intent_id}
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {activePaperTab === 'positions' && (
+            <div className="border border-white/10 rounded bg-zinc-900/40 overflow-hidden">
+              <div className="px-3 py-2 border-b border-white/10 text-xs text-zinc-400">Positions</div>
+              <div className="max-h-64 overflow-auto">
+                <table className="w-full text-xs">
+                  <thead className="bg-zinc-900 sticky top-0">
+                    <tr className="text-zinc-500">
+                      <th className="text-left px-3 py-2">Ticker</th>
+                      <th className="text-left px-3 py-2">Universe</th>
+                      <th className="text-left px-3 py-2">Side</th>
+                      <th className="text-left px-3 py-2">Net Contracts</th>
+                      <th className="text-left px-3 py-2">Avg Entry</th>
+                      <th className="text-left px-3 py-2">Realized PnL</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {paperPositions.map((position) => (
+                      <tr key={`${position.ticker}-${position.side}`} className="border-t border-white/5">
+                        <td className="px-3 py-2">{position.ticker}</td>
+                        <td className="px-3 py-2"><UniverseBadge universe={position.universe} /></td>
+                        <td className="px-3 py-2">{position.side}</td>
+                        <td className="px-3 py-2 tabular-nums">{position.net_contracts}</td>
+                        <td className="px-3 py-2 tabular-nums">{position.avg_entry_price_cents.toFixed(2)}</td>
+                        <td className="px-3 py-2 tabular-nums">{formatCurrencyCents(position.realized_pnl_cents)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {activePaperTab === 'config' && (
+            <div className="space-y-3">
+              {paperConfig && (
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+                  <div className="border border-white/10 rounded p-3 bg-zinc-900/40">
+                    <p className="text-zinc-500">Min Edge</p>
+                    <p className="text-zinc-100 tabular-nums mt-1">{paperConfig.min_edge_cents}</p>
+                  </div>
+                  <div className="border border-white/10 rounded p-3 bg-zinc-900/40">
+                    <p className="text-zinc-500">Fill Horizon s</p>
+                    <p className="text-zinc-100 tabular-nums mt-1">{paperConfig.fill_horizon_seconds}</p>
+                  </div>
+                  <div className="border border-white/10 rounded p-3 bg-zinc-900/40">
+                    <p className="text-zinc-500">Max Open Orders</p>
+                    <p className="text-zinc-100 tabular-nums mt-1">{paperConfig.max_open_orders}</p>
+                  </div>
+                  <div className="border border-white/10 rounded p-3 bg-zinc-900/40">
+                    <p className="text-zinc-500">Max Pos / Ticker</p>
+                    <p className="text-zinc-100 tabular-nums mt-1">{paperConfig.max_pos_per_ticker}</p>
+                  </div>
+                </div>
+              )}
+
+              <pre className="border border-white/10 rounded bg-zinc-900/40 p-3 text-xs text-zinc-300 overflow-auto max-h-72">
+                {JSON.stringify(paperConfig, null, 2)}
+              </pre>
+            </div>
+          )}
+        </div>
+
+        <SignalsTable
+          signals={signals}
+          isLoading={isSignalsLoading || scannerState === 'starting'}
+          lastUpdated={lastUpdated}
+          onRowClick={handleRowClick}
+        />
       </div>
 
       <OrderbookDrawer
@@ -1379,7 +1278,7 @@ export default function App() {
 
               {paperIntentDebug && (
                 <>
-                  <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                  <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
                     <div className="border border-white/10 rounded p-3 bg-zinc-900/40">
                       <p className="text-zinc-500">Last Seen Best Bid</p>
                       <p className="text-zinc-100 tabular-nums mt-1">{formatMetric((paperIntentDebug.intent.last_seen_best_bid as number | null | undefined) ?? null)}</p>
@@ -1395,6 +1294,10 @@ export default function App() {
                     <div className="border border-white/10 rounded p-3 bg-zinc-900/40">
                       <p className="text-zinc-500">Fill Horizon s</p>
                       <p className="text-zinc-100 tabular-nums mt-1">{formatMetric((paperIntentDebug.intent.max_hold_seconds as number | null | undefined) ?? null)}</p>
+                    </div>
+                    <div className="border border-white/10 rounded p-3 bg-zinc-900/40">
+                      <p className="text-zinc-500">Universe</p>
+                      <p className="text-zinc-100 tabular-nums mt-1">{formatUniverse(debugIntentUniverse)}</p>
                     </div>
                   </div>
 

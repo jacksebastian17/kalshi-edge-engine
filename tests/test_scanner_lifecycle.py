@@ -78,6 +78,7 @@ class TestScannerStartStop:
 
         # Reset global snapshot
         main_module._top_signals_snapshot = None
+        main_module.runtime_state.top_signals_snapshot = None
         main_module._scanner_state.enabled = True
 
         # Create a mock task that is already done
@@ -122,6 +123,7 @@ class TestScannerStatus:
         main_module._scanner_state.reset()
         main_module._scanner_state.last_error = None
         main_module._top_signals_snapshot = None
+        main_module.runtime_state.top_signals_snapshot = None
 
         response = client.get("/scanner/status")
 
@@ -130,6 +132,8 @@ class TestScannerStatus:
         assert data["enabled"] is False
         assert data["last_scan_ms"] is None
         assert data["markets_discovered"] == 0
+        assert data["enabled_universes"] == []
+        assert data["discovered_universe_counts"] == {}
         assert data["markets_scanned_last_cycle"] == 0
         assert data["last_cycle_duration_ms"] is None
         assert data["tickers_failed_last_cycle"] == []
@@ -149,7 +153,7 @@ class TestScannerStatus:
             signals=[],
             market_count=0,
         )
-        main_module._top_signals_snapshot = snapshot
+        main_module.runtime_state.top_signals_snapshot = snapshot
 
         response = client.get("/scanner/status")
 
@@ -166,6 +170,8 @@ class TestScannerStatus:
         main_module._scanner_state.tickers_failed_last_cycle = ["TICKER-1", "TICKER-2"]
         main_module._scanner_state.tickers_skipped_cooldown_last_cycle = ["TICKER-3"]
         main_module._scanner_state.last_cycle_duration_ms = 1500
+        main_module._scanner_state.enabled_universes = ["NBA", "CBB"]
+        main_module._scanner_state.discovered_universe_counts = {"NBA": 10, "CBB": 5}
 
         response = client.get("/scanner/status")
 
@@ -174,6 +180,8 @@ class TestScannerStatus:
         assert data["tickers_failed_last_cycle"] == ["TICKER-1", "TICKER-2"]
         assert data["tickers_skipped_cooldown_last_cycle"] == ["TICKER-3"]
         assert data["last_cycle_duration_ms"] == 1500
+        assert data["enabled_universes"] == ["NBA", "CBB"]
+        assert data["discovered_universe_counts"] == {"NBA": 10, "CBB": 5}
 
 
 class TestScannerCadence:

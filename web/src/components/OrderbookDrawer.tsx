@@ -30,6 +30,11 @@ function getMaxEdge(signal: SignalResponse | null): number {
   return Number.isFinite(max) ? max : 0
 }
 
+function formatUniverse(universe?: string): string {
+  const value = universe?.trim().toUpperCase()
+  return value && value.length > 0 ? value : '—'
+}
+
 function MetricRow({
   label,
   value,
@@ -163,7 +168,9 @@ export function OrderbookDrawer({
         <div className="flex items-center justify-between border-b border-white/10 px-6 py-4 bg-zinc-900">
           <div>
             <h2 className="text-lg font-bold text-zinc-100">{signal?.ticker}</h2>
-            <p className="text-xs text-zinc-400 mt-1">Reason: {signal?.reason_code}</p>
+            <p className="text-xs text-zinc-400 mt-1">
+              Reason: {signal?.reason_code} · Universe: {formatUniverse(signal?.universe)}
+            </p>
           </div>
           <button onClick={onClose} className="text-zinc-500 hover:text-zinc-300 text-xl">
             ✕
@@ -212,6 +219,10 @@ export function OrderbookDrawer({
                 <span>{signal?.top_liquidity ?? '—'}</span>
               </div>
               <MetricRow label="Imbalance Gap" value={signal?.imbalance_gap} />
+              <div className="flex justify-between">
+                <span>Universe</span>
+                <span>{formatUniverse(signal?.universe)}</span>
+              </div>
               <div className="flex justify-between">
                 <span>Timestamp</span>
                 <span>

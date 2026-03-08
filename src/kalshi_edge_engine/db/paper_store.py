@@ -74,6 +74,7 @@ class PaperStore:
                     CREATE TABLE IF NOT EXISTS quote_intents (
                         id TEXT PRIMARY KEY,
                         ticker TEXT NOT NULL,
+                        universe TEXT,
                         side TEXT NOT NULL,
                         quote_price_cents REAL NOT NULL,
                         size_contracts INTEGER NOT NULL,
@@ -105,6 +106,7 @@ class PaperStore:
                     CREATE TABLE IF NOT EXISTS paper_fills (
                         id TEXT PRIMARY KEY,
                         intent_id TEXT NOT NULL,
+                        universe TEXT,
                         fill_ts_ms INTEGER NOT NULL,
                         fill_price_cents REAL NOT NULL,
                         fill_size INTEGER NOT NULL,
@@ -223,7 +225,17 @@ class PaperStore:
                 "cross_at_submit_cents",
                 "ALTER TABLE quote_intents ADD COLUMN cross_at_submit_cents REAL",
             ),
+            (
+                "quote_intents",
+                "universe",
+                "ALTER TABLE quote_intents ADD COLUMN universe TEXT",
+            ),
             # Add telemetry columns to paper_fills
+            (
+                "paper_fills",
+                "universe",
+                "ALTER TABLE paper_fills ADD COLUMN universe TEXT",
+            ),
             (
                 "paper_fills",
                 "best_bid_at_fill_cents",
@@ -270,6 +282,7 @@ class PaperStore:
     def insert_intent(
         self,
         intent: QuoteIntent,
+        universe: str | None = None,
         entry_fee_cents: float | None = None,
         take_profit_cents_per_contract: float | None = None,
         # Backward-compat alias: interpreted as cents PER CONTRACT.
@@ -298,15 +311,16 @@ class PaperStore:
                 conn.execute(
                     """
                     INSERT INTO quote_intents
-                    (id, ticker, side, quote_price_cents, size_contracts, created_ts_ms,
+                    (id, ticker, universe, side, quote_price_cents, size_contracts, created_ts_ms,
                      status, net_edge, inside_width, imbalance_gap, fee_mode, round_trip,
                      entry_fee_cents, take_profit_cents, max_hold_seconds,
                      best_bid_at_submit_cents, cross_at_submit_cents)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         intent.id,
                         intent.ticker,
+                        universe if universe is not None else getattr(intent, "universe", None),
                         intent.side,
                         intent.quote_price_cents,
                         intent.size_contracts,
@@ -379,7 +393,7 @@ class PaperStore:
                 cursor = conn.cursor()
                 cursor.execute(
                     """
-                    SELECT id, ticker, side, quote_price_cents, size_contracts, created_ts_ms,
+                    SELECT id, ticker, universe, side, quote_price_cents, size_contracts, created_ts_ms,
                            net_edge, inside_width, imbalance_gap, fee_mode, round_trip
                     FROM quote_intents WHERE id = ?
                     """,
@@ -390,15 +404,16 @@ class PaperStore:
                     return QuoteIntent(
                         id=row[0],
                         ticker=row[1],
-                        side=row[2],
-                        quote_price_cents=row[3],
-                        size_contracts=row[4],
-                        created_ts_ms=row[5],
-                        net_edge=row[6],
-                        inside_width=row[7],
-                        imbalance_gap=row[8],
-                        fee_mode=row[9],
-                        round_trip=bool(row[10]),
+                        universe=row[2] or "NBA",
+                        side=row[3],
+                        quote_price_cents=row[4],
+                        size_contracts=row[5],
+                        created_ts_ms=row[6],
+                        net_edge=row[7],
+                        inside_width=row[8],
+                        imbalance_gap=row[9],
+                        fee_mode=row[10],
+                        round_trip=bool(row[11]),
                     )
                 return None
         except sqlite3.Error as e:
@@ -422,7 +437,7 @@ class PaperStore:
                 cursor = conn.cursor()
                 cursor.execute(
                     """
-                    SELECT id, ticker, side, quote_price_cents, size_contracts, created_ts_ms,
+                    SELECT id, ticker, universe, side, quote_price_cents, size_contracts, created_ts_ms,
                            net_edge, inside_width, imbalance_gap, fee_mode, round_trip
                     FROM quote_intents ORDER BY created_ts_ms DESC LIMIT ?
                     """,
@@ -434,15 +449,16 @@ class PaperStore:
                         QuoteIntent(
                             id=row[0],
                             ticker=row[1],
-                            side=row[2],
-                            quote_price_cents=row[3],
-                            size_contracts=row[4],
-                            created_ts_ms=row[5],
-                            net_edge=row[6],
-                            inside_width=row[7],
-                            imbalance_gap=row[8],
-                            fee_mode=row[9],
-                            round_trip=bool(row[10]),
+                            universe=row[2] or "NBA",
+                            side=row[3],
+                            quote_price_cents=row[4],
+                            size_contracts=row[5],
+                            created_ts_ms=row[6],
+                            net_edge=row[7],
+                            inside_width=row[8],
+                            imbalance_gap=row[9],
+                            fee_mode=row[10],
+                            round_trip=bool(row[11]),
                         )
                     )
                 return intents
@@ -527,7 +543,7 @@ class PaperStore:
                 cursor = conn.cursor()
                 cursor.execute(
                     """
-                    SELECT id, ticker, side, quote_price_cents, size_contracts, created_ts_ms,
+                    SELECT id, ticker, universe, side, quote_price_cents, size_contracts, created_ts_ms,
                            net_edge, inside_width, imbalance_gap, fee_mode, round_trip
                     FROM quote_intents WHERE id = ?
                     """,
@@ -538,15 +554,16 @@ class PaperStore:
                     return QuoteIntent(
                         id=row[0],
                         ticker=row[1],
-                        side=row[2],
-                        quote_price_cents=row[3],
-                        size_contracts=row[4],
-                        created_ts_ms=row[5],
-                        net_edge=row[6],
-                        inside_width=row[7],
-                        imbalance_gap=row[8],
-                        fee_mode=row[9],
-                        round_trip=bool(row[10]),
+                        universe=row[2] or "NBA",
+                        side=row[3],
+                        quote_price_cents=row[4],
+                        size_contracts=row[5],
+                        created_ts_ms=row[6],
+                        net_edge=row[7],
+                        inside_width=row[8],
+                        imbalance_gap=row[9],
+                        fee_mode=row[10],
+                        round_trip=bool(row[11]),
                     )
                 return None
         except sqlite3.Error as e:
@@ -601,7 +618,7 @@ class PaperStore:
         Returns a dict with canonical keys:
         {fill_id, intent_id, fill_ts_ms, fill_price_cents, fill_size, remaining_size,
          queue_ahead_at_fill, fill_fee_cents, best_bid_at_fill_cents, cross_at_fill_cents,
-         mark_30s_after_fill_cents, pnl_30s_after_fill_cents, note}
+         mark_30s_after_fill_cents, pnl_30s_after_fill_cents, note, universe}
 
         Raises ValueError if required fields are missing or invalid.
         Returns None if mode cannot be determined (edge case).
@@ -628,6 +645,7 @@ class PaperStore:
                 "mark_30s_after_fill_cents": None,
                 "pnl_30s_after_fill_cents": None,
                 "note": "legacy_fill",
+                "universe": None,
             }
 
         # Mode 2: Positional API (at least 4 required args: fill_id, intent_id, fill_ts_ms, fill_price_cents)
@@ -645,6 +663,7 @@ class PaperStore:
             mark_30s_after_fill_cents = args[10] if len(args) > 10 else None
             pnl_30s_after_fill_cents = args[11] if len(args) > 11 else None
             note = args[12] if len(args) > 12 else None
+            universe = args[13] if len(args) > 13 else None
 
             return {
                 "fill_id": fill_id,
@@ -660,6 +679,7 @@ class PaperStore:
                 "mark_30s_after_fill_cents": mark_30s_after_fill_cents,
                 "pnl_30s_after_fill_cents": pnl_30s_after_fill_cents,
                 "note": note,
+                "universe": universe,
             }
 
         # Mode 3: Keyword API (can mix kwargs + positional, kwargs take precedence)
@@ -683,6 +703,7 @@ class PaperStore:
             "pnl_30s_after_fill_cents", args[11] if len(args) > 11 else None
         )
         note = kwargs.get("note")
+        universe = kwargs.get("universe", args[13] if len(args) > 13 else None)
 
         # We have at least one kwarg or a mix; return the canonical dict
         if (
@@ -705,6 +726,7 @@ class PaperStore:
                 "mark_30s_after_fill_cents": mark_30s_after_fill_cents,
                 "pnl_30s_after_fill_cents": pnl_30s_after_fill_cents,
                 "note": note,
+                "universe": universe,
             }
 
         return None
@@ -803,7 +825,7 @@ class PaperStore:
 
                     # Load intent to get size_contracts
                     cursor.execute(
-                        "SELECT size_contracts FROM quote_intents WHERE id = ?",
+                        "SELECT size_contracts, universe FROM quote_intents WHERE id = ?",
                         (intent_id,),
                     )
                     intent_row = cursor.fetchone()
@@ -816,6 +838,8 @@ class PaperStore:
                         return FillInsertResult(status=FILL_REJECTED_MISSING_INTENT)
 
                     size_contracts = intent_row[0]
+                    intent_universe = intent_row[1]
+                    fill_universe = fill_dict.get("universe") or intent_universe
 
                     # Query current total filled size (inside transaction for consistency)
                     cursor.execute(
@@ -865,10 +889,10 @@ class PaperStore:
                         """
                         INSERT INTO paper_fills
                         (id, intent_id, fill_ts_ms, fill_price_cents, fill_size,
-                         remaining_size, queue_ahead_at_fill, fill_fee_cents, note,
+                         remaining_size, queue_ahead_at_fill, fill_fee_cents, note, universe,
                          best_bid_at_fill_cents, cross_at_fill_cents,
                          mark_30s_after_fill_cents, pnl_30s_after_fill_cents)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             fill_dict["fill_id"],
@@ -880,6 +904,7 @@ class PaperStore:
                             fill_dict["queue_ahead_at_fill"],
                             fill_dict["fill_fee_cents"],
                             fill_dict["note"],
+                            fill_universe,
                             fill_dict["best_bid_at_fill_cents"],
                             fill_dict["cross_at_fill_cents"],
                             fill_dict["mark_30s_after_fill_cents"],
@@ -1110,6 +1135,7 @@ class PaperStore:
                 cursor.execute(
                     """
                     SELECT id, ticker, side, quote_price_cents, size_contracts,
+                              universe,
                            created_ts_ms, status, last_seen_best_bid,
                            queue_ahead_contracts, last_update_ts_ms
                     FROM quote_intents
@@ -1128,11 +1154,12 @@ class PaperStore:
                             "side": row[2],
                             "quote_price_cents": row[3],
                             "size_contracts": row[4],
-                            "created_ts_ms": row[5],
-                            "status": row[6],
-                            "last_seen_best_bid": row[7],
-                            "queue_ahead_contracts": row[8],
-                            "last_update_ts_ms": row[9],
+                            "universe": row[5],
+                            "created_ts_ms": row[6],
+                            "status": row[7],
+                            "last_seen_best_bid": row[8],
+                            "queue_ahead_contracts": row[9],
+                            "last_update_ts_ms": row[10],
                         }
                     )
                 return intents
@@ -1151,6 +1178,7 @@ class PaperStore:
                 cursor.execute(
                     """
                     SELECT id, ticker, side, quote_price_cents, size_contracts,
+                              universe,
                            created_ts_ms, status, last_seen_best_bid,
                            queue_ahead_contracts, last_update_ts_ms,
                            net_edge, inside_width, imbalance_gap,
@@ -1173,24 +1201,25 @@ class PaperStore:
                     "side": row[2],
                     "quote_price_cents": row[3],
                     "size_contracts": row[4],
-                    "created_ts_ms": row[5],
-                    "status": row[6],
-                    "last_seen_best_bid": row[7],
-                    "queue_ahead_contracts": row[8],
-                    "last_update_ts_ms": row[9],
-                    "net_edge": row[10],
-                    "inside_width": row[11],
-                    "imbalance_gap": row[12],
-                    "fee_mode": row[13],
-                    "round_trip": bool(row[14]),
-                    "entry_fee_cents": row[15],
+                    "universe": row[5],
+                    "created_ts_ms": row[6],
+                    "status": row[7],
+                    "last_seen_best_bid": row[8],
+                    "queue_ahead_contracts": row[9],
+                    "last_update_ts_ms": row[10],
+                    "net_edge": row[11],
+                    "inside_width": row[12],
+                    "imbalance_gap": row[13],
+                    "fee_mode": row[14],
+                    "round_trip": bool(row[15]),
+                    "entry_fee_cents": row[16],
                     # Stored in quote_intents.take_profit_cents for backward compatibility,
                     # but semantics are cents PER CONTRACT.
-                    "take_profit_cents": row[16],
-                    "take_profit_cents_per_contract": row[16],
-                    "max_hold_seconds": row[17],
-                    "best_bid_at_submit_cents": row[18],
-                    "cross_at_submit_cents": row[19],
+                    "take_profit_cents": row[17],
+                    "take_profit_cents_per_contract": row[17],
+                    "max_hold_seconds": row[18],
+                    "best_bid_at_submit_cents": row[19],
+                    "cross_at_submit_cents": row[20],
                 }
         except sqlite3.Error as e:
             logger.exception(
@@ -1268,6 +1297,32 @@ class PaperStore:
                 extra={"ticker": ticker, "side": side, "error": str(e)},
             )
             return False
+
+    def get_latest_entry_created_ts_ms_for_ticker_side(self, ticker: str, side: str) -> int | None:
+        """Return latest created_ts_ms for ENTRY intents on ticker+side."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT created_ts_ms
+                    FROM quote_intents
+                    WHERE ticker = ?
+                      AND side = ?
+                      AND id NOT LIKE 'exit_intent:%'
+                    ORDER BY created_ts_ms DESC
+                    LIMIT 1
+                    """,
+                    (ticker, side),
+                )
+                row = cursor.fetchone()
+                return int(row[0]) if row and row[0] is not None else None
+        except sqlite3.Error as e:
+            logger.exception(
+                "paper_store_get_latest_entry_created_ts_ms_error",
+                extra={"ticker": ticker, "side": side, "error": str(e)},
+            )
+            return None
 
     def count_open_positions_for_ticker(self, ticker: str) -> int:
         """Count open positions for a ticker (across sides)."""
@@ -1376,6 +1431,189 @@ class PaperStore:
                 )
                 intent_rows = cursor.fetchall()
 
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM quote_intents
+                    WHERE id NOT LIKE 'exit_intent:%'
+                    """
+                )
+                entry_intents_created = int(cursor.fetchone()[0] or 0)
+
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM quote_intents
+                    WHERE id NOT LIKE 'exit_intent:%'
+                      AND side = 'YES'
+                    """
+                )
+                entry_yes_intents_created = int(cursor.fetchone()[0] or 0)
+
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM quote_intents
+                    WHERE id NOT LIKE 'exit_intent:%'
+                      AND side = 'NO'
+                    """
+                )
+                entry_no_intents_created = int(cursor.fetchone()[0] or 0)
+
+                cursor.execute(
+                    """
+                    SELECT COALESCE(universe, 'UNKNOWN') AS universe, COUNT(*)
+                    FROM quote_intents
+                    WHERE id NOT LIKE 'exit_intent:%'
+                    GROUP BY COALESCE(universe, 'UNKNOWN')
+                    """
+                )
+                entry_intents_created_by_universe = {
+                    str(row[0]).upper(): int(row[1]) for row in cursor.fetchall()
+                }
+
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM paper_fills f
+                    JOIN quote_intents i ON f.intent_id = i.id
+                    WHERE i.id NOT LIKE 'exit_intent:%'
+                    """
+                )
+                entry_fills = int(cursor.fetchone()[0] or 0)
+
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM paper_fills f
+                    JOIN quote_intents i ON f.intent_id = i.id
+                    WHERE i.id NOT LIKE 'exit_intent:%'
+                      AND i.side = 'YES'
+                    """
+                )
+                entry_yes_fills = int(cursor.fetchone()[0] or 0)
+
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM paper_fills f
+                    JOIN quote_intents i ON f.intent_id = i.id
+                    WHERE i.id NOT LIKE 'exit_intent:%'
+                      AND i.side = 'NO'
+                    """
+                )
+                entry_no_fills = int(cursor.fetchone()[0] or 0)
+
+                cursor.execute(
+                    """
+                    SELECT COALESCE(i.universe, 'UNKNOWN') AS universe, COUNT(*)
+                    FROM paper_fills f
+                    JOIN quote_intents i ON f.intent_id = i.id
+                    WHERE i.id NOT LIKE 'exit_intent:%'
+                    GROUP BY COALESCE(i.universe, 'UNKNOWN')
+                    """
+                )
+                entry_fills_by_universe = {
+                    str(row[0]).upper(): int(row[1]) for row in cursor.fetchall()
+                }
+
+                cursor.execute(
+                    """
+                    SELECT COUNT(DISTINCT f.intent_id)
+                    FROM paper_fills f
+                    JOIN quote_intents i ON f.intent_id = i.id
+                    WHERE i.id NOT LIKE 'exit_intent:%'
+                    """
+                )
+                entry_intents_with_at_least_one_fill = int(cursor.fetchone()[0] or 0)
+
+                cursor.execute(
+                    """
+                    SELECT COUNT(DISTINCT ticker)
+                    FROM quote_intents
+                    WHERE id NOT LIKE 'exit_intent:%'
+                    """
+                )
+                unique_entry_tickers_count = int(cursor.fetchone()[0] or 0)
+
+                cursor.execute(
+                    """
+                    SELECT COUNT(DISTINCT ticker || '|' || side)
+                    FROM quote_intents
+                    WHERE id NOT LIKE 'exit_intent:%'
+                    """
+                )
+                unique_entry_ticker_side_pairs_count = int(cursor.fetchone()[0] or 0)
+
+                cursor.execute(
+                    """
+                    SELECT COUNT(DISTINCT i.ticker)
+                    FROM paper_fills f
+                    JOIN quote_intents i ON f.intent_id = i.id
+                    WHERE i.id NOT LIKE 'exit_intent:%'
+                      AND (f.note IS NULL OR f.note NOT LIKE 'exit%')
+                    """
+                )
+                unique_filled_entry_tickers_count = int(cursor.fetchone()[0] or 0)
+
+                cursor.execute(
+                    """
+                    SELECT COUNT(DISTINCT i.ticker || '|' || i.side)
+                    FROM paper_fills f
+                    JOIN quote_intents i ON f.intent_id = i.id
+                    WHERE i.id NOT LIKE 'exit_intent:%'
+                      AND (f.note IS NULL OR f.note NOT LIKE 'exit%')
+                    """
+                )
+                unique_filled_entry_ticker_side_pairs_count = int(cursor.fetchone()[0] or 0)
+
+                cursor.execute(
+                    """
+                    SELECT AVG(i.net_edge),
+                           AVG(
+                               CASE
+                                   WHEN i.cross_at_submit_cents IS NULL THEN NULL
+                                   WHEN i.side = 'YES' THEN i.cross_at_submit_cents - i.quote_price_cents
+                                   WHEN i.side = 'NO' THEN i.quote_price_cents - i.cross_at_submit_cents
+                                   ELSE NULL
+                               END
+                           ),
+                           AVG(ABS(i.quote_price_cents - 50.0))
+                    FROM quote_intents i
+                    WHERE i.id NOT LIKE 'exit_intent:%'
+                    """
+                )
+                entry_avg_row = cursor.fetchone()
+                entry_avg_net_edge_at_entry = (
+                    float(entry_avg_row[0])
+                    if entry_avg_row and entry_avg_row[0] is not None
+                    else None
+                )
+                entry_avg_capturable_edge_to_cross_at_entry = (
+                    float(entry_avg_row[1])
+                    if entry_avg_row and entry_avg_row[1] is not None
+                    else None
+                )
+                entry_avg_abs_distance_from_50_at_entry = (
+                    float(entry_avg_row[2])
+                    if entry_avg_row and entry_avg_row[2] is not None
+                    else None
+                )
+
+                cursor.execute(
+                    """
+                    SELECT i.id, i.created_ts_ms, i.size_contracts,
+                           COALESCE(SUM(f.fill_size), 0) AS filled_size,
+                           MIN(f.fill_ts_ms) AS first_fill_ts_ms,
+                           MAX(f.fill_ts_ms) AS last_fill_ts_ms
+                    FROM quote_intents i
+                    LEFT JOIN paper_fills f ON f.intent_id = i.id
+                    WHERE i.id NOT LIKE 'exit_intent:%'
+                    GROUP BY i.id, i.created_ts_ms, i.size_contracts
+                    """
+                )
+                entry_intent_rows = cursor.fetchall()
+
                 fully_filled_intents = 0
                 partial_fill_intents = 0
                 fill_fractions: list[float] = []
@@ -1413,6 +1651,41 @@ class PaperStore:
                         if last_fill_ts_ms is not None:
                             ttf_full_seconds = (int(last_fill_ts_ms) - int(created_ts_ms)) / 1000.0
                             time_to_full_fill_seconds.append(max(0.0, float(ttf_full_seconds)))
+
+                entry_fully_filled_intents = 0
+                entry_partial_fill_intents = 0
+                entry_time_to_first_fill_seconds: list[float] = []
+                entry_time_to_full_fill_seconds: list[float] = []
+                for (
+                    _intent_id,
+                    created_ts_ms,
+                    size_contracts,
+                    filled_size,
+                    first_fill_ts_ms,
+                    last_fill_ts_ms,
+                ) in entry_intent_rows:
+                    intent_size = max(0, int(size_contracts or 0))
+                    total_filled_for_intent = max(0, int(filled_size or 0))
+                    if intent_size <= 0:
+                        continue
+
+                    has_fill = total_filled_for_intent > 0
+                    is_fully_filled = total_filled_for_intent >= intent_size
+
+                    if has_fill and first_fill_ts_ms is not None:
+                        ttf_seconds = (int(first_fill_ts_ms) - int(created_ts_ms)) / 1000.0
+                        entry_time_to_first_fill_seconds.append(max(0.0, float(ttf_seconds)))
+
+                    if has_fill and not is_fully_filled:
+                        entry_partial_fill_intents += 1
+
+                    if is_fully_filled:
+                        entry_fully_filled_intents += 1
+                        if last_fill_ts_ms is not None:
+                            ttf_full_seconds = (int(last_fill_ts_ms) - int(created_ts_ms)) / 1000.0
+                            entry_time_to_full_fill_seconds.append(
+                                max(0.0, float(ttf_full_seconds))
+                            )
 
                 avg_time_to_first_fill_seconds = (
                     float(sum(time_to_first_fill_seconds) / len(time_to_first_fill_seconds))
@@ -1453,6 +1726,36 @@ class PaperStore:
                 raw_fills_per_intent_ratio = (
                     float(total_fills / total_intents) if total_intents > 0 else 0.0
                 )
+                entry_intent_fill_rate = (
+                    float(entry_intents_with_at_least_one_fill / entry_intents_created)
+                    if entry_intents_created > 0
+                    else 0.0
+                )
+                entry_average_time_to_first_fill_seconds = (
+                    float(
+                        sum(entry_time_to_first_fill_seconds)
+                        / len(entry_time_to_first_fill_seconds)
+                    )
+                    if entry_time_to_first_fill_seconds
+                    else None
+                )
+                entry_median_time_to_first_fill_seconds = (
+                    float(statistics.median(entry_time_to_first_fill_seconds))
+                    if entry_time_to_first_fill_seconds
+                    else None
+                )
+                entry_average_time_to_full_fill_seconds = (
+                    float(
+                        sum(entry_time_to_full_fill_seconds) / len(entry_time_to_full_fill_seconds)
+                    )
+                    if entry_time_to_full_fill_seconds
+                    else None
+                )
+                entry_median_time_to_full_fill_seconds = (
+                    float(statistics.median(entry_time_to_full_fill_seconds))
+                    if entry_time_to_full_fill_seconds
+                    else None
+                )
 
                 # Compute unrealized PnL if marks provided
                 unrealized_pnl_cents = 0.0
@@ -1488,18 +1791,11 @@ class PaperStore:
                             # lifecycle window for this ticker+side.
                             # This avoids carrying stale fees from older closed cycles into
                             # current unrealized PnL.
-                        cursor.execute(
-                            """
-                            SELECT COALESCE(SUM(f.fill_fee_cents), 0.0)
-                            FROM paper_fills f
-                            JOIN quote_intents i ON f.intent_id = i.id
-                            WHERE i.ticker = ? AND i.side = ?
-                              AND (f.note IS NULL OR f.note NOT LIKE 'exit%')
-                                                            AND f.fill_ts_ms >= ?
-                            """,
-                            (ticker, side_key, int(first_open_ts_ms or 0)),
+                        total_entry_fees = self.get_open_lifecycle_entry_fees_cents(
+                            ticker=str(ticker),
+                            side=side_key,
+                            first_open_ts_ms=int(first_open_ts_ms or 0),
                         )
-                        total_entry_fees = cursor.fetchone()[0] or 0.0
 
                         # Unrealized = price_pnl - fees
                         unrealized_pnl_cents += price_pnl - total_entry_fees
@@ -1536,6 +1832,35 @@ class PaperStore:
                     "median_time_to_first_fill_seconds": median_time_to_first_fill_seconds,
                     "average_time_to_full_fill_seconds": avg_time_to_full_fill_seconds,
                     "median_time_to_full_fill_seconds": median_time_to_full_fill_seconds,
+                    "entry_intents_created": int(entry_intents_created),
+                    "entry_yes_intents_created": int(entry_yes_intents_created),
+                    "entry_no_intents_created": int(entry_no_intents_created),
+                    "entry_intents_created_by_universe": entry_intents_created_by_universe,
+                    "entry_fills": int(entry_fills),
+                    "entry_yes_fills": int(entry_yes_fills),
+                    "entry_no_fills": int(entry_no_fills),
+                    "entry_fills_by_universe": entry_fills_by_universe,
+                    "entry_intents_with_at_least_one_fill": int(
+                        entry_intents_with_at_least_one_fill
+                    ),
+                    "entry_intent_fill_rate": float(entry_intent_fill_rate),
+                    "entry_fully_filled_intents": int(entry_fully_filled_intents),
+                    "entry_partial_fill_intents": int(entry_partial_fill_intents),
+                    "entry_average_time_to_first_fill_seconds": entry_average_time_to_first_fill_seconds,
+                    "entry_median_time_to_first_fill_seconds": entry_median_time_to_first_fill_seconds,
+                    "entry_average_time_to_full_fill_seconds": entry_average_time_to_full_fill_seconds,
+                    "entry_median_time_to_full_fill_seconds": entry_median_time_to_full_fill_seconds,
+                    "entry_avg_net_edge_at_entry": entry_avg_net_edge_at_entry,
+                    "entry_avg_capturable_edge_to_cross_at_entry": entry_avg_capturable_edge_to_cross_at_entry,
+                    "entry_avg_abs_distance_from_50_at_entry": entry_avg_abs_distance_from_50_at_entry,
+                    "unique_entry_tickers_count": int(unique_entry_tickers_count),
+                    "unique_entry_ticker_side_pairs_count": int(
+                        unique_entry_ticker_side_pairs_count
+                    ),
+                    "unique_filled_entry_tickers_count": int(unique_filled_entry_tickers_count),
+                    "unique_filled_entry_ticker_side_pairs_count": int(
+                        unique_filled_entry_ticker_side_pairs_count
+                    ),
                     "unrealized_marks_available": bool(marks_available),
                     "unrealized_marked_positions_count": int(marked_open_positions_count),
                     "unrealized_unmarked_positions_count": int(unmarked_open_positions_count),
@@ -1567,6 +1892,29 @@ class PaperStore:
                 "median_time_to_first_fill_seconds": None,
                 "average_time_to_full_fill_seconds": None,
                 "median_time_to_full_fill_seconds": None,
+                "entry_intents_created": 0,
+                "entry_yes_intents_created": 0,
+                "entry_no_intents_created": 0,
+                "entry_intents_created_by_universe": {},
+                "entry_fills": 0,
+                "entry_yes_fills": 0,
+                "entry_no_fills": 0,
+                "entry_fills_by_universe": {},
+                "entry_intents_with_at_least_one_fill": 0,
+                "entry_intent_fill_rate": 0.0,
+                "entry_fully_filled_intents": 0,
+                "entry_partial_fill_intents": 0,
+                "entry_average_time_to_first_fill_seconds": None,
+                "entry_median_time_to_first_fill_seconds": None,
+                "entry_average_time_to_full_fill_seconds": None,
+                "entry_median_time_to_full_fill_seconds": None,
+                "entry_avg_net_edge_at_entry": None,
+                "entry_avg_capturable_edge_to_cross_at_entry": None,
+                "entry_avg_abs_distance_from_50_at_entry": None,
+                "unique_entry_tickers_count": 0,
+                "unique_entry_ticker_side_pairs_count": 0,
+                "unique_filled_entry_tickers_count": 0,
+                "unique_filled_entry_ticker_side_pairs_count": 0,
                 "unrealized_marks_available": False,
                 "unrealized_marked_positions_count": 0,
                 "unrealized_unmarked_positions_count": 0,
@@ -1596,6 +1944,42 @@ class PaperStore:
                 extra={"ticker": ticker, "side": side, "error": str(e)},
             )
             return None
+
+    def get_open_lifecycle_entry_fees_cents(
+        self,
+        *,
+        ticker: str,
+        side: str,
+        first_open_ts_ms: int,
+    ) -> float:
+        """Return summed entry fill fees for the current ticker+side lifecycle window."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT COALESCE(SUM(f.fill_fee_cents), 0.0)
+                    FROM paper_fills f
+                    JOIN quote_intents i ON f.intent_id = i.id
+                    WHERE i.ticker = ? AND i.side = ?
+                      AND (f.note IS NULL OR f.note NOT LIKE 'exit%')
+                      AND f.fill_ts_ms >= ?
+                    """,
+                    (ticker, side.upper(), int(first_open_ts_ms or 0)),
+                )
+                row = cursor.fetchone()
+                return float(row[0]) if row and row[0] is not None else 0.0
+        except sqlite3.Error as e:
+            logger.exception(
+                "paper_store_get_open_lifecycle_entry_fees_error",
+                extra={
+                    "ticker": ticker,
+                    "side": side,
+                    "first_open_ts_ms": first_open_ts_ms,
+                    "error": str(e),
+                },
+            )
+            return 0.0
 
     def mark_exited_intents_for_ticker_side(
         self,
@@ -1676,8 +2060,9 @@ class PaperStore:
                     SELECT f.id, f.intent_id, f.fill_ts_ms, f.fill_price_cents,
                            f.fill_size, f.remaining_size, f.queue_ahead_at_fill,
                            f.fill_fee_cents, f.note, f.best_bid_at_fill_cents,
-                              f.cross_at_fill_cents, f.mark_30s_after_fill_cents,
-                              f.pnl_30s_after_fill_cents, i.ticker, i.side
+                                        f.cross_at_fill_cents, f.mark_30s_after_fill_cents,
+                                        f.pnl_30s_after_fill_cents, i.ticker, i.side,
+                                        COALESCE(f.universe, i.universe)
                     FROM paper_fills f
                     JOIN quote_intents i ON f.intent_id = i.id
                     ORDER BY f.fill_ts_ms DESC
@@ -1704,6 +2089,7 @@ class PaperStore:
                             "pnl_30s_after_fill_cents": row[12],
                             "ticker": row[13],
                             "side": row[14],
+                            "universe": row[15],
                         }
                     )
                 return fills
@@ -1745,6 +2131,7 @@ class PaperStore:
                     SELECT f.id, f.intent_id, f.fill_ts_ms, f.fill_price_cents,
                            f.fill_size, f.fill_fee_cents, f.note,
                            i.ticker, i.side, i.net_edge, i.quote_price_cents
+                              , COALESCE(f.universe, i.universe)
                     FROM paper_fills f
                     JOIN quote_intents i ON i.id = f.intent_id
                     WHERE f.fill_ts_ms <= ?
@@ -1770,6 +2157,7 @@ class PaperStore:
                         "side": row[8],
                         "net_edge": row[9],
                         "quote_price_cents": row[10],
+                        "universe": row[11],
                     }
                     for row in rows
                 ]
@@ -1821,7 +2209,8 @@ class PaperStore:
                     SELECT f.id, f.intent_id, f.fill_ts_ms, f.fill_price_cents,
                            f.fill_size, f.fill_fee_cents, f.note,
                            f.mark_30s_after_fill_cents, f.pnl_30s_after_fill_cents,
-                           i.ticker, i.side, i.net_edge, i.quote_price_cents
+                              i.ticker, i.side, i.net_edge, i.quote_price_cents,
+                              COALESCE(f.universe, i.universe)
                     FROM paper_fills f
                     JOIN quote_intents i ON i.id = f.intent_id
                     ORDER BY f.fill_ts_ms DESC
@@ -1845,6 +2234,7 @@ class PaperStore:
                         "side": row[10],
                         "net_edge": row[11],
                         "quote_price_cents": row[12],
+                        "universe": row[13],
                     }
                     for row in rows
                 ]
@@ -1870,7 +2260,7 @@ class PaperStore:
                 cursor.execute(
                     """
                     SELECT f.fill_ts_ms, f.note, f.pnl_30s_after_fill_cents,
-                           i.side, i.net_edge
+                              i.side, i.net_edge, COALESCE(f.universe, i.universe)
                     FROM paper_fills f
                     JOIN quote_intents i ON i.id = f.intent_id
                     WHERE f.fill_ts_ms >= ?
@@ -1888,8 +2278,13 @@ class PaperStore:
                     "total_samples": 0,
                     "avg_pnl_30s_cents": None,
                     "win_rate_30s": None,
+                    "entry_only_sample_count": 0,
+                    "entry_only_by_side": {},
+                    "entry_only_by_fill_path": {},
+                    "entry_only_by_universe": {},
                     "by_side": {},
                     "by_fill_path": {},
+                    "by_universe": {},
                     "by_edge_bucket": [],
                 }
 
@@ -1910,10 +2305,14 @@ class PaperStore:
             all_pnls: list[float] = []
             by_side_values: dict[str, list[float]] = {"YES": [], "NO": []}
             by_fill_path_values: dict[str, list[float]] = {}
+            entry_only_by_side_values: dict[str, list[float]] = {"YES": [], "NO": []}
+            entry_only_by_fill_path_values: dict[str, list[float]] = {}
+            entry_only_by_universe_values: dict[str, list[float]] = {}
+            by_universe_values: dict[str, list[float]] = {}
             by_edge_bucket_values: dict[tuple[float, float], list[float]] = {}
 
             safe_bucket_size = max(0.1, edge_bucket_size_cents)
-            for _, note, pnl_30s_after_fill_cents, side, net_edge in rows:
+            for _, note, pnl_30s_after_fill_cents, side, net_edge, universe in rows:
                 pnl_value = float(pnl_30s_after_fill_cents)
                 all_pnls.append(pnl_value)
 
@@ -1926,6 +2325,16 @@ class PaperStore:
                 if isinstance(note, str) and note.startswith("entry_"):
                     fill_path = note.replace("entry_", "", 1)
                 by_fill_path_values.setdefault(fill_path, []).append(pnl_value)
+
+                universe_key = str(universe or "UNKNOWN").upper()
+                by_universe_values.setdefault(universe_key, []).append(pnl_value)
+
+                if isinstance(note, str) and note.startswith("entry_"):
+                    if side_key not in entry_only_by_side_values:
+                        entry_only_by_side_values[side_key] = []
+                    entry_only_by_side_values[side_key].append(pnl_value)
+                    entry_only_by_fill_path_values.setdefault(fill_path, []).append(pnl_value)
+                    entry_only_by_universe_values.setdefault(universe_key, []).append(pnl_value)
 
                 edge_value = float(net_edge or 0.0)
                 bucket_floor = (edge_value // safe_bucket_size) * safe_bucket_size
@@ -1940,6 +2349,23 @@ class PaperStore:
             by_fill_path = {
                 path_key: _compute_group_stats(values)
                 for path_key, values in by_fill_path_values.items()
+            }
+            entry_only_by_side = {
+                side_key: _compute_group_stats(values)
+                for side_key, values in entry_only_by_side_values.items()
+                if values
+            }
+            entry_only_by_fill_path = {
+                path_key: _compute_group_stats(values)
+                for path_key, values in entry_only_by_fill_path_values.items()
+            }
+            by_universe = {
+                universe_key: _compute_group_stats(values)
+                for universe_key, values in by_universe_values.items()
+            }
+            entry_only_by_universe = {
+                universe_key: _compute_group_stats(values)
+                for universe_key, values in entry_only_by_universe_values.items()
             }
 
             by_edge_bucket: list[dict[str, Any]] = []
@@ -1959,8 +2385,15 @@ class PaperStore:
                 "total_samples": total_samples,
                 "avg_pnl_30s_cents": overall["avg_pnl_30s_cents"],
                 "win_rate_30s": overall["win_rate_30s"],
+                "entry_only_sample_count": int(
+                    sum(len(values) for values in entry_only_by_fill_path_values.values())
+                ),
+                "entry_only_by_side": entry_only_by_side,
+                "entry_only_by_fill_path": entry_only_by_fill_path,
+                "entry_only_by_universe": entry_only_by_universe,
                 "by_side": by_side,
                 "by_fill_path": by_fill_path,
+                "by_universe": by_universe,
                 "by_edge_bucket": by_edge_bucket,
             }
         except sqlite3.Error as e:
@@ -1977,8 +2410,13 @@ class PaperStore:
                 "total_samples": 0,
                 "avg_pnl_30s_cents": None,
                 "win_rate_30s": None,
+                "entry_only_sample_count": 0,
+                "entry_only_by_side": {},
+                "entry_only_by_fill_path": {},
+                "entry_only_by_universe": {},
                 "by_side": {},
                 "by_fill_path": {},
+                "by_universe": {},
                 "by_edge_bucket": [],
             }
 
@@ -2068,6 +2506,271 @@ class PaperStore:
                 "intents_last_1h": 0,
             }
 
+    def get_recent_entry_outcome_audit(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Get recent ENTRY fills with side/outcome fields for manual outcome audits."""
+        safe_limit = max(1, min(500, int(limit)))
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT f.intent_id, i.ticker, i.side,
+                              COALESCE(f.universe, i.universe),
+                           i.created_ts_ms, f.fill_ts_ms,
+                           f.fill_price_cents, f.best_bid_at_fill_cents,
+                           f.cross_at_fill_cents, f.mark_30s_after_fill_cents,
+                           f.pnl_30s_after_fill_cents, f.note,
+                           i.net_edge, i.quote_price_cents, i.cross_at_submit_cents,
+                           LAG(f.fill_ts_ms) OVER (
+                               PARTITION BY i.ticker, i.side
+                               ORDER BY f.fill_ts_ms, f.id
+                           ) AS prev_fill_ts_ms,
+                           LAG(f.pnl_30s_after_fill_cents) OVER (
+                               PARTITION BY i.ticker, i.side
+                               ORDER BY f.fill_ts_ms, f.id
+                           ) AS prev_pnl_30s_after_fill_cents,
+                           LAG(i.net_edge) OVER (
+                               PARTITION BY i.ticker, i.side
+                               ORDER BY f.fill_ts_ms, f.id
+                           ) AS prev_net_edge
+                    FROM paper_fills f
+                    JOIN quote_intents i ON i.id = f.intent_id
+                    WHERE i.id NOT LIKE 'exit_intent:%'
+                      AND (f.note IS NULL OR f.note NOT LIKE 'exit%')
+                    ORDER BY f.fill_ts_ms DESC, f.id DESC
+                    LIMIT ?
+                    """,
+                    (safe_limit,),
+                )
+                rows = cursor.fetchall()
+
+            audit_rows: list[dict[str, Any]] = []
+            for row in rows:
+                side = str(row[2]).upper()
+                created_ts_ms = int(row[4]) if row[4] is not None else None
+                fill_ts_ms = int(row[5]) if row[5] is not None else None
+                quote_price = float(row[13]) if row[13] is not None else None
+                submit_cross = float(row[14]) if row[14] is not None else None
+                previous_fill_ts_ms = int(row[15]) if row[15] is not None else None
+                previous_entry_same_ticker_side_pnl_30s_cents = (
+                    float(row[16]) if row[16] is not None else None
+                )
+                previous_entry_same_ticker_side_net_edge = (
+                    float(row[17]) if row[17] is not None else None
+                )
+                minutes_since_previous_entry_same_ticker_side: float | None = None
+                if fill_ts_ms is not None and previous_fill_ts_ms is not None:
+                    minutes_since_previous_entry_same_ticker_side = (
+                        float(fill_ts_ms - previous_fill_ts_ms) / 60_000.0
+                    )
+                abs_distance_from_50_cents = (
+                    abs(quote_price - 50.0) if quote_price is not None else None
+                )
+                capturable_edge_to_cross_at_entry: float | None = None
+                if quote_price is not None and submit_cross is not None:
+                    if side == "YES":
+                        capturable_edge_to_cross_at_entry = submit_cross - quote_price
+                    elif side == "NO":
+                        capturable_edge_to_cross_at_entry = quote_price - submit_cross
+
+                audit_rows.append(
+                    {
+                        "intent_id": row[0],
+                        "ticker": row[1],
+                        "side": row[2],
+                        "universe": row[3],
+                        "created_ts_ms": created_ts_ms,
+                        "fill_ts_ms": fill_ts_ms,
+                        "fill_price_cents": row[6],
+                        "best_bid_at_fill_cents": row[7],
+                        "cross_at_fill_cents": row[8],
+                        "mark_30s_after_fill_cents": row[9],
+                        "pnl_30s_after_fill_cents": row[10],
+                        "note": row[11],
+                        "net_edge_at_entry": row[12],
+                        "intended_quote_cents": quote_price,
+                        "abs_distance_from_50_cents": abs_distance_from_50_cents,
+                        "capturable_edge_to_cross_at_entry": capturable_edge_to_cross_at_entry,
+                        "minutes_since_previous_entry_same_ticker_side": (
+                            minutes_since_previous_entry_same_ticker_side
+                        ),
+                        "previous_entry_same_ticker_side_pnl_30s_cents": (
+                            previous_entry_same_ticker_side_pnl_30s_cents
+                        ),
+                        "previous_entry_same_ticker_side_net_edge": (
+                            previous_entry_same_ticker_side_net_edge
+                        ),
+                    }
+                )
+            return audit_rows
+        except sqlite3.Error as e:
+            logger.exception(
+                "paper_store_get_recent_entry_outcome_audit_error",
+                extra={"limit": safe_limit, "error": str(e)},
+            )
+            return []
+
+    def get_entry_outcome_concentration_metrics(
+        self,
+        window_seconds: int = 3600,
+        top_n: int = 10,
+    ) -> dict[str, Any]:
+        """Get ticker concentration metrics for entry-only fills in a rolling window."""
+        now_ms = int(time.time() * 1000)
+        cutoff_ms = now_ms - max(0, int(window_seconds)) * 1000
+        safe_top_n = max(1, min(50, int(top_n)))
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM paper_fills f
+                    JOIN quote_intents i ON i.id = f.intent_id
+                    WHERE f.fill_ts_ms >= ?
+                      AND i.id NOT LIKE 'exit_intent:%'
+                      AND (f.note IS NULL OR f.note NOT LIKE 'exit%')
+                    """,
+                    (cutoff_ms,),
+                )
+                total_entry_samples = int(cursor.fetchone()[0] or 0)
+
+                cursor.execute(
+                    """
+                    SELECT COUNT(DISTINCT i.ticker)
+                    FROM paper_fills f
+                    JOIN quote_intents i ON i.id = f.intent_id
+                    WHERE f.fill_ts_ms >= ?
+                      AND i.id NOT LIKE 'exit_intent:%'
+                      AND (f.note IS NULL OR f.note NOT LIKE 'exit%')
+                    """,
+                    (cutoff_ms,),
+                )
+                unique_tickers = int(cursor.fetchone()[0] or 0)
+
+                cursor.execute(
+                    """
+                    SELECT COUNT(DISTINCT i.ticker || '|' || i.side)
+                    FROM paper_fills f
+                    JOIN quote_intents i ON i.id = f.intent_id
+                    WHERE f.fill_ts_ms >= ?
+                      AND i.id NOT LIKE 'exit_intent:%'
+                      AND (f.note IS NULL OR f.note NOT LIKE 'exit%')
+                    """,
+                    (cutoff_ms,),
+                )
+                unique_ticker_side_pairs = int(cursor.fetchone()[0] or 0)
+
+                cursor.execute(
+                    """
+                    SELECT i.universe, COUNT(*)
+                                        FROM paper_fills f
+                                        JOIN quote_intents i ON i.id = f.intent_id
+                    WHERE f.fill_ts_ms >= ?
+                      AND i.id NOT LIKE 'exit_intent:%'
+                      AND (f.note IS NULL OR f.note NOT LIKE 'exit%')
+                    GROUP BY i.universe
+                    """,
+                    (cutoff_ms,),
+                )
+                by_universe_counts = {
+                    str(row[0] or "UNKNOWN").upper(): int(row[1]) for row in cursor.fetchall()
+                }
+
+                cursor.execute(
+                    """
+                    SELECT i.ticker,
+                           COUNT(*) AS sample_count,
+                           AVG(f.pnl_30s_after_fill_cents) AS avg_pnl_30s_cents,
+                           CASE
+                               WHEN SUM(CASE WHEN f.pnl_30s_after_fill_cents IS NOT NULL THEN 1 ELSE 0 END) = 0
+                                   THEN NULL
+                               ELSE
+                                   CAST(SUM(CASE WHEN f.pnl_30s_after_fill_cents > 0 THEN 1 ELSE 0 END) AS REAL)
+                                   / SUM(CASE WHEN f.pnl_30s_after_fill_cents IS NOT NULL THEN 1 ELSE 0 END)
+                           END AS win_rate_30s
+                    FROM paper_fills f
+                    JOIN quote_intents i ON i.id = f.intent_id
+                    WHERE f.fill_ts_ms >= ?
+                      AND i.id NOT LIKE 'exit_intent:%'
+                      AND (f.note IS NULL OR f.note NOT LIKE 'exit%')
+                    GROUP BY i.ticker
+                    ORDER BY sample_count DESC, i.ticker ASC
+                    LIMIT ?
+                    """,
+                    (cutoff_ms, safe_top_n),
+                )
+                top_tickers_by_sample_count = [
+                    {
+                        "ticker": row[0],
+                        "sample_count": int(row[1]),
+                        "avg_pnl_30s_cents": float(row[2]) if row[2] is not None else None,
+                        "win_rate_30s": float(row[3]) if row[3] is not None else None,
+                    }
+                    for row in cursor.fetchall()
+                ]
+
+                cursor.execute(
+                    """
+                          SELECT i.ticker, i.side, i.universe,
+                           COUNT(*) AS sample_count,
+                           AVG(f.pnl_30s_after_fill_cents) AS avg_pnl_30s_cents,
+                           CASE
+                               WHEN SUM(CASE WHEN f.pnl_30s_after_fill_cents IS NOT NULL THEN 1 ELSE 0 END) = 0
+                                   THEN NULL
+                               ELSE
+                                   CAST(SUM(CASE WHEN f.pnl_30s_after_fill_cents > 0 THEN 1 ELSE 0 END) AS REAL)
+                                   / SUM(CASE WHEN f.pnl_30s_after_fill_cents IS NOT NULL THEN 1 ELSE 0 END)
+                           END AS win_rate_30s
+                    FROM paper_fills f
+                    JOIN quote_intents i ON i.id = f.intent_id
+                    WHERE f.fill_ts_ms >= ?
+                      AND i.id NOT LIKE 'exit_intent:%'
+                      AND (f.note IS NULL OR f.note NOT LIKE 'exit%')
+                    GROUP BY i.ticker, i.side, i.universe
+                    ORDER BY sample_count DESC, i.ticker ASC, i.side ASC, i.universe ASC
+                    LIMIT ?
+                    """,
+                    (cutoff_ms, safe_top_n),
+                )
+                top_ticker_sides_by_sample_count = [
+                    {
+                        "ticker": row[0],
+                        "side": row[1],
+                        "universe": row[2],
+                        "sample_count": int(row[3]),
+                        "avg_pnl_30s_cents": float(row[4]) if row[4] is not None else None,
+                        "win_rate_30s": float(row[5]) if row[5] is not None else None,
+                    }
+                    for row in cursor.fetchall()
+                ]
+
+            return {
+                "window_seconds": int(window_seconds),
+                "total_entry_samples": total_entry_samples,
+                "unique_tickers": unique_tickers,
+                "unique_ticker_side_pairs": unique_ticker_side_pairs,
+                "by_universe_counts": by_universe_counts,
+                "top_tickers_by_sample_count": top_tickers_by_sample_count,
+                "top_ticker_sides_by_sample_count": top_ticker_sides_by_sample_count,
+            }
+        except sqlite3.Error as e:
+            logger.exception(
+                "paper_store_get_entry_outcome_concentration_metrics_error",
+                extra={"window_seconds": window_seconds, "top_n": safe_top_n, "error": str(e)},
+            )
+            return {
+                "window_seconds": int(window_seconds),
+                "total_entry_samples": 0,
+                "unique_tickers": 0,
+                "unique_ticker_side_pairs": 0,
+                "by_universe_counts": {},
+                "top_tickers_by_sample_count": [],
+                "top_ticker_sides_by_sample_count": [],
+            }
+
     def get_fills_for_position(self, ticker: str, side: str) -> list[dict[str, Any]]:
         """Get all fills for a specific ticker+side position.
 
@@ -2086,7 +2789,7 @@ class PaperStore:
                     SELECT f.id, f.intent_id, f.fill_ts_ms, f.fill_price_cents,
                            f.fill_size, f.remaining_size, f.queue_ahead_at_fill,
                               f.fill_fee_cents, f.note, f.best_bid_at_fill_cents,
-                              f.cross_at_fill_cents
+                                        f.cross_at_fill_cents, COALESCE(f.universe, i.universe)
                     FROM paper_fills f
                     JOIN quote_intents i ON f.intent_id = i.id
                     WHERE i.ticker = ? AND i.side = ?
@@ -2109,6 +2812,7 @@ class PaperStore:
                             "note": row[8],
                             "best_bid_at_fill_cents": row[9],
                             "cross_at_fill_cents": row[10],
+                            "universe": row[11],
                         }
                     )
                 return fills
