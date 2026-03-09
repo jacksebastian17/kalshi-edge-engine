@@ -327,8 +327,182 @@ class TestPaperStore:
             paper_fills_columns = {row[1] for row in cursor.fetchall()}
             assert "best_bid_at_fill_cents" in paper_fills_columns
             assert "cross_at_fill_cents" in paper_fills_columns
+            assert "mark_5s_after_fill_cents" in paper_fills_columns
+            assert "pnl_5s_after_fill_cents" in paper_fills_columns
+            assert "mark_15s_after_fill_cents" in paper_fills_columns
+            assert "pnl_15s_after_fill_cents" in paper_fills_columns
             assert "mark_30s_after_fill_cents" in paper_fills_columns
             assert "pnl_30s_after_fill_cents" in paper_fills_columns
+            assert "mark_60s_after_fill_cents" in paper_fills_columns
+            assert "pnl_60s_after_fill_cents" in paper_fills_columns
+
+    def test_multi_horizon_outcome_persistence(self, paper_store: PaperStore) -> None:
+        """Store should persist 5s/15s/30s/60s fill outcomes additively."""
+        now_ms = int(time.time() * 1000)
+        intent = QuoteIntent(
+            id="intent-horizon-1",
+            ticker="KXNBAGAME-HORIZON-1",
+            side="YES",
+            quote_price_cents=50.0,
+            size_contracts=1,
+            created_ts_ms=now_ms - 120_000,
+            net_edge=1.0,
+            inside_width=2.0,
+            imbalance_gap=0.0,
+            fee_mode="maker",
+            round_trip=True,
+        )
+        paper_store.insert_intent(intent)
+        assert paper_store.insert_fill(
+            fill_id="fill-horizon-1",
+            intent_id=intent.id,
+            fill_ts_ms=now_ms - 90_000,
+            fill_price_cents=50.0,
+            fill_size=1,
+            remaining_size=0,
+            queue_ahead_at_fill=0,
+            fill_fee_cents=0.1,
+            note="entry_queue_cleared",
+        )
+
+        pending_5s = paper_store.get_pending_fill_outcome_updates(
+            horizon_seconds=5,
+            cutoff_ts_ms=now_ms,
+            limit=10,
+        )
+        assert len(pending_5s) == 1
+
+        assert paper_store.update_fill_outcome(
+            fill_id="fill-horizon-1",
+            horizon_seconds=5,
+            mark_after_fill_cents=50.2,
+            pnl_after_fill_cents=0.1,
+        )
+        assert paper_store.update_fill_outcome(
+            fill_id="fill-horizon-1",
+            horizon_seconds=15,
+            mark_after_fill_cents=50.4,
+            pnl_after_fill_cents=0.3,
+        )
+        assert paper_store.update_fill_30s_outcome(
+            fill_id="fill-horizon-1",
+            mark_30s_after_fill_cents=50.8,
+            pnl_30s_after_fill_cents=0.7,
+        )
+        assert paper_store.update_fill_outcome(
+            fill_id="fill-horizon-1",
+            horizon_seconds=60,
+            mark_after_fill_cents=51.0,
+            pnl_after_fill_cents=0.9,
+        )
+
+        fills = paper_store.get_recent_fills(limit=1)
+        assert len(fills) == 1
+        row = fills[0]
+        assert row["mark_5s_after_fill_cents"] == pytest.approx(50.2)
+        assert row["pnl_5s_after_fill_cents"] == pytest.approx(0.1)
+        assert row["mark_15s_after_fill_cents"] == pytest.approx(50.4)
+        assert row["pnl_15s_after_fill_cents"] == pytest.approx(0.3)
+        assert row["mark_30s_after_fill_cents"] == pytest.approx(50.8)
+        assert row["pnl_30s_after_fill_cents"] == pytest.approx(0.7)
+        assert row["mark_60s_after_fill_cents"] == pytest.approx(51.0)
+        assert row["pnl_60s_after_fill_cents"] == pytest.approx(0.9)
+
+    def test_recent_entry_sample_count_helpers(self, paper_store: PaperStore) -> None:
+        """Rolling entry sample counters should include entries and exclude synthetic exits."""
+        now_ms = int(time.time() * 1000)
+
+        entry_yes = QuoteIntent(
+            id="intent-conc-helper-yes",
+            ticker="KXNBAGAME-CONC-HELPER",
+            side="YES",
+            quote_price_cents=50.0,
+            size_contracts=1,
+            created_ts_ms=now_ms - 30_000,
+            net_edge=1.0,
+            inside_width=2.0,
+            imbalance_gap=0.0,
+            fee_mode="maker",
+            round_trip=True,
+        )
+        entry_no = QuoteIntent(
+            id="intent-conc-helper-no",
+            ticker="KXNBAGAME-CONC-HELPER",
+            side="NO",
+            quote_price_cents=49.0,
+            size_contracts=1,
+            created_ts_ms=now_ms - 20_000,
+            net_edge=1.0,
+            inside_width=2.0,
+            imbalance_gap=0.0,
+            fee_mode="maker",
+            round_trip=True,
+        )
+        exit_intent = QuoteIntent(
+            id="exit_intent:take_profit:KXNBAGAME-CONC-HELPER:YES:1",
+            ticker="KXNBAGAME-CONC-HELPER",
+            side="YES",
+            quote_price_cents=53.0,
+            size_contracts=1,
+            created_ts_ms=now_ms - 10_000,
+            net_edge=0.0,
+            inside_width=0.0,
+            imbalance_gap=0.0,
+            fee_mode="taker",
+            round_trip=False,
+        )
+        paper_store.insert_intent(entry_yes)
+        paper_store.insert_intent(entry_no)
+        paper_store.insert_intent(exit_intent)
+
+        assert paper_store.insert_fill(
+            fill_id="fill-conc-helper-yes",
+            intent_id=entry_yes.id,
+            fill_ts_ms=now_ms - 25_000,
+            fill_price_cents=50.0,
+            fill_size=1,
+            remaining_size=0,
+            queue_ahead_at_fill=0,
+            fill_fee_cents=0.1,
+            note="entry_queue_cleared",
+        )
+        assert paper_store.insert_fill(
+            fill_id="fill-conc-helper-no",
+            intent_id=entry_no.id,
+            fill_ts_ms=now_ms - 15_000,
+            fill_price_cents=49.0,
+            fill_size=1,
+            remaining_size=0,
+            queue_ahead_at_fill=0,
+            fill_fee_cents=0.1,
+            note="entry_moved_through",
+        )
+        assert paper_store.insert_fill(
+            fill_id="fill-conc-helper-exit",
+            intent_id=exit_intent.id,
+            fill_ts_ms=now_ms - 5_000,
+            fill_price_cents=53.0,
+            fill_size=1,
+            remaining_size=0,
+            queue_ahead_at_fill=0,
+            fill_fee_cents=0.1,
+            note="exit_take_profit",
+        )
+
+        assert paper_store.count_recent_entry_samples_for_ticker(
+            ticker="KXNBAGAME-CONC-HELPER",
+            within_seconds=3600,
+        ) == 2
+        assert paper_store.count_recent_entry_samples_for_ticker_side(
+            ticker="KXNBAGAME-CONC-HELPER",
+            side="YES",
+            within_seconds=3600,
+        ) == 1
+        assert paper_store.count_recent_entry_samples_for_ticker_side(
+            ticker="KXNBAGAME-CONC-HELPER",
+            side="NO",
+            within_seconds=3600,
+        ) == 1
 
 
 class TestPaperStoreV2:

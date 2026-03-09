@@ -44,12 +44,6 @@ from kalshi_edge_engine.runtime.paper_exit_runtime import (
 from kalshi_edge_engine.runtime.paper_exit_runtime import (
     _update_fill_30s_outcomes as _runtime_update_fill_30s_outcomes,
 )
-from kalshi_edge_engine.runtime.paper_runtime import (
-    _can_create_intent as _runtime_can_create_intent,
-)
-from kalshi_edge_engine.runtime.paper_runtime import (
-    _get_rate_limit_or_cooldown_reason as _runtime_get_rate_limit_or_cooldown_reason,
-)
 from kalshi_edge_engine.runtime.paper_runtime import _init_paper_store as _runtime_init_paper_store
 from kalshi_edge_engine.runtime.paper_runtime import (
     _process_paper_intents as _runtime_process_paper_intents,
@@ -330,6 +324,8 @@ PAPER_INTENT_ALLOWED_STATUSES = PAPER_INTENT_ACTIVE_STATUSES | PAPER_INTENT_LEGA
 
 
 def _sync_runtime_from_legacy() -> None:
+    # Compatibility bridge retained for private helper tests that patch legacy
+    # module globals. Runtime ownership remains runtime_config/runtime_state.
     runtime_config.ENABLE_PAPER_TRADING = _ENABLE_PAPER_TRADING
     runtime_config.PAPER_MIN_EDGE_CENTS = _PAPER_MIN_EDGE_CENTS
     runtime_config.PAPER_ALLOW_YES_ENTRIES = _PAPER_ALLOW_YES_ENTRIES
@@ -451,20 +447,6 @@ def _init_paper_store() -> None:
     _sync_runtime_from_legacy()
     _runtime_init_paper_store()
     _sync_legacy_from_runtime()
-
-
-def _can_create_intent(ticker: str, now_ms: int) -> bool:
-    _sync_runtime_from_legacy()
-    allowed = _runtime_can_create_intent(ticker, now_ms)
-    _sync_legacy_from_runtime()
-    return allowed
-
-
-def _get_rate_limit_or_cooldown_reason(ticker: str, now_ms: int) -> str | None:
-    _sync_runtime_from_legacy()
-    reason = _runtime_get_rate_limit_or_cooldown_reason(ticker, now_ms)
-    _sync_legacy_from_runtime()
-    return reason
 
 
 def _get_mark_price_for_position(
@@ -1334,12 +1316,18 @@ async def get_paper_metrics() -> dict[str, Any]:
     }
 
 
-async def get_paper_outcome_metrics(window_seconds: int = 86_400) -> dict[str, Any]:
+async def get_paper_outcome_metrics(
+    window_seconds: int = 86_400,
+    horizon_seconds: int = 30,
+) -> dict[str, Any]:
     """Get short-horizon edge-vs-outcome telemetry aggregates."""
     if not _paper_store:
         raise HTTPException(status_code=503, detail="Paper trading not enabled")
 
-    return _paper_store.get_short_horizon_outcome_metrics(window_seconds=window_seconds)
+    return _paper_store.get_short_horizon_outcome_metrics(
+        window_seconds=window_seconds,
+        horizon_seconds=horizon_seconds,
+    )
 
 
 async def get_paper_outcome_audit(limit: int = 50) -> dict[str, Any]:
@@ -1355,8 +1343,39 @@ async def get_paper_outcome_concentration(window_seconds: int = 3600) -> dict[st
     """Get entry-fill concentration metrics for duplicate-pattern analysis."""
     if not _paper_store:
         raise HTTPException(status_code=503, detail="Paper trading not enabled")
+    result = _paper_store.get_entry_outcome_concentration_metrics(window_seconds=window_seconds)
+    min_distinct = runtime_config.PAPER_MIN_DISTINCT_TICKERS_FOR_STRATEGY_CONFIDENCE
+    result["min_distinct_tickers_for_strategy_confidence"] = min_distinct
+    result["meets_distinct_ticker_confidence_threshold"] = (
+        bool(result.get("distinct_ticker_count", 0) >= min_distinct)
+        if min_distinct is not None
+        else None
+    )
+    return result
 
-    return _paper_store.get_entry_outcome_concentration_metrics(window_seconds=window_seconds)
+
+async def get_paper_outcome_entry_summary(
+    window_seconds: int = 86_400,
+    horizon_seconds: int = 30,
+    edge_bucket_size_cents: float = 1.0,
+) -> dict[str, Any]:
+    """Get entry-only grouped post-fill outcome summary."""
+    if not _paper_store:
+        raise HTTPException(status_code=503, detail="Paper trading not enabled")
+
+    result = _paper_store.get_entry_outcome_summary(
+        window_seconds=window_seconds,
+        horizon_seconds=horizon_seconds,
+        edge_bucket_size_cents=edge_bucket_size_cents,
+    )
+    min_distinct = runtime_config.PAPER_MIN_DISTINCT_TICKERS_FOR_STRATEGY_CONFIDENCE
+    result["min_distinct_tickers_for_strategy_confidence"] = min_distinct
+    result["meets_distinct_ticker_confidence_threshold"] = (
+        bool(result.get("distinct_ticker_count", 0) >= min_distinct)
+        if min_distinct is not None
+        else None
+    )
+    return result
 
 
 async def get_paper_config() -> dict[str, Any]:
@@ -1371,6 +1390,8 @@ async def get_paper_config() -> dict[str, Any]:
     """
     # Check if there are active simulation tasks
     active = _paper_enabled and any(not t.done() for t in _paper_simulation_tasks)
+    nba_effective = runtime_config.get_effective_paper_config("NBA")
+    cbb_effective = runtime_config.get_effective_paper_config("CBB")
 
     return {
         "configured": _ENABLE_PAPER_TRADING,
@@ -1391,6 +1412,19 @@ async def get_paper_config() -> dict[str, Any]:
         "fill_probability_price_moved": _PAPER_FILL_PROBABILITY,
         "fill_probability_at_best": _PAPER_FILL_PROBABILITY_AT_BEST,
         "fill_probability_price_improves": _PAPER_FILL_PROBABILITY_PRICE_IMPROVES,
+        "allow_price_improves": nba_effective.allow_price_improves,
+        "allow_moved_through": nba_effective.allow_moved_through,
+        "min_edge_cents_price_improves": nba_effective.min_edge_cents_price_improves,
+        "min_edge_cents_moved_through": nba_effective.min_edge_cents_moved_through,
+        "max_entry_samples_per_ticker_per_hour": (
+            runtime_config.PAPER_MAX_ENTRY_SAMPLES_PER_TICKER_PER_HOUR
+        ),
+        "max_entry_samples_per_ticker_side_per_hour": (
+            runtime_config.PAPER_MAX_ENTRY_SAMPLES_PER_TICKER_SIDE_PER_HOUR
+        ),
+        "min_distinct_tickers_for_strategy_confidence": (
+            runtime_config.PAPER_MIN_DISTINCT_TICKERS_FOR_STRATEGY_CONFIDENCE
+        ),
         "simulated_volume_per_poll": _PAPER_SIMULATED_VOLUME_PER_POLL,
         "max_hold_seconds": _PAPER_MAX_HOLD_SECONDS,
         # Backward-compatible key kept for API stability.
@@ -1400,6 +1434,80 @@ async def get_paper_config() -> dict[str, Any]:
         "max_concurrent_intents": _PAPER_MAX_CONCURRENT_INTENTS,
         "max_open_orders": _PAPER_MAX_OPEN_ORDERS,
         "max_pos_per_ticker": _PAPER_MAX_POS_PER_TICKER,
+        "effective_by_universe": {
+            "NBA": {
+                "min_edge_cents": nba_effective.min_edge_cents,
+                "allow_yes_entries": nba_effective.allow_yes_entries,
+                "allow_no_entries": nba_effective.allow_no_entries,
+                "min_top_liquidity": nba_effective.min_top_liquidity,
+                "require_signal_valid_only": nba_effective.require_signal_valid_only,
+                "min_capturable_edge_to_cross_cents": (
+                    nba_effective.min_capturable_edge_to_cross_cents
+                ),
+                "min_abs_distance_from_50_cents": nba_effective.min_abs_distance_from_50_cents,
+                "min_reentry_delay_seconds_same_ticker_side": (
+                    nba_effective.min_reentry_delay_seconds_same_ticker_side
+                ),
+                "fill_horizon_seconds": nba_effective.fill_horizon_seconds,
+                "poll_interval_seconds": nba_effective.poll_interval_seconds,
+                "fill_probability_price_moved": nba_effective.fill_probability_price_moved,
+                "fill_probability_at_best": nba_effective.fill_probability_at_best,
+                "fill_probability_price_improves": nba_effective.fill_probability_price_improves,
+                "allow_price_improves": nba_effective.allow_price_improves,
+                "allow_moved_through": nba_effective.allow_moved_through,
+                "min_edge_cents_price_improves": nba_effective.min_edge_cents_price_improves,
+                "min_edge_cents_moved_through": nba_effective.min_edge_cents_moved_through,
+                "max_entry_samples_per_ticker_per_hour": (
+                    nba_effective.max_entry_samples_per_ticker_per_hour
+                ),
+                "max_entry_samples_per_ticker_side_per_hour": (
+                    nba_effective.max_entry_samples_per_ticker_side_per_hour
+                ),
+                "min_distinct_tickers_for_strategy_confidence": (
+                    nba_effective.min_distinct_tickers_for_strategy_confidence
+                ),
+                "simulated_volume_per_poll": nba_effective.simulated_volume_per_poll,
+                "max_hold_seconds": nba_effective.max_hold_seconds,
+                "take_profit_cents": nba_effective.take_profit_cents_per_contract,
+                "ticker_cooldown_seconds": nba_effective.ticker_cooldown_seconds,
+            },
+            "CBB": {
+                "min_edge_cents": cbb_effective.min_edge_cents,
+                "allow_yes_entries": cbb_effective.allow_yes_entries,
+                "allow_no_entries": cbb_effective.allow_no_entries,
+                "min_top_liquidity": cbb_effective.min_top_liquidity,
+                "require_signal_valid_only": cbb_effective.require_signal_valid_only,
+                "min_capturable_edge_to_cross_cents": (
+                    cbb_effective.min_capturable_edge_to_cross_cents
+                ),
+                "min_abs_distance_from_50_cents": cbb_effective.min_abs_distance_from_50_cents,
+                "min_reentry_delay_seconds_same_ticker_side": (
+                    cbb_effective.min_reentry_delay_seconds_same_ticker_side
+                ),
+                "fill_horizon_seconds": cbb_effective.fill_horizon_seconds,
+                "poll_interval_seconds": cbb_effective.poll_interval_seconds,
+                "fill_probability_price_moved": cbb_effective.fill_probability_price_moved,
+                "fill_probability_at_best": cbb_effective.fill_probability_at_best,
+                "fill_probability_price_improves": cbb_effective.fill_probability_price_improves,
+                "allow_price_improves": cbb_effective.allow_price_improves,
+                "allow_moved_through": cbb_effective.allow_moved_through,
+                "min_edge_cents_price_improves": cbb_effective.min_edge_cents_price_improves,
+                "min_edge_cents_moved_through": cbb_effective.min_edge_cents_moved_through,
+                "max_entry_samples_per_ticker_per_hour": (
+                    cbb_effective.max_entry_samples_per_ticker_per_hour
+                ),
+                "max_entry_samples_per_ticker_side_per_hour": (
+                    cbb_effective.max_entry_samples_per_ticker_side_per_hour
+                ),
+                "min_distinct_tickers_for_strategy_confidence": (
+                    cbb_effective.min_distinct_tickers_for_strategy_confidence
+                ),
+                "simulated_volume_per_poll": cbb_effective.simulated_volume_per_poll,
+                "max_hold_seconds": cbb_effective.max_hold_seconds,
+                "take_profit_cents": cbb_effective.take_profit_cents_per_contract,
+                "ticker_cooldown_seconds": cbb_effective.ticker_cooldown_seconds,
+            },
+        },
     }
 
 
@@ -1746,6 +1854,7 @@ def create_app(testing: bool = False) -> FastAPI:
     app_instance.get("/paper/metrics/outcomes")(get_paper_outcome_metrics)
     app_instance.get("/paper/metrics/outcomes/audit")(get_paper_outcome_audit)
     app_instance.get("/paper/metrics/outcomes/concentration")(get_paper_outcome_concentration)
+    app_instance.get("/paper/metrics/outcomes/entry-summary")(get_paper_outcome_entry_summary)
     app_instance.get("/paper/config")(get_paper_config)
     app_instance.get("/paper/debug/intent/{intent_id}")(get_paper_debug_intent)
     app_instance.post("/paper/debug/force-fill")(post_paper_debug_force_fill)

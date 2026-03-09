@@ -116,8 +116,14 @@ class PaperStore:
                         note TEXT,
                         best_bid_at_fill_cents REAL,
                         cross_at_fill_cents REAL,
+                        mark_5s_after_fill_cents REAL,
+                        pnl_5s_after_fill_cents REAL,
+                        mark_15s_after_fill_cents REAL,
+                        pnl_15s_after_fill_cents REAL,
                         mark_30s_after_fill_cents REAL,
                         pnl_30s_after_fill_cents REAL,
+                        mark_60s_after_fill_cents REAL,
+                        pnl_60s_after_fill_cents REAL,
                         FOREIGN KEY (intent_id) REFERENCES quote_intents(id)
                     )
                     """
@@ -248,6 +254,26 @@ class PaperStore:
             ),
             (
                 "paper_fills",
+                "mark_5s_after_fill_cents",
+                "ALTER TABLE paper_fills ADD COLUMN mark_5s_after_fill_cents REAL",
+            ),
+            (
+                "paper_fills",
+                "pnl_5s_after_fill_cents",
+                "ALTER TABLE paper_fills ADD COLUMN pnl_5s_after_fill_cents REAL",
+            ),
+            (
+                "paper_fills",
+                "mark_15s_after_fill_cents",
+                "ALTER TABLE paper_fills ADD COLUMN mark_15s_after_fill_cents REAL",
+            ),
+            (
+                "paper_fills",
+                "pnl_15s_after_fill_cents",
+                "ALTER TABLE paper_fills ADD COLUMN pnl_15s_after_fill_cents REAL",
+            ),
+            (
+                "paper_fills",
                 "mark_30s_after_fill_cents",
                 "ALTER TABLE paper_fills ADD COLUMN mark_30s_after_fill_cents REAL",
             ),
@@ -255,6 +281,16 @@ class PaperStore:
                 "paper_fills",
                 "pnl_30s_after_fill_cents",
                 "ALTER TABLE paper_fills ADD COLUMN pnl_30s_after_fill_cents REAL",
+            ),
+            (
+                "paper_fills",
+                "mark_60s_after_fill_cents",
+                "ALTER TABLE paper_fills ADD COLUMN mark_60s_after_fill_cents REAL",
+            ),
+            (
+                "paper_fills",
+                "pnl_60s_after_fill_cents",
+                "ALTER TABLE paper_fills ADD COLUMN pnl_60s_after_fill_cents REAL",
             ),
         ]
 
@@ -1324,6 +1360,75 @@ class PaperStore:
             )
             return None
 
+    def count_recent_entry_samples_for_ticker(
+        self,
+        *,
+        ticker: str,
+        within_seconds: int = 3600,
+    ) -> int:
+        """Count recent entry-only fill samples for a ticker in a rolling window."""
+        cutoff_ms = int(time.time() * 1000) - max(0, int(within_seconds)) * 1000
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM paper_fills f
+                    JOIN quote_intents i ON i.id = f.intent_id
+                    WHERE f.fill_ts_ms >= ?
+                      AND i.ticker = ?
+                      AND i.id NOT LIKE 'exit_intent:%'
+                      AND (f.note IS NULL OR f.note NOT LIKE 'exit%')
+                    """,
+                    (cutoff_ms, ticker),
+                )
+                return int(cursor.fetchone()[0] or 0)
+        except sqlite3.Error as e:
+            logger.exception(
+                "paper_store_count_recent_entry_samples_for_ticker_error",
+                extra={"ticker": ticker, "within_seconds": within_seconds, "error": str(e)},
+            )
+            return 0
+
+    def count_recent_entry_samples_for_ticker_side(
+        self,
+        *,
+        ticker: str,
+        side: str,
+        within_seconds: int = 3600,
+    ) -> int:
+        """Count recent entry-only fill samples for ticker+side in a rolling window."""
+        cutoff_ms = int(time.time() * 1000) - max(0, int(within_seconds)) * 1000
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM paper_fills f
+                    JOIN quote_intents i ON i.id = f.intent_id
+                    WHERE f.fill_ts_ms >= ?
+                      AND i.ticker = ?
+                      AND i.side = ?
+                      AND i.id NOT LIKE 'exit_intent:%'
+                      AND (f.note IS NULL OR f.note NOT LIKE 'exit%')
+                    """,
+                    (cutoff_ms, ticker, side),
+                )
+                return int(cursor.fetchone()[0] or 0)
+        except sqlite3.Error as e:
+            logger.exception(
+                "paper_store_count_recent_entry_samples_for_ticker_side_error",
+                extra={
+                    "ticker": ticker,
+                    "side": side,
+                    "within_seconds": within_seconds,
+                    "error": str(e),
+                },
+            )
+            return 0
+
     def count_open_positions_for_ticker(self, ticker: str) -> int:
         """Count open positions for a ticker (across sides)."""
         try:
@@ -2060,8 +2165,12 @@ class PaperStore:
                     SELECT f.id, f.intent_id, f.fill_ts_ms, f.fill_price_cents,
                            f.fill_size, f.remaining_size, f.queue_ahead_at_fill,
                            f.fill_fee_cents, f.note, f.best_bid_at_fill_cents,
-                                        f.cross_at_fill_cents, f.mark_30s_after_fill_cents,
-                                        f.pnl_30s_after_fill_cents, i.ticker, i.side,
+                                     f.cross_at_fill_cents,
+                                     f.mark_5s_after_fill_cents, f.pnl_5s_after_fill_cents,
+                                     f.mark_15s_after_fill_cents, f.pnl_15s_after_fill_cents,
+                                     f.mark_30s_after_fill_cents, f.pnl_30s_after_fill_cents,
+                                     f.mark_60s_after_fill_cents, f.pnl_60s_after_fill_cents,
+                                     i.ticker, i.side,
                                         COALESCE(f.universe, i.universe)
                     FROM paper_fills f
                     JOIN quote_intents i ON f.intent_id = i.id
@@ -2085,11 +2194,17 @@ class PaperStore:
                             "note": row[8],
                             "best_bid_at_fill_cents": row[9],
                             "cross_at_fill_cents": row[10],
-                            "mark_30s_after_fill_cents": row[11],
-                            "pnl_30s_after_fill_cents": row[12],
-                            "ticker": row[13],
-                            "side": row[14],
-                            "universe": row[15],
+                            "mark_5s_after_fill_cents": row[11],
+                            "pnl_5s_after_fill_cents": row[12],
+                            "mark_15s_after_fill_cents": row[13],
+                            "pnl_15s_after_fill_cents": row[14],
+                            "mark_30s_after_fill_cents": row[15],
+                            "pnl_30s_after_fill_cents": row[16],
+                            "mark_60s_after_fill_cents": row[17],
+                            "pnl_60s_after_fill_cents": row[18],
+                            "ticker": row[19],
+                            "side": row[20],
+                            "universe": row[21],
                         }
                     )
                 return fills
@@ -2123,11 +2238,35 @@ class PaperStore:
         limit: int = 200,
     ) -> list[dict[str, Any]]:
         """Get fills eligible for 30s outcome update with joined intent metadata."""
+        return self.get_pending_fill_outcome_updates(
+            horizon_seconds=30,
+            cutoff_ts_ms=cutoff_ts_ms,
+            limit=limit,
+        )
+
+    @staticmethod
+    def _mark_column_for_horizon(horizon_seconds: int) -> str:
+        return f"mark_{int(horizon_seconds)}s_after_fill_cents"
+
+    @staticmethod
+    def _pnl_column_for_horizon(horizon_seconds: int) -> str:
+        return f"pnl_{int(horizon_seconds)}s_after_fill_cents"
+
+    def get_pending_fill_outcome_updates(
+        self,
+        *,
+        horizon_seconds: int,
+        cutoff_ts_ms: int,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Get fills eligible for horizon outcome update with joined intent metadata."""
+        mark_col = self._mark_column_for_horizon(horizon_seconds)
+        pnl_col = self._pnl_column_for_horizon(horizon_seconds)
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    """
+                    f"""
                     SELECT f.id, f.intent_id, f.fill_ts_ms, f.fill_price_cents,
                            f.fill_size, f.fill_fee_cents, f.note,
                            i.ticker, i.side, i.net_edge, i.quote_price_cents
@@ -2135,8 +2274,8 @@ class PaperStore:
                     FROM paper_fills f
                     JOIN quote_intents i ON i.id = f.intent_id
                     WHERE f.fill_ts_ms <= ?
-                      AND f.mark_30s_after_fill_cents IS NULL
-                      AND f.pnl_30s_after_fill_cents IS NULL
+                      AND f.{mark_col} IS NULL
+                      AND f.{pnl_col} IS NULL
                       AND (f.note IS NULL OR f.note NOT LIKE 'exit%')
                     ORDER BY f.fill_ts_ms ASC
                     LIMIT ?
@@ -2163,8 +2302,13 @@ class PaperStore:
                 ]
         except sqlite3.Error as e:
             logger.exception(
-                "paper_store_get_pending_fill_30s_outcome_updates_error",
-                extra={"cutoff_ts_ms": cutoff_ts_ms, "limit": limit, "error": str(e)},
+                "paper_store_get_pending_fill_outcome_updates_error",
+                extra={
+                    "horizon_seconds": horizon_seconds,
+                    "cutoff_ts_ms": cutoff_ts_ms,
+                    "limit": limit,
+                    "error": str(e),
+                },
             )
             return []
 
@@ -2176,26 +2320,48 @@ class PaperStore:
         pnl_30s_after_fill_cents: float,
     ) -> bool:
         """Persist 30s follow-up mark and short-horizon PnL for a fill."""
+        return self.update_fill_outcome(
+            fill_id=fill_id,
+            horizon_seconds=30,
+            mark_after_fill_cents=mark_30s_after_fill_cents,
+            pnl_after_fill_cents=pnl_30s_after_fill_cents,
+        )
+
+    def update_fill_outcome(
+        self,
+        *,
+        fill_id: str,
+        horizon_seconds: int,
+        mark_after_fill_cents: float,
+        pnl_after_fill_cents: float,
+    ) -> bool:
+        """Persist follow-up mark and short-horizon PnL for a fill/horizon."""
+        mark_col = self._mark_column_for_horizon(horizon_seconds)
+        pnl_col = self._pnl_column_for_horizon(horizon_seconds)
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    """
+                    f"""
                     UPDATE paper_fills
-                    SET mark_30s_after_fill_cents = ?,
-                        pnl_30s_after_fill_cents = ?
+                    SET {mark_col} = ?,
+                        {pnl_col} = ?
                     WHERE id = ?
-                      AND mark_30s_after_fill_cents IS NULL
-                      AND pnl_30s_after_fill_cents IS NULL
+                      AND {mark_col} IS NULL
+                      AND {pnl_col} IS NULL
                     """,
-                    (mark_30s_after_fill_cents, pnl_30s_after_fill_cents, fill_id),
+                    (mark_after_fill_cents, pnl_after_fill_cents, fill_id),
                 )
                 conn.commit()
                 return cursor.rowcount > 0
         except sqlite3.Error as e:
             logger.exception(
-                "paper_store_update_fill_30s_outcome_error",
-                extra={"fill_id": fill_id, "error": str(e)},
+                "paper_store_update_fill_outcome_error",
+                extra={
+                    "fill_id": fill_id,
+                    "horizon_seconds": horizon_seconds,
+                    "error": str(e),
+                },
             )
             return False
 
@@ -2208,7 +2374,10 @@ class PaperStore:
                     """
                     SELECT f.id, f.intent_id, f.fill_ts_ms, f.fill_price_cents,
                            f.fill_size, f.fill_fee_cents, f.note,
-                           f.mark_30s_after_fill_cents, f.pnl_30s_after_fill_cents,
+                              f.mark_5s_after_fill_cents, f.pnl_5s_after_fill_cents,
+                              f.mark_15s_after_fill_cents, f.pnl_15s_after_fill_cents,
+                              f.mark_30s_after_fill_cents, f.pnl_30s_after_fill_cents,
+                              f.mark_60s_after_fill_cents, f.pnl_60s_after_fill_cents,
                               i.ticker, i.side, i.net_edge, i.quote_price_cents,
                               COALESCE(f.universe, i.universe)
                     FROM paper_fills f
@@ -2228,13 +2397,19 @@ class PaperStore:
                         "fill_size": row[4],
                         "fill_fee_cents": row[5],
                         "note": row[6],
-                        "mark_30s_after_fill_cents": row[7],
-                        "pnl_30s_after_fill_cents": row[8],
-                        "ticker": row[9],
-                        "side": row[10],
-                        "net_edge": row[11],
-                        "quote_price_cents": row[12],
-                        "universe": row[13],
+                        "mark_5s_after_fill_cents": row[7],
+                        "pnl_5s_after_fill_cents": row[8],
+                        "mark_15s_after_fill_cents": row[9],
+                        "pnl_15s_after_fill_cents": row[10],
+                        "mark_30s_after_fill_cents": row[11],
+                        "pnl_30s_after_fill_cents": row[12],
+                        "mark_60s_after_fill_cents": row[13],
+                        "pnl_60s_after_fill_cents": row[14],
+                        "ticker": row[15],
+                        "side": row[16],
+                        "net_edge": row[17],
+                        "quote_price_cents": row[18],
+                        "universe": row[19],
                     }
                     for row in rows
                 ]
@@ -2249,22 +2424,27 @@ class PaperStore:
         self,
         window_seconds: int = 86_400,
         edge_bucket_size_cents: float = 1.0,
+        horizon_seconds: int = 30,
     ) -> dict[str, Any]:
-        """Aggregate 30s post-fill outcomes for edge-vs-outcome research."""
+        """Aggregate post-fill outcomes for edge-vs-outcome research."""
         now_ms = int(time.time() * 1000)
         cutoff_ms = now_ms - max(0, window_seconds) * 1000
+        horizon = int(horizon_seconds)
+        pnl_col = self._pnl_column_for_horizon(horizon)
+        avg_key = f"avg_pnl_{horizon}s_cents"
+        win_key = f"win_rate_{horizon}s"
 
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    """
-                    SELECT f.fill_ts_ms, f.note, f.pnl_30s_after_fill_cents,
+                    f"""
+                    SELECT f.fill_ts_ms, f.note, f.{pnl_col},
                               i.side, i.net_edge, COALESCE(f.universe, i.universe)
                     FROM paper_fills f
                     JOIN quote_intents i ON i.id = f.intent_id
                     WHERE f.fill_ts_ms >= ?
-                      AND f.pnl_30s_after_fill_cents IS NOT NULL
+                      AND f.{pnl_col} IS NOT NULL
                     ORDER BY f.fill_ts_ms DESC
                     """,
                     (cutoff_ms,),
@@ -2273,11 +2453,12 @@ class PaperStore:
 
             total_samples = len(rows)
             if total_samples == 0:
-                return {
+                empty_result: dict[str, Any] = {
                     "window_seconds": window_seconds,
+                    "horizon_seconds": horizon,
                     "total_samples": 0,
-                    "avg_pnl_30s_cents": None,
-                    "win_rate_30s": None,
+                    avg_key: None,
+                    win_key: None,
                     "entry_only_sample_count": 0,
                     "entry_only_by_side": {},
                     "entry_only_by_fill_path": {},
@@ -2287,6 +2468,10 @@ class PaperStore:
                     "by_universe": {},
                     "by_edge_bucket": [],
                 }
+                if horizon == 30:
+                    empty_result["avg_pnl_30s_cents"] = None
+                    empty_result["win_rate_30s"] = None
+                return empty_result
 
             def _compute_group_stats(values: list[float]) -> dict[str, Any]:
                 sample_count = len(values)
@@ -2298,8 +2483,8 @@ class PaperStore:
                 )
                 return {
                     "sample_count": sample_count,
-                    "avg_pnl_30s_cents": avg_pnl,
-                    "win_rate_30s": win_rate,
+                    avg_key: avg_pnl,
+                    win_key: win_rate,
                 }
 
             all_pnls: list[float] = []
@@ -2380,11 +2565,12 @@ class PaperStore:
                 )
 
             overall = _compute_group_stats(all_pnls)
-            return {
+            result: dict[str, Any] = {
                 "window_seconds": window_seconds,
+                "horizon_seconds": horizon,
                 "total_samples": total_samples,
-                "avg_pnl_30s_cents": overall["avg_pnl_30s_cents"],
-                "win_rate_30s": overall["win_rate_30s"],
+                avg_key: overall[avg_key],
+                win_key: overall[win_key],
                 "entry_only_sample_count": int(
                     sum(len(values) for values in entry_only_by_fill_path_values.values())
                 ),
@@ -2396,20 +2582,27 @@ class PaperStore:
                 "by_universe": by_universe,
                 "by_edge_bucket": by_edge_bucket,
             }
+            if horizon == 30:
+                # Preserve historical keys used by existing clients/tests.
+                result["avg_pnl_30s_cents"] = overall[avg_key]
+                result["win_rate_30s"] = overall[win_key]
+            return result
         except sqlite3.Error as e:
             logger.exception(
                 "paper_store_get_short_horizon_outcome_metrics_error",
                 extra={
                     "window_seconds": window_seconds,
                     "edge_bucket_size_cents": edge_bucket_size_cents,
+                    "horizon_seconds": horizon,
                     "error": str(e),
                 },
             )
-            return {
+            error_result: dict[str, Any] = {
                 "window_seconds": window_seconds,
+                "horizon_seconds": horizon,
                 "total_samples": 0,
-                "avg_pnl_30s_cents": None,
-                "win_rate_30s": None,
+                avg_key: None,
+                win_key: None,
                 "entry_only_sample_count": 0,
                 "entry_only_by_side": {},
                 "entry_only_by_fill_path": {},
@@ -2419,6 +2612,10 @@ class PaperStore:
                 "by_universe": {},
                 "by_edge_bucket": [],
             }
+            if horizon == 30:
+                error_result["avg_pnl_30s_cents"] = None
+                error_result["win_rate_30s"] = None
+            return error_result
 
     def get_activity_metrics(self, window_seconds: int = 3600) -> dict[str, Any]:
         """Get lightweight activity metrics for paper trading telemetry.
@@ -2681,6 +2878,39 @@ class PaperStore:
 
                 cursor.execute(
                     """
+                    SELECT i.side, COUNT(*)
+                    FROM paper_fills f
+                    JOIN quote_intents i ON i.id = f.intent_id
+                    WHERE f.fill_ts_ms >= ?
+                      AND i.id NOT LIKE 'exit_intent:%'
+                      AND (f.note IS NULL OR f.note NOT LIKE 'exit%')
+                    GROUP BY i.side
+                    """,
+                    (cutoff_ms,),
+                )
+                side_counts = {str(row[0]).upper(): int(row[1]) for row in cursor.fetchall()}
+
+                cursor.execute(
+                    """
+                    SELECT CASE
+                               WHEN f.note LIKE 'entry_%' THEN REPLACE(f.note, 'entry_', '')
+                               ELSE 'unknown'
+                           END AS fill_path,
+                           COUNT(*)
+                    FROM paper_fills f
+                    JOIN quote_intents i ON i.id = f.intent_id
+                    WHERE f.fill_ts_ms >= ?
+                      AND i.id NOT LIKE 'exit_intent:%'
+                      AND (f.note IS NULL OR f.note NOT LIKE 'exit%')
+                    GROUP BY fill_path
+                    ORDER BY COUNT(*) DESC, fill_path ASC
+                    """,
+                    (cutoff_ms,),
+                )
+                fill_path_counts = {str(row[0]): int(row[1]) for row in cursor.fetchall()}
+
+                cursor.execute(
+                    """
                     SELECT i.ticker,
                            COUNT(*) AS sample_count,
                            AVG(f.pnl_30s_after_fill_cents) AS avg_pnl_30s_cents,
@@ -2747,12 +2977,64 @@ class PaperStore:
                     for row in cursor.fetchall()
                 ]
 
+                cursor.execute(
+                    """
+                    SELECT i.ticker, i.side, COALESCE(i.universe, 'UNKNOWN') AS universe, COUNT(*)
+                    FROM paper_fills f
+                    JOIN quote_intents i ON i.id = f.intent_id
+                    WHERE f.fill_ts_ms >= ?
+                      AND i.id NOT LIKE 'exit_intent:%'
+                      AND (f.note IS NULL OR f.note NOT LIKE 'exit%')
+                    GROUP BY i.ticker, i.side, COALESCE(i.universe, 'UNKNOWN')
+                    ORDER BY COUNT(*) DESC, i.ticker ASC, i.side ASC, universe ASC
+                    """,
+                    (cutoff_ms,),
+                )
+                entry_samples_by_ticker_side = {
+                    f"{str(row[0])}|{str(row[1]).upper()}|{str(row[2]).upper()}": int(row[3])
+                    for row in cursor.fetchall()
+                }
+
+                by_universe_share = {
+                    key: (float(count / total_entry_samples) if total_entry_samples > 0 else 0.0)
+                    for key, count in by_universe_counts.items()
+                }
+                side_share_of_entry_samples = {
+                    key: (float(count / total_entry_samples) if total_entry_samples > 0 else 0.0)
+                    for key, count in side_counts.items()
+                }
+                fill_path_share_of_entry_samples = {
+                    key: (float(count / total_entry_samples) if total_entry_samples > 0 else 0.0)
+                    for key, count in fill_path_counts.items()
+                }
+
+                top_ticker_side_concentration_share = (
+                    float(top_ticker_sides_by_sample_count[0]["sample_count"] / total_entry_samples)
+                    if total_entry_samples > 0 and top_ticker_sides_by_sample_count
+                    else 0.0
+                )
+                top_ticker_concentration_share = (
+                    float(top_tickers_by_sample_count[0]["sample_count"] / total_entry_samples)
+                    if total_entry_samples > 0 and top_tickers_by_sample_count
+                    else 0.0
+                )
+
             return {
                 "window_seconds": int(window_seconds),
                 "total_entry_samples": total_entry_samples,
                 "unique_tickers": unique_tickers,
                 "unique_ticker_side_pairs": unique_ticker_side_pairs,
+                "distinct_ticker_count": unique_tickers,
+                "distinct_ticker_side_count": unique_ticker_side_pairs,
                 "by_universe_counts": by_universe_counts,
+                "by_universe_share_of_entry_samples": by_universe_share,
+                "by_side_counts": side_counts,
+                "side_share_of_entry_samples": side_share_of_entry_samples,
+                "entry_samples_by_fill_path": fill_path_counts,
+                "fill_path_share_of_entry_samples": fill_path_share_of_entry_samples,
+                "entry_samples_by_ticker_side": entry_samples_by_ticker_side,
+                "top_ticker_concentration_share": top_ticker_concentration_share,
+                "top_ticker_side_concentration_share": top_ticker_side_concentration_share,
                 "top_tickers_by_sample_count": top_tickers_by_sample_count,
                 "top_ticker_sides_by_sample_count": top_ticker_sides_by_sample_count,
             }
@@ -2766,9 +3048,172 @@ class PaperStore:
                 "total_entry_samples": 0,
                 "unique_tickers": 0,
                 "unique_ticker_side_pairs": 0,
+                "distinct_ticker_count": 0,
+                "distinct_ticker_side_count": 0,
                 "by_universe_counts": {},
+                "by_universe_share_of_entry_samples": {},
+                "by_side_counts": {},
+                "side_share_of_entry_samples": {},
+                "entry_samples_by_fill_path": {},
+                "fill_path_share_of_entry_samples": {},
+                "entry_samples_by_ticker_side": {},
+                "top_ticker_concentration_share": 0.0,
+                "top_ticker_side_concentration_share": 0.0,
                 "top_tickers_by_sample_count": [],
                 "top_ticker_sides_by_sample_count": [],
+            }
+
+    def get_entry_outcome_summary(
+        self,
+        *,
+        window_seconds: int = 86_400,
+        horizon_seconds: int = 30,
+        edge_bucket_size_cents: float = 1.0,
+    ) -> dict[str, Any]:
+        """Summarize entry-only post-fill outcomes by universe/side/path/edge bucket."""
+        now_ms = int(time.time() * 1000)
+        cutoff_ms = now_ms - max(0, int(window_seconds)) * 1000
+        horizon = int(horizon_seconds)
+        pnl_col = self._pnl_column_for_horizon(horizon)
+        avg_key = f"avg_pnl_{horizon}s_cents"
+        win_key = f"win_rate_{horizon}s"
+        safe_bucket_size = max(0.1, float(edge_bucket_size_cents))
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    f"""
+                      SELECT i.side,
+                          i.ticker,
+                           COALESCE(f.universe, i.universe, 'UNKNOWN') AS universe,
+                           f.note,
+                           i.net_edge,
+                           f.{pnl_col}
+                    FROM paper_fills f
+                    JOIN quote_intents i ON i.id = f.intent_id
+                    WHERE f.fill_ts_ms >= ?
+                      AND i.id NOT LIKE 'exit_intent:%'
+                      AND (f.note IS NULL OR f.note NOT LIKE 'exit%')
+                      AND f.{pnl_col} IS NOT NULL
+                    ORDER BY f.fill_ts_ms DESC
+                    """,
+                    (cutoff_ms,),
+                )
+                rows = cursor.fetchall()
+
+            def _stats(values: list[float]) -> dict[str, Any]:
+                if not values:
+                    return {"sample_count": 0, avg_key: None, win_key: None}
+                count = len(values)
+                return {
+                    "sample_count": count,
+                    avg_key: float(sum(values) / count),
+                    win_key: float(sum(1 for value in values if value > 0) / count),
+                }
+
+            by_universe_values: dict[str, list[float]] = {}
+            by_side_values: dict[str, list[float]] = {}
+            by_fill_path_values: dict[str, list[float]] = {}
+            by_edge_bucket_values: dict[tuple[float, float], list[float]] = {}
+            by_ticker_counts: dict[str, int] = {}
+            by_ticker_side_counts: dict[str, int] = {}
+
+            for side, ticker, universe, note, net_edge, pnl_after in rows:
+                pnl_value = float(pnl_after)
+                ticker_key = str(ticker)
+                universe_key = str(universe or "UNKNOWN").upper()
+                side_key = str(side).upper()
+                ticker_side_key = f"{ticker_key}|{side_key}|{universe_key}"
+                fill_path = "unknown"
+                if isinstance(note, str) and note.startswith("entry_"):
+                    fill_path = note.replace("entry_", "", 1)
+
+                by_universe_values.setdefault(universe_key, []).append(pnl_value)
+                by_side_values.setdefault(side_key, []).append(pnl_value)
+                by_fill_path_values.setdefault(fill_path, []).append(pnl_value)
+                by_ticker_counts[ticker_key] = by_ticker_counts.get(ticker_key, 0) + 1
+                by_ticker_side_counts[ticker_side_key] = (
+                    by_ticker_side_counts.get(ticker_side_key, 0) + 1
+                )
+
+                edge_value = float(net_edge or 0.0)
+                bucket_floor = (edge_value // safe_bucket_size) * safe_bucket_size
+                bucket_key = (bucket_floor, bucket_floor + safe_bucket_size)
+                by_edge_bucket_values.setdefault(bucket_key, []).append(pnl_value)
+
+            by_edge_bucket: list[dict[str, Any]] = []
+            for (edge_low, edge_high), values in sorted(by_edge_bucket_values.items()):
+                by_edge_bucket.append(
+                    {
+                        "edge_bucket_low_cents": edge_low,
+                        "edge_bucket_high_cents": edge_high,
+                        **_stats(values),
+                    }
+                )
+
+            result: dict[str, Any] = {
+                "window_seconds": int(window_seconds),
+                "horizon_seconds": horizon,
+                "total_entry_samples": len(rows),
+                "distinct_ticker_count": len(by_ticker_counts),
+                "distinct_ticker_side_count": len(by_ticker_side_counts),
+                "by_universe": {
+                    key: _stats(values) for key, values in sorted(by_universe_values.items())
+                },
+                "by_side": {key: _stats(values) for key, values in sorted(by_side_values.items())},
+                "by_fill_path": {
+                    key: _stats(values) for key, values in sorted(by_fill_path_values.items())
+                },
+                "entry_samples_by_ticker_side": {
+                    key: int(count) for key, count in sorted(by_ticker_side_counts.items())
+                },
+                "by_edge_bucket": by_edge_bucket,
+            }
+            if result["total_entry_samples"] > 0:
+                top_ticker_count = max(by_ticker_counts.values())
+                top_ticker_side_count = max(by_ticker_side_counts.values())
+                result["top_ticker_concentration_share"] = float(
+                    top_ticker_count / result["total_entry_samples"]
+                )
+                result["top_ticker_side_concentration_share"] = float(
+                    top_ticker_side_count / result["total_entry_samples"]
+                )
+            else:
+                result["top_ticker_concentration_share"] = 0.0
+                result["top_ticker_side_concentration_share"] = 0.0
+            if horizon == 30:
+                # Backward-compatible aliases for legacy tooling.
+                for group in ("by_universe", "by_side", "by_fill_path"):
+                    for stats in result[group].values():
+                        stats["avg_pnl_30s_cents"] = stats[avg_key]
+                        stats["win_rate_30s"] = stats[win_key]
+                for stats in result["by_edge_bucket"]:
+                    stats["avg_pnl_30s_cents"] = stats[avg_key]
+                    stats["win_rate_30s"] = stats[win_key]
+            return result
+        except sqlite3.Error as e:
+            logger.exception(
+                "paper_store_get_entry_outcome_summary_error",
+                extra={
+                    "window_seconds": window_seconds,
+                    "horizon_seconds": horizon,
+                    "error": str(e),
+                },
+            )
+            return {
+                "window_seconds": int(window_seconds),
+                "horizon_seconds": horizon,
+                "total_entry_samples": 0,
+                "distinct_ticker_count": 0,
+                "distinct_ticker_side_count": 0,
+                "by_universe": {},
+                "by_side": {},
+                "by_fill_path": {},
+                "entry_samples_by_ticker_side": {},
+                "top_ticker_concentration_share": 0.0,
+                "top_ticker_side_concentration_share": 0.0,
+                "by_edge_bucket": [],
             }
 
     def get_fills_for_position(self, ticker: str, side: str) -> list[dict[str, Any]]:

@@ -67,58 +67,62 @@ async def _fetch_mark_price_cents(
 
 
 async def _update_fill_30s_outcomes(*, client: KalshiClient, now_ms: int) -> None:
-    """Backfill 30s post-fill mark and side-aware short-horizon PnL telemetry."""
+    """Backfill post-fill marks and side-aware short-horizon PnL telemetry."""
     if runtime_state.paper_store is None:
         return
 
-    cutoff_ts_ms = now_ms - 30_000
-    pending = runtime_state.paper_store.get_pending_fill_30s_outcome_updates(
-        cutoff_ts_ms=cutoff_ts_ms,
-        limit=200,
-    )
-    if not pending:
-        return
-
-    updated_count = 0
-    for row in pending:
-        mark_price = _get_mark_price_for_position(
-            ticker=row["ticker"],
-            side=row["side"],
-            snapshot=runtime_state.top_signals_snapshot,
+    updated_by_horizon: dict[int, int] = {}
+    for horizon_seconds in (5, 15, 30, 60):
+        cutoff_ts_ms = now_ms - (horizon_seconds * 1000)
+        pending = runtime_state.paper_store.get_pending_fill_outcome_updates(
+            horizon_seconds=horizon_seconds,
+            cutoff_ts_ms=cutoff_ts_ms,
+            limit=200,
         )
-        if mark_price is None:
-            mark_price = await _fetch_mark_price_cents(
-                client,
-                row["ticker"],
-                row["side"],
-            )
-        if mark_price is None:
+        if not pending:
             continue
 
-        pnl_30s_after_fill_cents = PaperStore.compute_short_horizon_fill_pnl_cents(
-            side=str(row["side"]),
-            fill_price_cents=float(row["fill_price_cents"]),
-            fill_size=int(row["fill_size"]),
-            mark_price_cents=float(mark_price),
-            fill_fee_cents=(
-                float(row["fill_fee_cents"]) if row.get("fill_fee_cents") is not None else None
-            ),
-        )
-        did_update = runtime_state.paper_store.update_fill_30s_outcome(
-            fill_id=str(row["fill_id"]),
-            mark_30s_after_fill_cents=float(mark_price),
-            pnl_30s_after_fill_cents=pnl_30s_after_fill_cents,
-        )
-        if did_update:
-            updated_count += 1
+        updated_count = 0
+        for row in pending:
+            mark_price = _get_mark_price_for_position(
+                ticker=row["ticker"],
+                side=row["side"],
+                snapshot=runtime_state.top_signals_snapshot,
+            )
+            if mark_price is None:
+                mark_price = await _fetch_mark_price_cents(
+                    client,
+                    row["ticker"],
+                    row["side"],
+                )
+            if mark_price is None:
+                continue
 
-    if updated_count > 0:
+            pnl_after_fill_cents = PaperStore.compute_short_horizon_fill_pnl_cents(
+                side=str(row["side"]),
+                fill_price_cents=float(row["fill_price_cents"]),
+                fill_size=int(row["fill_size"]),
+                mark_price_cents=float(mark_price),
+                fill_fee_cents=(
+                    float(row["fill_fee_cents"]) if row.get("fill_fee_cents") is not None else None
+                ),
+            )
+            did_update = runtime_state.paper_store.update_fill_outcome(
+                fill_id=str(row["fill_id"]),
+                horizon_seconds=horizon_seconds,
+                mark_after_fill_cents=float(mark_price),
+                pnl_after_fill_cents=pnl_after_fill_cents,
+            )
+            if did_update:
+                updated_count += 1
+
+        if updated_count > 0:
+            updated_by_horizon[horizon_seconds] = updated_count
+
+    if updated_by_horizon:
         logger.info(
-            "paper_fill_30s_outcomes_updated",
-            extra={
-                "updated_count": updated_count,
-                "pending_count": len(pending),
-            },
+            "paper_fill_outcomes_updated",
+            extra={"updated_by_horizon": updated_by_horizon},
         )
 
 

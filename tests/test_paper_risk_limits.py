@@ -15,6 +15,44 @@ from kalshi_edge_engine.db.paper_store import PaperStore
 from kalshi_edge_engine.engine.paper import QuoteIntent
 from kalshi_edge_engine.engine.paper_sim import Fill
 from kalshi_edge_engine.engine.signal import SIGNAL_VALID, SPREAD_TOO_SMALL, Signal
+from kalshi_edge_engine.runtime import config as runtime_config
+
+
+def _clear_universe_specific_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    keys = [
+        "PAPER_NBA_MIN_EDGE_CENTS",
+        "PAPER_NBA_ALLOW_YES_ENTRIES",
+        "PAPER_NBA_ALLOW_NO_ENTRIES",
+        "PAPER_NBA_MIN_TOP_LIQUIDITY",
+        "PAPER_NBA_REQUIRE_SIGNAL_VALID_ONLY",
+        "PAPER_NBA_MIN_CAPTURABLE_EDGE_TO_CROSS_CENTS",
+        "PAPER_NBA_MIN_ABS_DISTANCE_FROM_50_CENTS",
+        "PAPER_NBA_MIN_REENTRY_DELAY_SECONDS_SAME_TICKER_SIDE",
+        "PAPER_NBA_ALLOW_PRICE_IMPROVES",
+        "PAPER_NBA_MIN_EDGE_CENTS_PRICE_IMPROVES",
+        "PAPER_NBA_ALLOW_MOVED_THROUGH",
+        "PAPER_NBA_MIN_EDGE_CENTS_MOVED_THROUGH",
+        "PAPER_NBA_MAX_ENTRY_SAMPLES_PER_TICKER_PER_HOUR",
+        "PAPER_NBA_MAX_ENTRY_SAMPLES_PER_TICKER_SIDE_PER_HOUR",
+        "PAPER_NBA_MIN_DISTINCT_TICKERS_FOR_STRATEGY_CONFIDENCE",
+        "PAPER_CBB_MIN_EDGE_CENTS",
+        "PAPER_CBB_ALLOW_YES_ENTRIES",
+        "PAPER_CBB_ALLOW_NO_ENTRIES",
+        "PAPER_CBB_MIN_TOP_LIQUIDITY",
+        "PAPER_CBB_REQUIRE_SIGNAL_VALID_ONLY",
+        "PAPER_CBB_MIN_CAPTURABLE_EDGE_TO_CROSS_CENTS",
+        "PAPER_CBB_MIN_ABS_DISTANCE_FROM_50_CENTS",
+        "PAPER_CBB_MIN_REENTRY_DELAY_SECONDS_SAME_TICKER_SIDE",
+        "PAPER_CBB_ALLOW_PRICE_IMPROVES",
+        "PAPER_CBB_MIN_EDGE_CENTS_PRICE_IMPROVES",
+        "PAPER_CBB_ALLOW_MOVED_THROUGH",
+        "PAPER_CBB_MIN_EDGE_CENTS_MOVED_THROUGH",
+        "PAPER_CBB_MAX_ENTRY_SAMPLES_PER_TICKER_PER_HOUR",
+        "PAPER_CBB_MAX_ENTRY_SAMPLES_PER_TICKER_SIDE_PER_HOUR",
+        "PAPER_CBB_MIN_DISTINCT_TICKERS_FOR_STRATEGY_CONFIDENCE",
+    ]
+    for key in keys:
+        monkeypatch.delenv(key, raising=False)
 
 
 @pytest.mark.asyncio
@@ -287,6 +325,12 @@ async def test_process_paper_intents_task_callback_removes_done_task(
         round_trip=True,
     )
 
+    _clear_universe_specific_overrides(monkeypatch)
+    monkeypatch.setattr(runtime_config, "PAPER_ALLOW_PRICE_IMPROVES", True)
+    monkeypatch.setattr(runtime_config, "PAPER_ALLOW_MOVED_THROUGH", True)
+    monkeypatch.setattr(runtime_config, "PAPER_MIN_EDGE_CENTS_PRICE_IMPROVES", None)
+    monkeypatch.setattr(runtime_config, "PAPER_MIN_EDGE_CENTS_MOVED_THROUGH", None)
+
     class _ImmediateSimulator:
         def __init__(self, *args, **kwargs) -> None:
             pass
@@ -513,6 +557,12 @@ async def test_process_paper_intents_side_gate_disables_yes(
         round_trip=True,
     )
 
+    _clear_universe_specific_overrides(monkeypatch)
+    monkeypatch.setattr(runtime_config, "PAPER_ALLOW_PRICE_IMPROVES", True)
+    monkeypatch.setattr(runtime_config, "PAPER_ALLOW_MOVED_THROUGH", True)
+    monkeypatch.setattr(runtime_config, "PAPER_MIN_EDGE_CENTS_PRICE_IMPROVES", None)
+    monkeypatch.setattr(runtime_config, "PAPER_MIN_EDGE_CENTS_MOVED_THROUGH", None)
+
     class _NoFillSimulator:
         def __init__(self, *args, **kwargs) -> None:
             pass
@@ -613,6 +663,12 @@ async def test_process_paper_intents_side_gate_disables_no(
         fee_mode="maker",
         round_trip=True,
     )
+
+    _clear_universe_specific_overrides(monkeypatch)
+    monkeypatch.setattr(runtime_config, "PAPER_ALLOW_PRICE_IMPROVES", True)
+    monkeypatch.setattr(runtime_config, "PAPER_ALLOW_MOVED_THROUGH", True)
+    monkeypatch.setattr(runtime_config, "PAPER_MIN_EDGE_CENTS_PRICE_IMPROVES", None)
+    monkeypatch.setattr(runtime_config, "PAPER_MIN_EDGE_CENTS_MOVED_THROUGH", None)
 
     monkeypatch.setattr(main_module, "_ENABLE_PAPER_TRADING", True)
     monkeypatch.setattr(main_module, "_paper_enabled", True)

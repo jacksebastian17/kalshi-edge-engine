@@ -961,6 +961,126 @@ class TestPaperMetricsEndpoint:
                 with contextlib.suppress(OSError):
                     os.unlink(db_path)
 
+    def test_paper_outcome_metrics_supports_horizon_parameter(self, client: TestClient) -> None:
+        """GET /paper/metrics/outcomes should support non-30s horizons additively."""
+        import kalshi_edge_engine.api.main as main_module
+
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            store = PaperStore(db_path=db_path)
+            main_module._paper_store = store
+
+            now_ms = int(time.time() * 1000)
+            intent = QuoteIntent(
+                id="intent-outcome-api-5s",
+                ticker="KXNBAGAME-OUTCOME-API-5S",
+                side="YES",
+                quote_price_cents=50.0,
+                size_contracts=1,
+                created_ts_ms=now_ms - 90_000,
+                net_edge=1.2,
+                inside_width=2.0,
+                imbalance_gap=0.0,
+                fee_mode="maker",
+                round_trip=True,
+            )
+            store.insert_intent(intent)
+            assert store.insert_fill(
+                fill_id="fill-outcome-api-5s",
+                intent_id=intent.id,
+                fill_ts_ms=now_ms - 60_000,
+                fill_price_cents=50.0,
+                fill_size=1,
+                remaining_size=0,
+                queue_ahead_at_fill=0,
+                fill_fee_cents=0.1,
+                note="entry_queue_cleared",
+            )
+            assert store.update_fill_outcome(
+                fill_id="fill-outcome-api-5s",
+                horizon_seconds=5,
+                mark_after_fill_cents=50.3,
+                pnl_after_fill_cents=0.2,
+            )
+
+            response = client.get("/paper/metrics/outcomes?window_seconds=3600&horizon_seconds=5")
+            assert response.status_code == 200
+            data = response.json()
+            assert data["horizon_seconds"] == 5
+            assert data["avg_pnl_5s_cents"] == pytest.approx(0.2)
+            assert data["win_rate_5s"] == pytest.approx(1.0)
+            assert "avg_pnl_30s_cents" not in data
+            assert "win_rate_30s" not in data
+        finally:
+            main_module._paper_store = None
+            gc.collect()
+            if os.path.exists(db_path):
+                with contextlib.suppress(OSError):
+                    os.unlink(db_path)
+
+    def test_paper_entry_outcome_summary_endpoint(self, client: TestClient) -> None:
+        """Entry summary endpoint should group by universe/side/fill path/edge buckets."""
+        import kalshi_edge_engine.api.main as main_module
+
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            store = PaperStore(db_path=db_path)
+            main_module._paper_store = store
+
+            now_ms = int(time.time() * 1000)
+            intent = QuoteIntent(
+                id="intent-entry-summary-1",
+                ticker="KXCBBGAME-ENTRY-SUMMARY-1",
+                universe="CBB",
+                side="NO",
+                quote_price_cents=49.0,
+                size_contracts=1,
+                created_ts_ms=now_ms - 90_000,
+                net_edge=1.7,
+                inside_width=2.0,
+                imbalance_gap=0.0,
+                fee_mode="maker",
+                round_trip=True,
+            )
+            store.insert_intent(intent)
+            assert store.insert_fill(
+                fill_id="fill-entry-summary-1",
+                intent_id=intent.id,
+                fill_ts_ms=now_ms - 60_000,
+                fill_price_cents=49.0,
+                fill_size=1,
+                remaining_size=0,
+                queue_ahead_at_fill=0,
+                fill_fee_cents=0.1,
+                note="entry_moved_through",
+            )
+            assert store.update_fill_30s_outcome(
+                fill_id="fill-entry-summary-1",
+                mark_30s_after_fill_cents=48.2,
+                pnl_30s_after_fill_cents=0.7,
+            )
+
+            response = client.get("/paper/metrics/outcomes/entry-summary?window_seconds=3600")
+            assert response.status_code == 200
+            data = response.json()
+            assert data["total_entry_samples"] == 1
+            assert data["distinct_ticker_count"] == 1
+            assert data["distinct_ticker_side_count"] == 1
+            assert data["top_ticker_concentration_share"] == pytest.approx(1.0)
+            assert data["top_ticker_side_concentration_share"] == pytest.approx(1.0)
+            assert data["by_universe"]["CBB"]["sample_count"] == 1
+            assert data["by_side"]["NO"]["sample_count"] == 1
+            assert data["by_fill_path"]["moved_through"]["sample_count"] == 1
+            assert len(data["by_edge_bucket"]) == 1
+        finally:
+            main_module._paper_store = None
+            gc.collect()
+            if os.path.exists(db_path):
+                with contextlib.suppress(OSError):
+                    os.unlink(db_path)
+
     def test_paper_outcome_audit_excludes_exit_intents(self, client: TestClient) -> None:
         """GET /paper/metrics/outcomes/audit should return ENTRY rows only."""
         import kalshi_edge_engine.api.main as main_module
@@ -1357,6 +1477,8 @@ class TestPaperMetricsEndpoint:
             assert data["total_entry_samples"] == 3
             assert data["unique_tickers"] == 2
             assert data["unique_ticker_side_pairs"] == 2
+            assert data["distinct_ticker_count"] == 2
+            assert data["distinct_ticker_side_count"] == 2
 
             assert data["top_tickers_by_sample_count"][0]["ticker"] == "KXNBAGAME-CONC-A"
             assert data["top_tickers_by_sample_count"][0]["sample_count"] == 2
@@ -1364,10 +1486,22 @@ class TestPaperMetricsEndpoint:
                 0.05
             )
             assert data["top_tickers_by_sample_count"][0]["win_rate_30s"] == pytest.approx(0.5)
+            assert data["top_ticker_concentration_share"] == pytest.approx(2 / 3)
 
             assert data["top_ticker_sides_by_sample_count"][0]["ticker"] == "KXNBAGAME-CONC-A"
             assert data["top_ticker_sides_by_sample_count"][0]["side"] == "YES"
             assert data["top_ticker_sides_by_sample_count"][0]["sample_count"] == 2
+
+            assert data["entry_samples_by_fill_path"]["queue_cleared"] == 2
+            assert data["entry_samples_by_fill_path"]["moved_through"] == 1
+            assert data["fill_path_share_of_entry_samples"]["queue_cleared"] == pytest.approx(2 / 3)
+            assert data["entry_samples_by_ticker_side"]["KXNBAGAME-CONC-A|YES|UNKNOWN"] == 2
+            assert data["entry_samples_by_ticker_side"]["KXNBAGAME-CONC-B|NO|UNKNOWN"] == 1
+            assert data["top_ticker_side_concentration_share"] == pytest.approx(2 / 3)
+            assert data["side_share_of_entry_samples"]["YES"] == pytest.approx(2 / 3)
+            assert data["side_share_of_entry_samples"]["NO"] == pytest.approx(1 / 3)
+            assert data["min_distinct_tickers_for_strategy_confidence"] is None
+            assert data["meets_distinct_ticker_confidence_threshold"] is None
         finally:
             main_module._paper_store = None
             gc.collect()
