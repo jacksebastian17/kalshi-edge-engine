@@ -7,10 +7,10 @@ This project is intentionally **paper-only** right now:
 - Uses Kalshi market data endpoints (`GET`)
 - Generates structured signal decisions
 - Runs a continuous background scanner
-- Simulates fills with a conservative queue/volume-aware model
+- Simulates fills with a heuristic, queue/volume-aware model that is being actively hardened for realism
 - Persists paper state and PnL in SQLite
 - Exposes a local FastAPI backend + React dashboard
-- Produces telemetry to compare predicted edge vs realized post-fill outcomes
+- Produces telemetry to compare predicted edge vs realized post-fill outcomes and identify when paper profitability depends on fragile fill paths
 
 It does **not** place live orders.
 
@@ -26,7 +26,7 @@ The strategy layer is currently focused on structural market conditions:
 - liquidity,
 - imbalance,
 - fee-aware entry economics,
-- conservative paper execution assumptions,
+- heuristic paper execution assumptions that are being stress-tested and tightened over time,
 - post-fill outcome telemetry.
 
 The system is built to answer:
@@ -50,6 +50,33 @@ Important stance:
 - Universe-specific thresholds and simulator assumptions are expected to diverge over time
 - Good paper results are **not** proof of live tradability
 - The purpose of telemetry is to **validate or falsify** strategy assumptions before live trading is considered
+
+## Current empirical status
+
+The project has now demonstrated that the paper stack can:
+
+- generate entry intents,
+- simulate fills,
+- open and close positions,
+- persist fills and exits,
+- and produce realized PnL and multi-horizon outcome telemetry.
+
+However, current positive paper results should still be treated as provisional.
+
+Recent multi-hour NBA paper runs have shown credible end-to-end runtime behavior and positive realized paper PnL, but that profitability has been heavily influenced by `moved_through` entries and should therefore be treated as a research signal, not a live-tradability conclusion.
+
+At the moment, observed profitable paper behavior has been driven heavily by the `moved_through` fill path. That path is useful for research and diagnostics, but it is not yet trusted as a strong proxy for live execution quality. In particular:
+
+- moved-through fills may over-credit stale or gap-through book transitions,
+- short-horizon post-fill outcomes can look unrealistically strong,
+- headline paper PnL may therefore overstate realizable edge.
+
+So the current state of the project is:
+
+- **runtime/accounting infrastructure: increasingly credible**
+- **signal discovery: promising**
+- **execution realism: still under active validation**
+- **live-trading readiness: not yet established**
 
 ---
 
@@ -79,7 +106,7 @@ Important stance:
 
 - Quote intent generation from qualifying signals
 - Universe-aware entry gating
-- Conservative fill simulation via `RealisticOrderSimulator`
+- Heuristic fill simulation via `RealisticOrderSimulator`
 - Queue-ahead + traded-volume-aware fill eligibility
 - Path-aware entry policy:
   - `price_improves`
@@ -510,6 +537,16 @@ VITE_API_BASE_URL=http://localhost:8000
 
 ---
 
+## Current known limitations
+
+- The simulator is still heuristic and may over-credit some `moved_through` fills.
+- Positive short-horizon post-fill outcomes do not yet imply live realizability.
+- Current paper profitability may be sensitive to fill-path mix rather than broad execution robustness.
+- Queue-cleared fills are currently the more trustworthy baseline for strategy validation.
+- Additional confidence should come from broader ticker coverage, stricter path gating, and sustained behavior across longer runs.
+
+---
+
 ## Verification workflow
 
 Run backend quality gates:
@@ -563,19 +600,20 @@ curl http://localhost:8000/paper/metrics/outcomes/audit
 A few important cautions:
 
 - positive paper PnL is **not** proof of live EV
-- low fill count means outcome metrics are fragile
+- low fill count makes outcome metrics fragile
 - repeated fills in one ticker can make results look stronger than they are
-- price-improving fills should be treated with extra skepticism
-- moved-through fills may carry adverse-selection risk
-- concentration metrics matter as much as raw win rate
+- `price_improves` fills should be treated with extra skepticism
+- `moved_through` fills are currently a major realism-risk path and should not be treated as high-confidence evidence of live capture
+- if most positive results come from one fill path, that is a warning sign, not validation
+- concentration metrics and fill-path mix matter as much as headline PnL
 
-Good signs are:
+Stronger signs are:
 
 - fills across multiple distinct tickers
-- stable positive short-horizon outcomes across more than one path
-- low dependence on one ticker or one repeated setup
+- positive outcomes across broader samples
+- evidence that queue-cleared fills, not just moved-through fills, retain edge
+- stable behavior under stricter path gating
 - consistent realized/unrealized accounting
-- strategy still looking reasonable under stricter thresholds
 
 ---
 

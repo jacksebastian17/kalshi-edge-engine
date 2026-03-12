@@ -1074,6 +1074,167 @@ class TestPaperMetricsEndpoint:
             assert data["by_side"]["NO"]["sample_count"] == 1
             assert data["by_fill_path"]["moved_through"]["sample_count"] == 1
             assert len(data["by_edge_bucket"]) == 1
+            assert data["queue_cleared_only_sample_count"] == 0
+            assert data["queue_cleared_only_avg_pnl_30s_cents"] is None
+            assert data["queue_cleared_only_win_rate_30s"] is None
+            assert data["headline_included_fill_paths"] == ["moved_through"]
+            assert data["headline_excluded_fill_paths"] == []
+            assert data["headline_meets_distinct_ticker_threshold"] is None
+            assert data["headline_meets_concentration_threshold"] is None
+            assert data["headline_is_confidence_eligible"] is None
+        finally:
+            main_module._paper_store = None
+            gc.collect()
+            if os.path.exists(db_path):
+                with contextlib.suppress(OSError):
+                    os.unlink(db_path)
+
+    def test_paper_entry_outcome_summary_endpoint_truth_mode_filters_headline(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Entry summary truth-mode controls should filter headline paths and set eligibility flags."""
+        import kalshi_edge_engine.api.main as main_module
+        from kalshi_edge_engine.runtime import config as runtime_config
+
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            store = PaperStore(db_path=db_path)
+            main_module._paper_store = store
+
+            monkeypatch.setattr(
+                runtime_config, "PAPER_NBA_REPORT_ONLY_FILL_PATHS", ("queue_cleared",)
+            )
+            monkeypatch.setattr(
+                runtime_config,
+                "PAPER_NBA_EXCLUDE_FILL_PATHS_FROM_HEADLINE",
+                ("moved_through",),
+            )
+            monkeypatch.setattr(runtime_config, "PAPER_NBA_HEADLINE_MIN_DISTINCT_TICKERS", 2)
+            monkeypatch.setattr(runtime_config, "PAPER_NBA_HEADLINE_MAX_TOP_TICKER_SHARE", 0.60)
+
+            now_ms = int(time.time() * 1000)
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO quote_intents
+                    (id, ticker, side, quote_price_cents, size_contracts, created_ts_ms,
+                     net_edge, inside_width, imbalance_gap, fee_mode, round_trip, status, universe)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "entry-summary-truth-a",
+                        "KXNBAGAME-ENTRY-TRUTH-A",
+                        "YES",
+                        50.0,
+                        1,
+                        now_ms - 100_000,
+                        1.0,
+                        2.0,
+                        0.0,
+                        "maker",
+                        True,
+                        "FILLED",
+                        "NBA",
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO quote_intents
+                    (id, ticker, side, quote_price_cents, size_contracts, created_ts_ms,
+                     net_edge, inside_width, imbalance_gap, fee_mode, round_trip, status, universe)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "entry-summary-truth-b",
+                        "KXNBAGAME-ENTRY-TRUTH-A",
+                        "NO",
+                        49.0,
+                        1,
+                        now_ms - 90_000,
+                        1.0,
+                        2.0,
+                        0.0,
+                        "maker",
+                        True,
+                        "FILLED",
+                        "NBA",
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO quote_intents
+                    (id, ticker, side, quote_price_cents, size_contracts, created_ts_ms,
+                     net_edge, inside_width, imbalance_gap, fee_mode, round_trip, status, universe)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "entry-summary-truth-c",
+                        "KXNBAGAME-ENTRY-TRUTH-B",
+                        "YES",
+                        50.0,
+                        1,
+                        now_ms - 80_000,
+                        1.0,
+                        2.0,
+                        0.0,
+                        "maker",
+                        True,
+                        "FILLED",
+                        "NBA",
+                    ),
+                )
+                conn.commit()
+
+            assert store.insert_fill(
+                fill_id="fill-entry-summary-truth-a",
+                intent_id="entry-summary-truth-a",
+                fill_ts_ms=now_ms - 70_000,
+                fill_price_cents=50.0,
+                fill_size=1,
+                remaining_size=0,
+                queue_ahead_at_fill=0,
+                fill_fee_cents=0.1,
+                note="entry_queue_cleared",
+                pnl_30s_after_fill_cents=0.3,
+            )
+            assert store.insert_fill(
+                fill_id="fill-entry-summary-truth-b",
+                intent_id="entry-summary-truth-b",
+                fill_ts_ms=now_ms - 60_000,
+                fill_price_cents=49.0,
+                fill_size=1,
+                remaining_size=0,
+                queue_ahead_at_fill=0,
+                fill_fee_cents=0.1,
+                note="entry_queue_cleared",
+                pnl_30s_after_fill_cents=0.1,
+            )
+            assert store.insert_fill(
+                fill_id="fill-entry-summary-truth-c",
+                intent_id="entry-summary-truth-c",
+                fill_ts_ms=now_ms - 50_000,
+                fill_price_cents=50.0,
+                fill_size=1,
+                remaining_size=0,
+                queue_ahead_at_fill=0,
+                fill_fee_cents=0.1,
+                note="entry_moved_through",
+                pnl_30s_after_fill_cents=-0.2,
+            )
+
+            response = client.get("/paper/metrics/outcomes/entry-summary?window_seconds=3600")
+            assert response.status_code == 200
+            data = response.json()
+
+            assert data["queue_cleared_only_sample_count"] == 2
+            assert data["queue_cleared_only_avg_pnl_30s_cents"] == pytest.approx(0.2)
+            assert data["queue_cleared_only_win_rate_30s"] == pytest.approx(1.0)
+            assert data["headline_included_fill_paths"] == ["queue_cleared"]
+            assert data["headline_excluded_fill_paths"] == ["moved_through"]
+            assert data["headline_meets_distinct_ticker_threshold"] is False
+            assert data["headline_meets_concentration_threshold"] is False
+            assert data["headline_is_confidence_eligible"] is False
         finally:
             main_module._paper_store = None
             gc.collect()
@@ -1790,6 +1951,14 @@ class TestPaperConfigAndSummaryEndpoints:
             assert data["unique_entry_ticker_side_pairs_count"] == 1
             assert data["unique_filled_entry_tickers_count"] == 1
             assert data["unique_filled_entry_ticker_side_pairs_count"] == 1
+            assert data["queue_cleared_only_sample_count"] == 0
+            assert data["queue_cleared_only_avg_pnl_30s_cents"] is None
+            assert data["queue_cleared_only_win_rate_30s"] is None
+            assert data["headline_included_fill_paths"] == []
+            assert data["headline_excluded_fill_paths"] == []
+            assert data["headline_meets_distinct_ticker_threshold"] is None
+            assert data["headline_meets_concentration_threshold"] is None
+            assert data["headline_is_confidence_eligible"] is None
         finally:
             main_module._paper_store = None
             main_module._paper_enabled = False

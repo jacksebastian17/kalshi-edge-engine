@@ -144,6 +144,23 @@ Prefer metrics that reveal:
 * fragile sample sizes,
 * universe-specific behavior differences.
 
+## 5) Current empirical finding: moved-through fills dominate observed paper profitability
+
+Recent NBA paper runs showed:
+
+- paper runtime plumbing is functioning end-to-end,
+- entries, fills, exits, and accounting are occurring,
+- realized paper PnL can appear positive across a multi-hour run,
+- but filled entry samples are currently dominated by the `moved_through` path,
+- and short-horizon outcome telemetry for those fills has looked unrealistically strong.
+
+This means:
+
+- current paper profitability must not be treated as strong evidence of live edge,
+- `moved_through` fills should be treated as a realism-risk path until stricter validation proves otherwise,
+- README language, metrics interpretation, and simulator changes should reflect that current caveat explicitly,
+- queue-cleared behavior remains the more trustworthy baseline for strategy validation.
+
 ---
 
 # Primary Objective
@@ -200,7 +217,10 @@ toward:
 * Do not make simulator logic more favorable without strong justification.
 * If uncertain, bias toward underestimating fills / profitability.
 * Treat price-improving fills with special skepticism.
-* Treat moved-through fills as potentially adverse-selection-heavy unless data proves otherwise.
+* Treat moved-through fills as a currently high-risk / low-trust execution path.
+* Do not treat moved-through-driven paper profitability as strong evidence of strategy quality.
+* Any logic that expands moved-through fill credit must be justified by stronger telemetry and conservative tests.
+* Prefer queue-cleared evidence over moved-through evidence when evaluating whether the strategy survives realistic assumptions.
 
 ## 7) Refactors must preserve runtime truth
 

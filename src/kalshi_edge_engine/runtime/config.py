@@ -123,6 +123,42 @@ PAPER_MIN_DISTINCT_TICKERS_FOR_STRATEGY_CONFIDENCE = (
     and _paper_min_distinct_tickers_for_strategy_confidence_raw.strip() != ""
     else None
 )
+_paper_nba_report_only_fill_paths_raw = os.getenv("PAPER_NBA_REPORT_ONLY_FILL_PATHS")
+PAPER_NBA_REPORT_ONLY_FILL_PATHS = (
+    tuple(
+        path.strip().lower()
+        for path in _paper_nba_report_only_fill_paths_raw.split(",")
+        if path.strip() != ""
+    )
+    if _paper_nba_report_only_fill_paths_raw is not None
+    else None
+)
+_paper_nba_exclude_fill_paths_from_headline_raw = os.getenv(
+    "PAPER_NBA_EXCLUDE_FILL_PATHS_FROM_HEADLINE"
+)
+PAPER_NBA_EXCLUDE_FILL_PATHS_FROM_HEADLINE = (
+    tuple(
+        path.strip().lower()
+        for path in _paper_nba_exclude_fill_paths_from_headline_raw.split(",")
+        if path.strip() != ""
+    )
+    if _paper_nba_exclude_fill_paths_from_headline_raw is not None
+    else None
+)
+_paper_nba_headline_min_distinct_tickers_raw = os.getenv("PAPER_NBA_HEADLINE_MIN_DISTINCT_TICKERS")
+PAPER_NBA_HEADLINE_MIN_DISTINCT_TICKERS = (
+    int(_paper_nba_headline_min_distinct_tickers_raw.strip())
+    if _paper_nba_headline_min_distinct_tickers_raw is not None
+    and _paper_nba_headline_min_distinct_tickers_raw.strip() != ""
+    else None
+)
+_paper_nba_headline_max_top_ticker_share_raw = os.getenv("PAPER_NBA_HEADLINE_MAX_TOP_TICKER_SHARE")
+PAPER_NBA_HEADLINE_MAX_TOP_TICKER_SHARE = (
+    float(_paper_nba_headline_max_top_ticker_share_raw.strip())
+    if _paper_nba_headline_max_top_ticker_share_raw is not None
+    and _paper_nba_headline_max_top_ticker_share_raw.strip() != ""
+    else None
+)
 PAPER_SIMULATED_VOLUME_PER_POLL = int(os.getenv("PAPER_SIMULATED_VOLUME_PER_POLL", "50"))
 PAPER_MAX_INTENTS_PER_MINUTE = int(os.getenv("PAPER_MAX_INTENTS_PER_MINUTE", "10"))
 PAPER_TICKER_COOLDOWN_SECONDS = int(os.getenv("PAPER_TICKER_COOLDOWN_SECONDS", "120"))
@@ -159,6 +195,10 @@ class PaperRuntimeConfig:
     max_entry_samples_per_ticker_per_hour: int | None
     max_entry_samples_per_ticker_side_per_hour: int | None
     min_distinct_tickers_for_strategy_confidence: int | None
+    report_only_fill_paths: tuple[str, ...] | None
+    exclude_fill_paths_from_headline: tuple[str, ...] | None
+    headline_min_distinct_tickers: int | None
+    headline_max_top_ticker_share: float | None
     simulated_volume_per_poll: int
     ticker_cooldown_seconds: int
 
@@ -199,6 +239,13 @@ def _parse_env_optional_int(raw: str) -> int | None:
     return int(stripped)
 
 
+def _parse_env_optional_str_list(raw: str) -> tuple[str, ...] | None:
+    values = tuple(part.strip().lower() for part in raw.split(",") if part.strip() != "")
+    if not values:
+        return None
+    return values
+
+
 def _resolve_with_override(
     *,
     universe: str,
@@ -216,6 +263,62 @@ def get_effective_paper_config(universe: str) -> PaperRuntimeConfig:
     Falls back to existing global PAPER_* values when no universe override exists.
     """
     universe_key = (universe or "NBA").upper().strip()
+    nba_report_only_fill_paths = (
+        _resolve_with_override(
+            universe=universe_key,
+            suffix="REPORT_ONLY_FILL_PATHS",
+            default=PAPER_NBA_REPORT_ONLY_FILL_PATHS,
+            parser=_parse_env_optional_str_list,
+        )
+        if universe_key == "NBA"
+        else _env_override(
+            universe=universe_key,
+            suffix="REPORT_ONLY_FILL_PATHS",
+            parser=_parse_env_optional_str_list,
+        )
+    )
+    nba_exclude_fill_paths_from_headline = (
+        _resolve_with_override(
+            universe=universe_key,
+            suffix="EXCLUDE_FILL_PATHS_FROM_HEADLINE",
+            default=PAPER_NBA_EXCLUDE_FILL_PATHS_FROM_HEADLINE,
+            parser=_parse_env_optional_str_list,
+        )
+        if universe_key == "NBA"
+        else _env_override(
+            universe=universe_key,
+            suffix="EXCLUDE_FILL_PATHS_FROM_HEADLINE",
+            parser=_parse_env_optional_str_list,
+        )
+    )
+    nba_headline_min_distinct_tickers = (
+        _resolve_with_override(
+            universe=universe_key,
+            suffix="HEADLINE_MIN_DISTINCT_TICKERS",
+            default=PAPER_NBA_HEADLINE_MIN_DISTINCT_TICKERS,
+            parser=_parse_env_optional_int,
+        )
+        if universe_key == "NBA"
+        else _env_override(
+            universe=universe_key,
+            suffix="HEADLINE_MIN_DISTINCT_TICKERS",
+            parser=_parse_env_optional_int,
+        )
+    )
+    nba_headline_max_top_ticker_share = (
+        _resolve_with_override(
+            universe=universe_key,
+            suffix="HEADLINE_MAX_TOP_TICKER_SHARE",
+            default=PAPER_NBA_HEADLINE_MAX_TOP_TICKER_SHARE,
+            parser=_parse_env_optional_float,
+        )
+        if universe_key == "NBA"
+        else _env_override(
+            universe=universe_key,
+            suffix="HEADLINE_MAX_TOP_TICKER_SHARE",
+            parser=_parse_env_optional_float,
+        )
+    )
     return PaperRuntimeConfig(
         universe=universe_key,
         min_edge_cents=_resolve_with_override(
@@ -350,6 +453,10 @@ def get_effective_paper_config(universe: str) -> PaperRuntimeConfig:
             default=PAPER_MIN_DISTINCT_TICKERS_FOR_STRATEGY_CONFIDENCE,
             parser=_parse_env_optional_int,
         ),
+        report_only_fill_paths=nba_report_only_fill_paths,
+        exclude_fill_paths_from_headline=nba_exclude_fill_paths_from_headline,
+        headline_min_distinct_tickers=nba_headline_min_distinct_tickers,
+        headline_max_top_ticker_share=nba_headline_max_top_ticker_share,
         simulated_volume_per_poll=_resolve_with_override(
             universe=universe_key,
             suffix="SIMULATED_VOLUME_PER_POLL",

@@ -489,20 +489,29 @@ class TestPaperStore:
             note="exit_take_profit",
         )
 
-        assert paper_store.count_recent_entry_samples_for_ticker(
-            ticker="KXNBAGAME-CONC-HELPER",
-            within_seconds=3600,
-        ) == 2
-        assert paper_store.count_recent_entry_samples_for_ticker_side(
-            ticker="KXNBAGAME-CONC-HELPER",
-            side="YES",
-            within_seconds=3600,
-        ) == 1
-        assert paper_store.count_recent_entry_samples_for_ticker_side(
-            ticker="KXNBAGAME-CONC-HELPER",
-            side="NO",
-            within_seconds=3600,
-        ) == 1
+        assert (
+            paper_store.count_recent_entry_samples_for_ticker(
+                ticker="KXNBAGAME-CONC-HELPER",
+                within_seconds=3600,
+            )
+            == 2
+        )
+        assert (
+            paper_store.count_recent_entry_samples_for_ticker_side(
+                ticker="KXNBAGAME-CONC-HELPER",
+                side="YES",
+                within_seconds=3600,
+            )
+            == 1
+        )
+        assert (
+            paper_store.count_recent_entry_samples_for_ticker_side(
+                ticker="KXNBAGAME-CONC-HELPER",
+                side="NO",
+                within_seconds=3600,
+            )
+            == 1
+        )
 
 
 class TestPaperStoreV2:
@@ -1905,3 +1914,195 @@ class TestShortHorizonOutcomeTelemetry:
         assert metrics["entry_only_sample_count"] == 1
         assert "queue_cleared" in metrics["entry_only_by_fill_path"]
         assert "unknown" not in metrics["entry_only_by_fill_path"]
+
+    def test_entry_outcome_summary_can_filter_by_fill_path(self, paper_store: PaperStore) -> None:
+        """Entry-only summary should support include/exclude fill-path filters."""
+        now_ms = int(time.time() * 1000)
+        intents = [
+            QuoteIntent(
+                id="intent-filter-path-1",
+                ticker="KXNBAGAME-FILTER-A",
+                side="YES",
+                quote_price_cents=50.0,
+                size_contracts=1,
+                created_ts_ms=now_ms - 80_000,
+                net_edge=1.0,
+                inside_width=2.0,
+                imbalance_gap=0.0,
+                fee_mode="maker",
+                round_trip=True,
+            ),
+            QuoteIntent(
+                id="intent-filter-path-2",
+                ticker="KXNBAGAME-FILTER-B",
+                side="NO",
+                quote_price_cents=49.0,
+                size_contracts=1,
+                created_ts_ms=now_ms - 80_000,
+                net_edge=1.0,
+                inside_width=2.0,
+                imbalance_gap=0.0,
+                fee_mode="maker",
+                round_trip=True,
+            ),
+            QuoteIntent(
+                id="intent-filter-path-3",
+                ticker="KXNBAGAME-FILTER-C",
+                side="YES",
+                quote_price_cents=51.0,
+                size_contracts=1,
+                created_ts_ms=now_ms - 80_000,
+                net_edge=1.0,
+                inside_width=2.0,
+                imbalance_gap=0.0,
+                fee_mode="maker",
+                round_trip=True,
+            ),
+        ]
+        for intent in intents:
+            paper_store.insert_intent(intent)
+
+        assert paper_store.insert_fill(
+            fill_id="fill-filter-path-1",
+            intent_id="intent-filter-path-1",
+            fill_ts_ms=now_ms - 60_000,
+            fill_price_cents=50.0,
+            fill_size=1,
+            remaining_size=0,
+            fill_fee_cents=0.1,
+            note="entry_queue_cleared",
+            pnl_30s_after_fill_cents=0.6,
+        )
+        assert paper_store.insert_fill(
+            fill_id="fill-filter-path-2",
+            intent_id="intent-filter-path-2",
+            fill_ts_ms=now_ms - 50_000,
+            fill_price_cents=49.0,
+            fill_size=1,
+            remaining_size=0,
+            fill_fee_cents=0.1,
+            note="entry_moved_through",
+            pnl_30s_after_fill_cents=-0.3,
+        )
+        assert paper_store.insert_fill(
+            fill_id="fill-filter-path-3",
+            intent_id="intent-filter-path-3",
+            fill_ts_ms=now_ms - 40_000,
+            fill_price_cents=51.0,
+            fill_size=1,
+            remaining_size=0,
+            fill_fee_cents=0.1,
+            note="entry_queue_cleared",
+            pnl_30s_after_fill_cents=0.2,
+        )
+
+        queue_only = paper_store.get_entry_only_metrics_filtered_by_fill_path(
+            window_seconds=3600,
+            horizon_seconds=30,
+            include_fill_paths=("queue_cleared",),
+        )
+        assert queue_only["total_entry_samples"] == 2
+        assert queue_only["avg_pnl_30s_cents"] == pytest.approx(0.4)
+        assert queue_only["win_rate_30s"] == pytest.approx(1.0)
+        assert set(queue_only["by_fill_path"].keys()) == {"queue_cleared"}
+
+        excluded_moved = paper_store.get_entry_only_metrics_filtered_by_fill_path(
+            window_seconds=3600,
+            horizon_seconds=30,
+            exclude_fill_paths=("moved_through",),
+        )
+        assert excluded_moved["total_entry_samples"] == 2
+        assert set(excluded_moved["by_fill_path"].keys()) == {"queue_cleared"}
+
+    def test_headline_confidence_flags_distinct_ticker_threshold(
+        self, paper_store: PaperStore
+    ) -> None:
+        """Headline confidence should fail when filtered samples have too few distinct tickers."""
+        now_ms = int(time.time() * 1000)
+        for idx in range(2):
+            intent = QuoteIntent(
+                id=f"intent-distinct-{idx}",
+                ticker="KXNBAGAME-DISTINCT-ONLY-A",
+                side="YES",
+                quote_price_cents=50.0,
+                size_contracts=1,
+                created_ts_ms=now_ms - 80_000,
+                net_edge=1.0,
+                inside_width=2.0,
+                imbalance_gap=0.0,
+                fee_mode="maker",
+                round_trip=True,
+            )
+            paper_store.insert_intent(intent)
+            assert paper_store.insert_fill(
+                fill_id=f"fill-distinct-{idx}",
+                intent_id=intent.id,
+                fill_ts_ms=now_ms - 60_000 + idx,
+                fill_price_cents=50.0,
+                fill_size=1,
+                remaining_size=0,
+                fill_fee_cents=0.1,
+                note="entry_queue_cleared",
+                pnl_30s_after_fill_cents=0.1,
+            )
+
+        headline = paper_store.get_headline_metrics_filtered_by_fill_path(
+            window_seconds=3600,
+            horizon_seconds=30,
+            include_fill_paths=("queue_cleared",),
+            min_distinct_tickers=2,
+            max_top_ticker_share=None,
+        )
+        assert headline["distinct_ticker_count"] == 1
+        assert headline["meets_distinct_ticker_threshold"] is False
+        assert headline["meets_concentration_threshold"] is None
+        assert headline["is_confidence_eligible"] is False
+
+    def test_headline_confidence_flags_concentration_threshold(
+        self, paper_store: PaperStore
+    ) -> None:
+        """Headline confidence should fail when top ticker share breaches max threshold."""
+        now_ms = int(time.time() * 1000)
+        intents = [
+            ("intent-concentration-1", "KXNBAGAME-CONC-HEADLINE-A", 0.2),
+            ("intent-concentration-2", "KXNBAGAME-CONC-HEADLINE-A", 0.1),
+            ("intent-concentration-3", "KXNBAGAME-CONC-HEADLINE-B", -0.2),
+        ]
+        for idx, (intent_id, ticker, pnl_30s) in enumerate(intents):
+            intent = QuoteIntent(
+                id=intent_id,
+                ticker=ticker,
+                side="YES",
+                quote_price_cents=50.0,
+                size_contracts=1,
+                created_ts_ms=now_ms - 80_000,
+                net_edge=1.0,
+                inside_width=2.0,
+                imbalance_gap=0.0,
+                fee_mode="maker",
+                round_trip=True,
+            )
+            paper_store.insert_intent(intent)
+            assert paper_store.insert_fill(
+                fill_id=f"fill-concentration-{idx}",
+                intent_id=intent.id,
+                fill_ts_ms=now_ms - 60_000 + idx,
+                fill_price_cents=50.0,
+                fill_size=1,
+                remaining_size=0,
+                fill_fee_cents=0.1,
+                note="entry_queue_cleared",
+                pnl_30s_after_fill_cents=pnl_30s,
+            )
+
+        headline = paper_store.get_headline_metrics_filtered_by_fill_path(
+            window_seconds=3600,
+            horizon_seconds=30,
+            include_fill_paths=("queue_cleared",),
+            min_distinct_tickers=2,
+            max_top_ticker_share=0.60,
+        )
+        assert headline["top_ticker_concentration_share"] == pytest.approx(2 / 3)
+        assert headline["meets_distinct_ticker_threshold"] is True
+        assert headline["meets_concentration_threshold"] is False
+        assert headline["is_confidence_eligible"] is False

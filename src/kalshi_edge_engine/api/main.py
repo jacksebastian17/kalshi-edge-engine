@@ -1231,6 +1231,40 @@ async def get_paper_summary() -> dict[str, Any]:
     # Use authoritative compute_paper_metrics for consistency
     metrics = _paper_store.compute_paper_metrics()
     snapshot = _paper_store.get_latest_pnl_snapshot()
+    nba_effective = runtime_config.get_effective_paper_config("NBA")
+
+    entry_summary_all_paths = _paper_store.get_entry_outcome_summary(
+        window_seconds=86_400,
+        horizon_seconds=30,
+    )
+    observed_fill_paths = sorted(entry_summary_all_paths.get("by_fill_path", {}).keys())
+    headline_excluded_fill_paths = sorted(set(nba_effective.exclude_fill_paths_from_headline or ()))
+    if nba_effective.report_only_fill_paths is not None:
+        headline_included_fill_paths = sorted(
+            path
+            for path in set(nba_effective.report_only_fill_paths)
+            if path not in set(headline_excluded_fill_paths)
+        )
+        headline_include_filter: list[str] | None = headline_included_fill_paths
+    else:
+        headline_included_fill_paths = [
+            path for path in observed_fill_paths if path not in set(headline_excluded_fill_paths)
+        ]
+        headline_include_filter = None
+
+    queue_cleared_only = _paper_store.get_entry_only_metrics_filtered_by_fill_path(
+        window_seconds=86_400,
+        horizon_seconds=30,
+        include_fill_paths=("queue_cleared",),
+    )
+    headline_metrics = _paper_store.get_headline_metrics_filtered_by_fill_path(
+        window_seconds=86_400,
+        horizon_seconds=30,
+        include_fill_paths=headline_include_filter,
+        exclude_fill_paths=(headline_excluded_fill_paths if headline_excluded_fill_paths else None),
+        min_distinct_tickers=nba_effective.headline_min_distinct_tickers,
+        max_top_ticker_share=nba_effective.headline_max_top_ticker_share,
+    )
 
     return {
         "enabled": _paper_enabled,
@@ -1290,6 +1324,18 @@ async def get_paper_summary() -> dict[str, Any]:
         "unique_filled_entry_ticker_side_pairs_count": metrics.get(
             "unique_filled_entry_ticker_side_pairs_count", 0
         ),
+        "queue_cleared_only_sample_count": queue_cleared_only.get("total_entry_samples", 0),
+        "queue_cleared_only_avg_pnl_30s_cents": queue_cleared_only.get("avg_pnl_30s_cents"),
+        "queue_cleared_only_win_rate_30s": queue_cleared_only.get("win_rate_30s"),
+        "headline_included_fill_paths": headline_included_fill_paths,
+        "headline_excluded_fill_paths": headline_excluded_fill_paths,
+        "headline_meets_distinct_ticker_threshold": headline_metrics.get(
+            "meets_distinct_ticker_threshold"
+        ),
+        "headline_meets_concentration_threshold": headline_metrics.get(
+            "meets_concentration_threshold"
+        ),
+        "headline_is_confidence_eligible": headline_metrics.get("is_confidence_eligible"),
         "unrealized_marks_available": metrics.get("unrealized_marks_available", False),
         "unrealized_pnl_status": metrics.get("unrealized_pnl_status", "marks_unavailable"),
         "unrealized_marked_positions_count": metrics.get("unrealized_marked_positions_count", 0),
@@ -1368,6 +1414,35 @@ async def get_paper_outcome_entry_summary(
         horizon_seconds=horizon_seconds,
         edge_bucket_size_cents=edge_bucket_size_cents,
     )
+    nba_effective = runtime_config.get_effective_paper_config("NBA")
+    observed_fill_paths = sorted(result.get("by_fill_path", {}).keys())
+    headline_excluded_fill_paths = sorted(set(nba_effective.exclude_fill_paths_from_headline or ()))
+    if nba_effective.report_only_fill_paths is not None:
+        headline_included_fill_paths = sorted(
+            path
+            for path in set(nba_effective.report_only_fill_paths)
+            if path not in set(headline_excluded_fill_paths)
+        )
+        headline_include_filter: list[str] | None = headline_included_fill_paths
+    else:
+        headline_included_fill_paths = [
+            path for path in observed_fill_paths if path not in set(headline_excluded_fill_paths)
+        ]
+        headline_include_filter = None
+
+    queue_cleared_only_30s = _paper_store.get_entry_only_metrics_filtered_by_fill_path(
+        window_seconds=window_seconds,
+        horizon_seconds=30,
+        include_fill_paths=("queue_cleared",),
+    )
+    headline_metrics = _paper_store.get_headline_metrics_filtered_by_fill_path(
+        window_seconds=window_seconds,
+        horizon_seconds=horizon_seconds,
+        include_fill_paths=headline_include_filter,
+        exclude_fill_paths=(headline_excluded_fill_paths if headline_excluded_fill_paths else None),
+        min_distinct_tickers=nba_effective.headline_min_distinct_tickers,
+        max_top_ticker_share=nba_effective.headline_max_top_ticker_share,
+    )
     min_distinct = runtime_config.PAPER_MIN_DISTINCT_TICKERS_FOR_STRATEGY_CONFIDENCE
     result["min_distinct_tickers_for_strategy_confidence"] = min_distinct
     result["meets_distinct_ticker_confidence_threshold"] = (
@@ -1375,6 +1450,18 @@ async def get_paper_outcome_entry_summary(
         if min_distinct is not None
         else None
     )
+    result["queue_cleared_only_sample_count"] = queue_cleared_only_30s.get("total_entry_samples", 0)
+    result["queue_cleared_only_avg_pnl_30s_cents"] = queue_cleared_only_30s.get("avg_pnl_30s_cents")
+    result["queue_cleared_only_win_rate_30s"] = queue_cleared_only_30s.get("win_rate_30s")
+    result["headline_included_fill_paths"] = headline_included_fill_paths
+    result["headline_excluded_fill_paths"] = headline_excluded_fill_paths
+    result["headline_meets_distinct_ticker_threshold"] = headline_metrics.get(
+        "meets_distinct_ticker_threshold"
+    )
+    result["headline_meets_concentration_threshold"] = headline_metrics.get(
+        "meets_concentration_threshold"
+    )
+    result["headline_is_confidence_eligible"] = headline_metrics.get("is_confidence_eligible")
     return result
 
 

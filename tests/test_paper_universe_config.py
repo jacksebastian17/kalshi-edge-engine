@@ -66,6 +66,10 @@ def _clear_universe_specific_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
         "PAPER_NBA_MAX_ENTRY_SAMPLES_PER_TICKER_PER_HOUR",
         "PAPER_NBA_MAX_ENTRY_SAMPLES_PER_TICKER_SIDE_PER_HOUR",
         "PAPER_NBA_MIN_DISTINCT_TICKERS_FOR_STRATEGY_CONFIDENCE",
+        "PAPER_NBA_REPORT_ONLY_FILL_PATHS",
+        "PAPER_NBA_EXCLUDE_FILL_PATHS_FROM_HEADLINE",
+        "PAPER_NBA_HEADLINE_MIN_DISTINCT_TICKERS",
+        "PAPER_NBA_HEADLINE_MAX_TOP_TICKER_SHARE",
         "PAPER_CBB_MIN_EDGE_CENTS",
         "PAPER_CBB_ALLOW_YES_ENTRIES",
         "PAPER_CBB_ALLOW_NO_ENTRIES",
@@ -138,6 +142,34 @@ def test_effective_paper_config_resolves_concentration_controls(
     assert cbb_effective.max_entry_samples_per_ticker_per_hour == 5
     assert cbb_effective.max_entry_samples_per_ticker_side_per_hour == 4
     assert cbb_effective.min_distinct_tickers_for_strategy_confidence == 3
+
+
+def test_effective_paper_config_resolves_nba_truth_mode_report_controls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NBA truth-mode report controls should resolve as optional effective config fields."""
+    _clear_universe_specific_overrides(monkeypatch)
+    monkeypatch.setattr(runtime_config, "PAPER_NBA_REPORT_ONLY_FILL_PATHS", None)
+    monkeypatch.setattr(runtime_config, "PAPER_NBA_EXCLUDE_FILL_PATHS_FROM_HEADLINE", None)
+    monkeypatch.setattr(runtime_config, "PAPER_NBA_HEADLINE_MIN_DISTINCT_TICKERS", None)
+    monkeypatch.setattr(runtime_config, "PAPER_NBA_HEADLINE_MAX_TOP_TICKER_SHARE", None)
+
+    monkeypatch.setenv("PAPER_NBA_REPORT_ONLY_FILL_PATHS", "queue_cleared,price_improves")
+    monkeypatch.setenv("PAPER_NBA_EXCLUDE_FILL_PATHS_FROM_HEADLINE", "moved_through")
+    monkeypatch.setenv("PAPER_NBA_HEADLINE_MIN_DISTINCT_TICKERS", "3")
+    monkeypatch.setenv("PAPER_NBA_HEADLINE_MAX_TOP_TICKER_SHARE", "0.55")
+
+    nba_effective = runtime_config.get_effective_paper_config("NBA")
+    cbb_effective = runtime_config.get_effective_paper_config("CBB")
+
+    assert nba_effective.report_only_fill_paths == ("queue_cleared", "price_improves")
+    assert nba_effective.exclude_fill_paths_from_headline == ("moved_through",)
+    assert nba_effective.headline_min_distinct_tickers == 3
+    assert nba_effective.headline_max_top_ticker_share == pytest.approx(0.55)
+    assert cbb_effective.report_only_fill_paths is None
+    assert cbb_effective.exclude_fill_paths_from_headline is None
+    assert cbb_effective.headline_min_distinct_tickers is None
+    assert cbb_effective.headline_max_top_ticker_share is None
 
 
 @pytest.mark.asyncio

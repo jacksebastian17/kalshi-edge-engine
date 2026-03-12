@@ -3063,12 +3063,104 @@ class PaperStore:
                 "top_ticker_sides_by_sample_count": [],
             }
 
+    @staticmethod
+    def _normalize_fill_path_filters(
+        fill_paths: list[str] | tuple[str, ...] | set[str] | None,
+    ) -> set[str] | None:
+        if fill_paths is None:
+            return None
+        normalized = {str(path).strip().lower() for path in fill_paths if str(path).strip() != ""}
+        if not normalized:
+            return None
+        return normalized
+
+    @staticmethod
+    def _entry_fill_path_from_note(note: Any) -> str:
+        if isinstance(note, str) and note.startswith("entry_"):
+            return note.replace("entry_", "", 1)
+        return "unknown"
+
+    @staticmethod
+    def _compute_confidence_eligibility_flags(
+        *,
+        distinct_ticker_count: int,
+        top_ticker_concentration_share: float,
+        min_distinct_tickers: int | None,
+        max_top_ticker_share: float | None,
+    ) -> dict[str, bool | None]:
+        meets_distinct = (
+            bool(distinct_ticker_count >= int(min_distinct_tickers))
+            if min_distinct_tickers is not None
+            else None
+        )
+        meets_concentration = (
+            bool(top_ticker_concentration_share <= float(max_top_ticker_share))
+            if max_top_ticker_share is not None
+            else None
+        )
+        configured_flags = [
+            flag for flag in (meets_distinct, meets_concentration) if flag is not None
+        ]
+        is_confidence_eligible = all(configured_flags) if configured_flags else None
+        return {
+            "meets_distinct_ticker_threshold": meets_distinct,
+            "meets_concentration_threshold": meets_concentration,
+            "is_confidence_eligible": is_confidence_eligible,
+        }
+
+    def get_entry_only_metrics_filtered_by_fill_path(
+        self,
+        *,
+        window_seconds: int = 86_400,
+        horizon_seconds: int = 30,
+        include_fill_paths: list[str] | tuple[str, ...] | set[str] | None = None,
+        exclude_fill_paths: list[str] | tuple[str, ...] | set[str] | None = None,
+    ) -> dict[str, Any]:
+        """Compute entry-only summary metrics with optional fill-path filtering."""
+        return self.get_entry_outcome_summary(
+            window_seconds=window_seconds,
+            horizon_seconds=horizon_seconds,
+            include_fill_paths=include_fill_paths,
+            exclude_fill_paths=exclude_fill_paths,
+        )
+
+    def get_headline_metrics_filtered_by_fill_path(
+        self,
+        *,
+        window_seconds: int = 86_400,
+        horizon_seconds: int = 30,
+        include_fill_paths: list[str] | tuple[str, ...] | set[str] | None = None,
+        exclude_fill_paths: list[str] | tuple[str, ...] | set[str] | None = None,
+        min_distinct_tickers: int | None = None,
+        max_top_ticker_share: float | None = None,
+    ) -> dict[str, Any]:
+        """Compute headline metrics and confidence eligibility for filtered entry paths."""
+        metrics = self.get_entry_outcome_summary(
+            window_seconds=window_seconds,
+            horizon_seconds=horizon_seconds,
+            include_fill_paths=include_fill_paths,
+            exclude_fill_paths=exclude_fill_paths,
+        )
+        metrics.update(
+            self._compute_confidence_eligibility_flags(
+                distinct_ticker_count=int(metrics.get("distinct_ticker_count", 0)),
+                top_ticker_concentration_share=float(
+                    metrics.get("top_ticker_concentration_share", 0.0)
+                ),
+                min_distinct_tickers=min_distinct_tickers,
+                max_top_ticker_share=max_top_ticker_share,
+            )
+        )
+        return metrics
+
     def get_entry_outcome_summary(
         self,
         *,
         window_seconds: int = 86_400,
         horizon_seconds: int = 30,
         edge_bucket_size_cents: float = 1.0,
+        include_fill_paths: list[str] | tuple[str, ...] | set[str] | None = None,
+        exclude_fill_paths: list[str] | tuple[str, ...] | set[str] | None = None,
     ) -> dict[str, Any]:
         """Summarize entry-only post-fill outcomes by universe/side/path/edge bucket."""
         now_ms = int(time.time() * 1000)
@@ -3078,6 +3170,8 @@ class PaperStore:
         avg_key = f"avg_pnl_{horizon}s_cents"
         win_key = f"win_rate_{horizon}s"
         safe_bucket_size = max(0.1, float(edge_bucket_size_cents))
+        include_paths = self._normalize_fill_path_filters(include_fill_paths)
+        exclude_paths = self._normalize_fill_path_filters(exclude_fill_paths)
 
         try:
             with sqlite3.connect(self.db_path) as conn:
@@ -3118,16 +3212,21 @@ class PaperStore:
             by_edge_bucket_values: dict[tuple[float, float], list[float]] = {}
             by_ticker_counts: dict[str, int] = {}
             by_ticker_side_counts: dict[str, int] = {}
+            filtered_sample_count = 0
 
             for side, ticker, universe, note, net_edge, pnl_after in rows:
+                fill_path = self._entry_fill_path_from_note(note)
+                if include_paths is not None and fill_path not in include_paths:
+                    continue
+                if exclude_paths is not None and fill_path in exclude_paths:
+                    continue
+
                 pnl_value = float(pnl_after)
+                filtered_sample_count += 1
                 ticker_key = str(ticker)
                 universe_key = str(universe or "UNKNOWN").upper()
                 side_key = str(side).upper()
                 ticker_side_key = f"{ticker_key}|{side_key}|{universe_key}"
-                fill_path = "unknown"
-                if isinstance(note, str) and note.startswith("entry_"):
-                    fill_path = note.replace("entry_", "", 1)
 
                 by_universe_values.setdefault(universe_key, []).append(pnl_value)
                 by_side_values.setdefault(side_key, []).append(pnl_value)
@@ -3155,7 +3254,7 @@ class PaperStore:
             result: dict[str, Any] = {
                 "window_seconds": int(window_seconds),
                 "horizon_seconds": horizon,
-                "total_entry_samples": len(rows),
+                "total_entry_samples": filtered_sample_count,
                 "distinct_ticker_count": len(by_ticker_counts),
                 "distinct_ticker_side_count": len(by_ticker_side_counts),
                 "by_universe": {
@@ -3170,7 +3269,7 @@ class PaperStore:
                 },
                 "by_edge_bucket": by_edge_bucket,
             }
-            if result["total_entry_samples"] > 0:
+            if result["total_entry_samples"] > 0 and by_ticker_counts and by_ticker_side_counts:
                 top_ticker_count = max(by_ticker_counts.values())
                 top_ticker_side_count = max(by_ticker_side_counts.values())
                 result["top_ticker_concentration_share"] = float(
@@ -3182,8 +3281,16 @@ class PaperStore:
             else:
                 result["top_ticker_concentration_share"] = 0.0
                 result["top_ticker_side_concentration_share"] = 0.0
+
+            overall_stats = _stats(
+                [value for values in by_fill_path_values.values() for value in values]
+            )
+            result[avg_key] = overall_stats[avg_key]
+            result[win_key] = overall_stats[win_key]
             if horizon == 30:
                 # Backward-compatible aliases for legacy tooling.
+                result["avg_pnl_30s_cents"] = result[avg_key]
+                result["win_rate_30s"] = result[win_key]
                 for group in ("by_universe", "by_side", "by_fill_path"):
                     for stats in result[group].values():
                         stats["avg_pnl_30s_cents"] = stats[avg_key]
@@ -3213,6 +3320,8 @@ class PaperStore:
                 "entry_samples_by_ticker_side": {},
                 "top_ticker_concentration_share": 0.0,
                 "top_ticker_side_concentration_share": 0.0,
+                avg_key: None,
+                win_key: None,
                 "by_edge_bucket": [],
             }
 
