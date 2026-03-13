@@ -596,6 +596,29 @@ class TestSimulatorDiagnostics:
         assert top["no"]["best_bid_price"] == 47.0
         assert top["no"]["best_bid_size"] == 12
 
+    def test_extract_top_of_book_snapshot_fixed_point_shape(self) -> None:
+        """Top-of-book extraction handles fixed-point Kalshi shape."""
+        orderbook = {
+            "orderbook_fp": {
+                "no_dollars": [
+                    ["0.0100", "599447.00"],
+                    ["0.0200", "94444.00"],
+                    ["0.0800", "417258.00"],
+                ],
+                "yes_dollars": [
+                    ["0.0100", "1364209.00"],
+                    ["0.9000", "64056.00"],
+                    ["0.9100", "16642.00"],
+                ],
+            }
+        }
+
+        top = extract_top_of_book_snapshot(orderbook)
+        assert top["yes"]["best_bid_price"] == 91.0
+        assert top["yes"]["best_bid_size"] == 16642
+        assert top["no"]["best_bid_price"] == 8.0
+        assert top["no"]["best_bid_size"] == 417258
+
     def test_compute_simulator_diagnostics_can_be_eligible(
         self, sample_order_request: OrderRequest
     ):
@@ -734,6 +757,51 @@ class TestSimulatorDiagnostics:
         assert diagnostics["price_improves"] is False
         assert diagnostics["effective_best_bid"] == sample_order_request.quote_price_cents + 1.0
         assert diagnostics["eligibility"]["at_best_price"] is False
+
+    def test_compute_simulator_diagnostics_fixed_point_shape(self) -> None:
+        """Diagnostics should parse fixed-point orderbook payloads."""
+        now_ms = int(time.time() * 1000)
+        order = OrderRequest(
+            id="order-fp-diagnostics-1",
+            ticker="TEST-TICKER",
+            side="YES",
+            quote_price_cents=90.0,
+            size_contracts=1,
+            created_ts_ms=now_ms,
+            net_edge=0.5,
+            entry_fee_cents=0.5,
+            take_profit_cents=2.0,
+            max_hold_seconds=600,
+        )
+        orderbook = {
+            "orderbook_fp": {
+                "no_dollars": [
+                    ["0.0100", "599447.00"],
+                    ["0.0200", "94444.00"],
+                    ["0.0800", "417258.00"],
+                ],
+                "yes_dollars": [
+                    ["0.0100", "1364209.00"],
+                    ["0.9000", "64056.00"],
+                    ["0.9100", "16642.00"],
+                ],
+            }
+        }
+
+        diagnostics = compute_simulator_diagnostics(
+            order=order,
+            orderbook=orderbook,
+            queue_ahead=5,
+            last_best_size_at_bid=120,
+            simulated_volume_per_poll=50,
+        )
+
+        assert diagnostics["best_yes_bid"] == 91.0
+        assert diagnostics["best_no_bid"] == 8.0
+        assert diagnostics["cross_yes"] == 92.0
+        assert diagnostics["cross_no"] == 9.0
+        assert diagnostics["market_best_bid"] == 91.0
+        assert diagnostics["eligibility"]["price_moved_through"] is True
 
 
 class TestPriceImprovementFillPath:

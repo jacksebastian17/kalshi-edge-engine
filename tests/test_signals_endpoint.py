@@ -163,6 +163,36 @@ class TestSignalsLiveEndpoint(unittest.TestCase):
         assert data["liq_no"] == 500
         assert data["top_liquidity"] == 500
 
+    def test_signals_live_fixed_point_orderbook_payload(self) -> None:
+        """Live endpoint should accept fixed-point orderbook schema."""
+        mock_client = AsyncMock()
+        self.client.app.state.kalshi_client = mock_client
+        mock_client.get_orderbook.return_value = {
+            "orderbook_fp": {
+                "no_dollars": [
+                    ["0.0100", "599447.00"],
+                    ["0.0200", "94444.00"],
+                    ["0.0800", "417258.00"],
+                ],
+                "yes_dollars": [
+                    ["0.0100", "1364209.00"],
+                    ["0.9000", "64056.00"],
+                    ["0.9100", "16642.00"],
+                ],
+            }
+        }
+
+        response = self.client.get("/signals/live?ticker=TEST-TICKER")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["reason_code"] != "MARKET_INELIGIBLE"
+        assert data["reason_code"] == "SPREAD_TOO_SMALL"
+        assert data["bid_yes"] == 91.0
+        assert data["bid_no"] == 8.0
+        assert data["cross_yes"] == 92.0
+        assert data["cross_no"] == 9.0
+
 
 class TestSignalsScanEndpoint(unittest.TestCase):
     """Test /signals/scan endpoint."""

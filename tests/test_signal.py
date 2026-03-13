@@ -21,6 +21,22 @@ from kalshi_edge_engine.engine.signal import (
 )
 
 
+ORDERBOOK_FP_FIXTURE = {
+    "orderbook_fp": {
+        "no_dollars": [
+            ["0.0100", "599447.00"],
+            ["0.0200", "94444.00"],
+            ["0.0800", "417258.00"],
+        ],
+        "yes_dollars": [
+            ["0.0100", "1364209.00"],
+            ["0.9000", "64056.00"],
+            ["0.9100", "16642.00"],
+        ],
+    }
+}
+
+
 class TestOrderbookParsing(unittest.TestCase):
     """Test orderbook parsing with flat and nested shapes."""
 
@@ -105,6 +121,23 @@ class TestOrderbookParsing(unittest.TestCase):
         assert parsed.bid_no.price == 5.0
         assert parsed.cross_yes is not None
         assert parsed.cross_yes.price == 95.0
+
+    def test_parse_orderbook_fixed_point_shape(self) -> None:
+        """Test parsing fixed-point orderbook shape (orderbook_fp.*_dollars)."""
+        parsed = parse_orderbook(ORDERBOOK_FP_FIXTURE)
+
+        assert parsed.bid_yes is not None
+        assert parsed.bid_yes.price == 91.0
+        assert parsed.bid_yes.size == 16642
+
+        assert parsed.bid_no is not None
+        assert parsed.bid_no.price == 8.0
+        assert parsed.bid_no.size == 417258
+
+        assert parsed.cross_yes is not None
+        assert parsed.cross_yes.price == 92.0
+        assert parsed.cross_no is not None
+        assert parsed.cross_no.price == 9.0
 
     def test_get_inside_width_valid(self) -> None:
         """Test inside width calculation with valid levels."""
@@ -224,6 +257,17 @@ class TestSignalScoring(unittest.TestCase):
         assert signal.bid_yes == 80.0
         assert signal.cross_yes is None
         assert signal.bid_no is None
+
+    def test_signal_fixed_point_orderbook_not_ineligible_from_parse_failure(self) -> None:
+        """Fixed-point orderbook should parse and avoid MARKET_INELIGIBLE due to shape."""
+        signal = score_signal("TEST-TICKER", ORDERBOOK_FP_FIXTURE)
+
+        assert signal.reason_code != MARKET_INELIGIBLE
+        assert signal.reason_code == SPREAD_TOO_SMALL
+        assert signal.bid_yes == 91.0
+        assert signal.bid_no == 8.0
+        assert signal.cross_yes == 92.0
+        assert signal.cross_no == 9.0
 
     def test_signal_inverted_market(self) -> None:
         """Test signal where best bids invert (no inside width)."""

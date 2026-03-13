@@ -1,3 +1,9 @@
+
+---
+
+# Updated `kalshi-edge-agent.agent.md`
+
+```md
 ---
 name: kalshi-edge-agent
 description: Build and evolve a Kalshi sports-market scanner and paper-trading research engine with conservative execution assumptions, correct accounting, universe-aware configuration, path-aware entry policy, multi-horizon telemetry, and test-driven backend changes.
@@ -144,22 +150,25 @@ Prefer metrics that reveal:
 * fragile sample sizes,
 * universe-specific behavior differences.
 
-## 5) Current empirical finding: moved-through fills dominate observed paper profitability
+## 5) Current empirical finding: the engine works end-to-end, but higher-trust evidence is still sparse
 
-Recent NBA paper runs showed:
+Recent NBA paper runs have established the following:
 
 - paper runtime plumbing is functioning end-to-end,
 - entries, fills, exits, and accounting are occurring,
-- realized paper PnL can appear positive across a multi-hour run,
-- but filled entry samples are currently dominated by the `moved_through` path,
-- and short-horizon outcome telemetry for those fills has looked unrealistically strong.
+- positive realized paper PnL has appeared in multi-hour runs,
+- earlier profitable runs were heavily influenced by the `moved_through` fill path,
+- `moved_through` therefore remains a realism-risk path and must not be treated as strong live-quality evidence,
+- when weaker fill paths were disabled, the system still produced at least one real `queue_cleared` entry → exit → realized-PnL lifecycle,
+- but queue-cleared-only evidence is currently too sparse to justify strong conclusions.
 
 This means:
 
-- current paper profitability must not be treated as strong evidence of live edge,
-- `moved_through` fills should be treated as a realism-risk path until stricter validation proves otherwise,
-- README language, metrics interpretation, and simulator changes should reflect that current caveat explicitly,
-- queue-cleared behavior remains the more trustworthy baseline for strategy validation.
+- current paper profitability must not be treated as proof of live edge,
+- `moved_through` fills should be treated as lower-trust research evidence,
+- `queue_cleared` fills are currently the cleaner validation baseline,
+- future work should optimize for **higher-trust evidence density**, not merely more paper fills,
+- README language, metrics interpretation, and simulator changes should preserve this distinction explicitly.
 
 ---
 
@@ -319,6 +328,7 @@ Focus on:
 * fill-path telemetry
 * outcome telemetry comparing predicted edge vs realized short-horizon outcomes
 * making simulator assumptions easy to vary by universe
+* increasing higher-trust sample density without weakening realism
 
 ## 3) Signal model evolution
 
@@ -444,6 +454,8 @@ Good task examples:
 * Add multi-horizon outcome telemetry and preserve 30s compatibility
 * Clarify global vs universe-aware policy boundaries in code and tests
 * Reduce `main.py` compatibility glue without breaking private helper tests
+* Increase queue-cleared evidence density without weakening execution realism
+* Make higher-trust telemetry easier to interpret than lower-trust path profitability
 
 Bad task examples:
 

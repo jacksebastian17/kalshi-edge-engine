@@ -75,40 +75,15 @@ def _estimate_price_improving_arrival_volume(
     return max(1, simulated_volume_per_poll // 5)
 
 
-def _extract_best_level_raw(levels: Any) -> tuple[float | None, int | None]:
-    """Extract best bid level (price,size) from a YES/NO ladder."""
-    if not isinstance(levels, list):
-        return (None, None)
-
-    valid_levels: list[tuple[float, int]] = []
-    for level in levels:
-        if not isinstance(level, (list, tuple)) or len(level) < 2:
-            continue
-        try:
-            price = float(level[0])
-            size = int(level[1])
-            if 0.0 <= price <= 100.0 and size >= 0:
-                valid_levels.append((price, size))
-        except (TypeError, ValueError):
-            continue
-
-    if not valid_levels:
-        return (None, None)
-
-    best_price, best_size = max(valid_levels, key=lambda item: item[0])
-    return best_price, best_size
-
-
 def extract_top_of_book_snapshot(orderbook: dict[str, Any]) -> dict[str, Any]:
-    """Extract top-of-book bids from raw orderbook for YES/NO sides."""
-    container = (
-        orderbook.get("orderbook") if isinstance(orderbook.get("orderbook"), dict) else orderbook
-    )
-    yes_levels = container.get("yes", []) if isinstance(container, dict) else []
-    no_levels = container.get("no", []) if isinstance(container, dict) else []
+    """Extract top-of-book bids from normalized orderbook for YES/NO sides."""
+    from kalshi_edge_engine.engine.orderbook import parse_orderbook
 
-    yes_price, yes_size = _extract_best_level_raw(yes_levels)
-    no_price, no_size = _extract_best_level_raw(no_levels)
+    parsed = parse_orderbook(orderbook)
+    yes_price = parsed.bid_yes.price if parsed.bid_yes else None
+    yes_size = parsed.bid_yes.size if parsed.bid_yes else None
+    no_price = parsed.bid_no.price if parsed.bid_no else None
+    no_size = parsed.bid_no.size if parsed.bid_no else None
 
     return {
         "yes": {"best_bid_price": yes_price, "best_bid_size": yes_size},

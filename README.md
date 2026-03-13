@@ -61,20 +61,21 @@ The project has now demonstrated that the paper stack can:
 - persist fills and exits,
 - and produce realized PnL and multi-horizon outcome telemetry.
 
-However, current positive paper results should still be treated as provisional.
+Recent multi-hour NBA paper runs have established a few important research findings:
 
-Recent multi-hour NBA paper runs have shown credible end-to-end runtime behavior and positive realized paper PnL, but that profitability has been heavily influenced by `moved_through` entries and should therefore be treated as a research signal, not a live-tradability conclusion.
+- the runtime, persistence, and accounting pipeline now appears to work end-to-end,
+- positive realized paper PnL has been observed across real multi-hour runs,
+- much of the earlier positive paper behavior was driven by the `moved_through` fill path,
+- `moved_through` therefore remains a useful research path but a lower-trust execution path,
+- when `moved_through` was disabled, the system still produced a true `queue_cleared` entry → exit → realized-PnL lifecycle,
+- but queue-cleared-only throughput became sparse enough that confidence remains low.
 
-At the moment, observed profitable paper behavior has been driven heavily by the `moved_through` fill path. That path is useful for research and diagnostics, but it is not yet trusted as a strong proxy for live execution quality. In particular:
-
-- moved-through fills may over-credit stale or gap-through book transitions,
-- short-horizon post-fill outcomes can look unrealistically strong,
-- headline paper PnL may therefore overstate realizable edge.
-
-So the current state of the project is:
+That means the current evidence supports the following interpretation:
 
 - **runtime/accounting infrastructure: increasingly credible**
 - **signal discovery: promising**
+- **queue-cleared evidence: higher trust but still too sparse**
+- **moved-through evidence: useful but lower trust**
 - **execution realism: still under active validation**
 - **live-trading readiness: not yet established**
 
@@ -543,6 +544,7 @@ VITE_API_BASE_URL=http://localhost:8000
 - Positive short-horizon post-fill outcomes do not yet imply live realizability.
 - Current paper profitability may be sensitive to fill-path mix rather than broad execution robustness.
 - Queue-cleared fills are currently the more trustworthy baseline for strategy validation.
+- Queue-cleared-only runs have shown that the strategy can still fill and complete a lifecycle without weaker fill paths, but current sample density is too low to support strong conclusions.
 - Additional confidence should come from broader ticker coverage, stricter path gating, and sustained behavior across longer runs.
 
 ---
@@ -606,6 +608,7 @@ A few important cautions:
 - `moved_through` fills are currently a major realism-risk path and should not be treated as high-confidence evidence of live capture
 - if most positive results come from one fill path, that is a warning sign, not validation
 - concentration metrics and fill-path mix matter as much as headline PnL
+- queue-cleared-only evidence is currently the cleaner validation path, even if it is slower and sparser
 
 Stronger signs are:
 
