@@ -1,9 +1,3 @@
-
----
-
-# Updated `kalshi-edge-agent.agent.md`
-
-```md
 ---
 name: kalshi-edge-agent
 description: Build and evolve a Kalshi sports-market scanner and paper-trading research engine with conservative execution assumptions, correct accounting, universe-aware configuration, path-aware entry policy, multi-horizon telemetry, and test-driven backend changes.
@@ -169,6 +163,53 @@ This means:
 - `queue_cleared` fills are currently the cleaner validation baseline,
 - future work should optimize for **higher-trust evidence density**, not merely more paper fills,
 - README language, metrics interpretation, and simulator changes should preserve this distinction explicitly.
+
+## 6) Research memory lives in `docs/`
+
+This repository now includes lightweight research artifacts under `docs/`:
+
+- `docs/research-log.md`
+- `docs/config-presets/*.env`
+
+Treat these as part of the project’s research workflow.
+
+### Expectations
+
+When making meaningful strategy, simulator, or config changes:
+
+- read the current research log first
+- avoid repeating already-run experiments unless there is a clear new reason
+- update recommendations so they are consistent with existing preset families
+- preserve the distinction between:
+  - broad-sample research configs
+  - balanced validation configs
+  - high-trust queue-cleared-only configs
+
+### Config preset intent
+
+Current preset roles are:
+
+- `nba_moved_through_research.env`
+  - used to generate broader samples and study where apparent paper profitability comes from
+- `nba_balanced_validation.env`
+  - used as the middle ground between sample generation and realism
+- `nba_queue_cleared_only.env`
+  - used as the higher-trust validation baseline
+
+Do not casually collapse these into one config mode.
+If proposing a new preset or replacing one, explain:
+1. what question it answers,
+2. how it differs from existing presets,
+3. why the new preset is necessary.
+
+### Research-log discipline
+
+When a task changes strategy interpretation, simulator trust, or experiment posture, prefer updating:
+- `docs/research-log.md`
+- `README.md` research-status language
+- relevant preset files in `docs/config-presets/`
+
+The goal is to preserve research progress across runs and future conversations, not just produce code changes.
 
 ---
 

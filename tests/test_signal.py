@@ -4,7 +4,10 @@ import time
 import unittest
 from typing import Literal
 
-from kalshi_edge_engine.engine.fees import estimate_maker_fee_cents, estimate_taker_fee_cents
+from kalshi_edge_engine.engine.fees import (
+    estimate_maker_fee_cents,
+    estimate_taker_fee_cents,
+)
 from kalshi_edge_engine.engine.orderbook import (
     BestLevel,
     get_best_bid_size,
@@ -19,7 +22,6 @@ from kalshi_edge_engine.engine.signal import (
     compute_intended_inside_quote_price_cents,
     score_signal,
 )
-
 
 ORDERBOOK_FP_FIXTURE = {
     "orderbook_fp": {

@@ -549,6 +549,42 @@ VITE_API_BASE_URL=http://localhost:8000
 
 ---
 
+
+## Research artifacts and experiment presets
+
+This repository now keeps lightweight research memory inside `docs/` so experiment results and config families are not lost between runs or conversations.
+
+### `docs/research-log.md`
+
+This is the human-readable research journal.
+
+Use it to record:
+- the config family that was run
+- approximate run duration
+- what actually happened
+- what conclusion was justified
+- what should be tested next
+
+It is meant to preserve conclusions, not raw endpoint dumps.
+
+### `docs/config-presets/`
+
+This directory stores reusable paper-trading config families.
+
+Current intended presets include:
+- `nba_moved_through_research.env` — broader-sample research mode
+- `nba_balanced_validation.env` — middle-ground validation mode
+- `nba_queue_cleared_only.env` — highest-trust execution validation mode
+
+Workflow:
+1. choose a preset
+2. copy it into root `.env`
+3. run the session
+4. summarize the outcome in `docs/research-log.md`
+
+This keeps experiment definitions reproducible and prevents paper-trading research from becoming “lost” across config tweaks.
+---
+
 ## Verification workflow
 
 Run backend quality gates:
@@ -590,9 +626,9 @@ curl "http://localhost:8000/paper/metrics/outcomes?horizon_seconds=5"
 curl "http://localhost:8000/paper/metrics/outcomes?horizon_seconds=15"
 curl "http://localhost:8000/paper/metrics/outcomes?horizon_seconds=30"
 curl "http://localhost:8000/paper/metrics/outcomes?horizon_seconds=60"
-curl http://localhost:8000/paper/metrics/outcomes/entry-summary
-curl http://localhost:8000/paper/metrics/outcomes/concentration
-curl http://localhost:8000/paper/metrics/outcomes/audit
+curl "http://localhost:8000/paper/metrics/outcomes/entry-summary"
+curl "http://localhost:8000/paper/metrics/outcomes/concentration"
+curl "http://localhost:8000/paper/metrics/outcomes/audit"
 ```
 
 ---

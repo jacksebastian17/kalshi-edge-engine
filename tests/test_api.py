@@ -1019,9 +1019,22 @@ class TestPaperMetricsEndpoint:
                 with contextlib.suppress(OSError):
                     os.unlink(db_path)
 
-    def test_paper_entry_outcome_summary_endpoint(self, client: TestClient) -> None:
+    def test_paper_entry_outcome_summary_endpoint(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Entry summary endpoint should group by universe/side/fill path/edge buckets."""
         import kalshi_edge_engine.api.main as main_module
+        from kalshi_edge_engine.runtime import config as runtime_config
+
+        # Pin headline-path config so this test is stable across local .env and CI defaults.
+        monkeypatch.delenv("PAPER_NBA_REPORT_ONLY_FILL_PATHS", raising=False)
+        monkeypatch.delenv("PAPER_NBA_EXCLUDE_FILL_PATHS_FROM_HEADLINE", raising=False)
+        monkeypatch.delenv("PAPER_NBA_HEADLINE_MIN_DISTINCT_TICKERS", raising=False)
+        monkeypatch.delenv("PAPER_NBA_HEADLINE_MAX_TOP_TICKER_SHARE", raising=False)
+        monkeypatch.setattr(runtime_config, "PAPER_NBA_REPORT_ONLY_FILL_PATHS", None)
+        monkeypatch.setattr(runtime_config, "PAPER_NBA_EXCLUDE_FILL_PATHS_FROM_HEADLINE", None)
+        monkeypatch.setattr(runtime_config, "PAPER_NBA_HEADLINE_MIN_DISTINCT_TICKERS", 2)
+        monkeypatch.setattr(runtime_config, "PAPER_NBA_HEADLINE_MAX_TOP_TICKER_SHARE", 1.0)
 
         fd, db_path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
@@ -1079,9 +1092,9 @@ class TestPaperMetricsEndpoint:
             assert data["queue_cleared_only_win_rate_30s"] is None
             assert data["headline_included_fill_paths"] == ["moved_through"]
             assert data["headline_excluded_fill_paths"] == []
-            assert data["headline_meets_distinct_ticker_threshold"] is None
-            assert data["headline_meets_concentration_threshold"] is None
-            assert data["headline_is_confidence_eligible"] is None
+            assert data["headline_meets_distinct_ticker_threshold"] is False
+            assert data["headline_meets_concentration_threshold"] is True
+            assert data["headline_is_confidence_eligible"] is False
         finally:
             main_module._paper_store = None
             gc.collect()
@@ -1842,9 +1855,22 @@ class TestPaperConfigAndSummaryEndpoints:
                 with contextlib.suppress(OSError):
                     os.unlink(db_path)
 
-    def test_paper_summary_exposes_entry_only_metrics(self, client: TestClient) -> None:
+    def test_paper_summary_exposes_entry_only_metrics(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """GET /paper/summary should include entry-only metrics excluding exit intents."""
         import kalshi_edge_engine.api.main as main_module
+        from kalshi_edge_engine.runtime import config as runtime_config
+
+        # Pin headline-path config so this test is stable across local .env and CI defaults.
+        monkeypatch.delenv("PAPER_NBA_REPORT_ONLY_FILL_PATHS", raising=False)
+        monkeypatch.delenv("PAPER_NBA_EXCLUDE_FILL_PATHS_FROM_HEADLINE", raising=False)
+        monkeypatch.delenv("PAPER_NBA_HEADLINE_MIN_DISTINCT_TICKERS", raising=False)
+        monkeypatch.delenv("PAPER_NBA_HEADLINE_MAX_TOP_TICKER_SHARE", raising=False)
+        monkeypatch.setattr(runtime_config, "PAPER_NBA_REPORT_ONLY_FILL_PATHS", None)
+        monkeypatch.setattr(runtime_config, "PAPER_NBA_EXCLUDE_FILL_PATHS_FROM_HEADLINE", None)
+        monkeypatch.setattr(runtime_config, "PAPER_NBA_HEADLINE_MIN_DISTINCT_TICKERS", 2)
+        monkeypatch.setattr(runtime_config, "PAPER_NBA_HEADLINE_MAX_TOP_TICKER_SHARE", 1.0)
 
         fd, db_path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
@@ -1956,9 +1982,9 @@ class TestPaperConfigAndSummaryEndpoints:
             assert data["queue_cleared_only_win_rate_30s"] is None
             assert data["headline_included_fill_paths"] == []
             assert data["headline_excluded_fill_paths"] == []
-            assert data["headline_meets_distinct_ticker_threshold"] is None
-            assert data["headline_meets_concentration_threshold"] is None
-            assert data["headline_is_confidence_eligible"] is None
+            assert data["headline_meets_distinct_ticker_threshold"] is False
+            assert data["headline_meets_concentration_threshold"] is True
+            assert data["headline_is_confidence_eligible"] is False
         finally:
             main_module._paper_store = None
             main_module._paper_enabled = False
