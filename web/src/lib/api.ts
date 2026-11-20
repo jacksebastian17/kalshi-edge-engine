@@ -76,6 +76,8 @@ export interface PaperFill {
   remaining_size: number
   queue_ahead_at_fill: number | null
   fill_fee_cents: number | null
+  execution_source?: string
+  settlement_ts_ms?: number | null
   ticker: string
   side: 'YES' | 'NO'
 }
@@ -93,6 +95,7 @@ export interface PaperPosition {
 
 export interface PaperPnlSnapshot {
   ts_ms: number | null
+  experiment_cutover_ts_ms?: number
   realized_pnl_cents: number
   unrealized_pnl_cents: number | null
   total_pnl_cents: number | null
@@ -109,7 +112,10 @@ export interface PaperSummaryResponse {
   realized_pnl_cents: number
   unrealized_pnl_cents: number | null
   total_pnl_cents: number | null
-  marked_unrealized_pnl_cents?: number | null
+  experiment_cutover_ts_ms?: number
+  non_experiment_realized_pnl_cents?: number
+  portfolio_marked_unrealized_pnl_cents?: number | null
+  portfolio_unmarked_positions_count?: number
   unmarked_contracts?: number
   unmarked_cost_basis_cents?: number
   latest_snapshot_ts_ms: number | null

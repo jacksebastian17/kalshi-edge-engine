@@ -226,6 +226,10 @@ async def test_horizons_record_observation_time_and_exclude_delayed_samples(tmp_
     await _observe_due_outcomes(store, client, now)
     fills = {row["ticker"]: row for row in store.get_recent_fills()}
     assert fills["ON-TIME"]["pnl_5s_after_fill_cents"] == 2
+    assert (
+        fills["ON-TIME"]["outcome_fee_audit"]["5s"]["profile"]["version"] == "legacy_whole_cent_v1"
+    )
+    assert fills["ON-TIME"]["outcome_fee_audit"]["5s"]["exit_fee_cents"] == 2
     assert fills["ON-TIME"]["observed_5s_ts_ms"] >= now
     assert fills["DELAYED"]["observed_5s_ts_ms"] - fills["DELAYED"]["fill_ts_ms"] >= 11_000
     assert fills["TOO-OLD"]["mark_5s_after_fill_cents"] is None
@@ -254,7 +258,7 @@ def test_failed_inventory_write_rolls_back_fill_and_status(tmp_path, monkeypatch
     store = PaperStore(str(tmp_path / "paper.db"))
     intent = _intent(store, "ROLLBACK", "YES", 40, 1, 100)
 
-    def fail(*_args):
+    def fail(*_args, **_kwargs):
         raise sqlite3.IntegrityError("test interruption")
 
     with monkeypatch.context() as patch:

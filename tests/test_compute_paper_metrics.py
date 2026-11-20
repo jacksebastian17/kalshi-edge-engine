@@ -7,6 +7,7 @@ import pytest
 
 from kalshi_edge_engine.db.paper_store import PaperStore
 from kalshi_edge_engine.engine.fees import estimate_taker_fee_cents
+from kalshi_edge_engine.engine.orderbook import quote_liquidation
 
 
 class TestComputePaperMetrics:
@@ -34,7 +35,6 @@ class TestComputePaperMetrics:
 
         # Insert intents
         entry_intent_id = "entry-1"
-        exit_intent_id = "exit-1"
         with sqlite3.connect(paper_store.db_path) as conn:
             conn.execute(
                 """
@@ -48,28 +48,6 @@ class TestComputePaperMetrics:
                     ticker,
                     side,
                     entry_price,
-                    contracts,
-                    now_ms,
-                    1.0,
-                    0.5,
-                    None,
-                    "taker",
-                    False,
-                    "FILLED",
-                ),
-            )
-            conn.execute(
-                """
-                INSERT INTO quote_intents
-                (id, ticker, side, quote_price_cents, size_contracts, created_ts_ms,
-                 net_edge, inside_width, imbalance_gap, fee_mode, round_trip, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    exit_intent_id,
-                    ticker,
-                    side,
-                    exit_price,
                     contracts,
                     now_ms,
                     1.0,
@@ -109,24 +87,12 @@ class TestComputePaperMetrics:
         price_pnl = (exit_price - entry_price) * contracts
         expected_realized = price_pnl - entry_fee - exit_fee
 
-        paper_store.insert_fill(
-            fill_id="fill-exit",
-            intent_id=exit_intent_id,
-            fill_ts_ms=now_ms + 2000,
-            fill_price_cents=exit_price,
-            fill_size=contracts,
-            remaining_size=0,
-            queue_ahead_at_fill=0,
-            fill_fee_cents=exit_fee,
+        quote = quote_liquidation(
+            {side.lower(): [[exit_price, contracts]]}, side, contracts, now_ms + 2_000
         )
-
-        paper_store.upsert_position(
-            ticker=ticker,
-            side=side,
-            net_contracts=0,
-            avg_entry_price_cents=entry_price,
-            realized_pnl_cents=expected_realized,
-            first_open_ts_ms=now_ms + 1000,
+        assert quote is not None
+        assert paper_store.close_position(
+            paper_store.get_positions()[0], quote, now_ms=now_ms + 2_000, reason="time_stop"
         )
 
         # Test compute_paper_metrics

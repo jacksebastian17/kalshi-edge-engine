@@ -575,7 +575,7 @@ class TestPaperStoreV2:
         assert positions[0]["avg_entry_price_cents"] == 50.0
 
     def test_upsert_position_update(self, paper_store: PaperStore):
-        """Test upserting an existing position."""
+        """Inventory imports preserve the initially seeded realized balance."""
         now_ms = int(time.time() * 1000)
 
         # Insert initial position
@@ -602,7 +602,7 @@ class TestPaperStoreV2:
         assert len(positions) == 1
         assert positions[0]["net_contracts"] == 10
         assert positions[0]["avg_entry_price_cents"] == 51.0
-        assert positions[0]["realized_pnl_cents"] == 100.0
+        assert positions[0]["realized_pnl_cents"] == 0.0
 
     def test_insert_pnl_snapshot(self, paper_store: PaperStore):
         """Test inserting a PnL snapshot."""

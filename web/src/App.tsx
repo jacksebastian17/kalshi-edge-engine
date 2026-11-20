@@ -34,6 +34,7 @@ type PaperTab = 'summary' | 'intents' | 'fills' | 'positions' | 'config'
 type FillSortDirection = 'desc' | 'asc'
 
 type PnlHistoryPoint = {
+  cutoverMs: number
   tsMs: number
   totalPnlCents: number
 }
@@ -528,14 +529,15 @@ export default function App() {
         setPaperPnlSnapshot(snapshot)
         const snapshotTsMs = snapshot.ts_ms
         const totalPnlCents = snapshot.total_pnl_cents
-        if (snapshotTsMs != null && totalPnlCents != null && snapshot.unrealized_pnl_status !== 'legacy_unverified') {
+        const cutoverMs = snapshot.experiment_cutover_ts_ms
+        if (snapshotTsMs != null && totalPnlCents != null && cutoverMs != null) {
           setPaperPnlHistory((prev) => {
-            if (prev.length > 0 && prev[prev.length - 1].tsMs === snapshotTsMs) {
-              return prev
-            }
+            const sameExperiment = prev[0]?.cutoverMs === cutoverMs ? prev : []
+            if (sameExperiment[sameExperiment.length - 1]?.tsMs === snapshotTsMs) return prev
             return [
-              ...prev,
+              ...sameExperiment,
               {
+                cutoverMs,
                 tsMs: snapshotTsMs,
                 totalPnlCents,
               },
@@ -998,15 +1000,15 @@ export default function App() {
                   <p className="text-zinc-100 tabular-nums mt-1">{formatMetric(paperSummary?.total_fills)}</p>
                 </div>
                 <div className="border border-white/10 rounded p-3 bg-zinc-900/40">
-                  <p className="text-zinc-500">Realized PnL</p>
+                  <p className="text-zinc-500">Clean Ledger Realized PnL</p>
                   <p className="text-zinc-100 tabular-nums mt-1">{formatCurrencyCents(paperSummary?.realized_pnl_cents)}</p>
                 </div>
                 <div className="border border-white/10 rounded p-3 bg-zinc-900/40">
-                  <p className="text-zinc-500">Unrealized PnL</p>
+                  <p className="text-zinc-500">Clean Ledger Unrealized PnL</p>
                   <p className="text-zinc-100 tabular-nums mt-1">{formatCurrencyCents(paperSummary?.unrealized_pnl_cents)}</p>
                 </div>
                 <div className="border border-white/10 rounded p-3 bg-zinc-900/40">
-                  <p className="text-zinc-500">Total PnL</p>
+                  <p className="text-zinc-500">Clean Ledger Total PnL</p>
                   <p className="text-zinc-100 tabular-nums mt-1">{formatCurrencyCents(paperSummary?.total_pnl_cents)}</p>
                 </div>
                 <div className="border border-white/10 rounded p-3 bg-zinc-900/40">
@@ -1017,11 +1019,18 @@ export default function App() {
                 </div>
               </div>
 
-              {(paperSummary?.unrealized_unmarked_positions_count ?? 0) > 0 && (
+              {paperSummary?.experiment_cutover_ts_ms != null && (
+                <p className="text-xs text-zinc-400">
+                  Experiment started {formatTimestamp(paperSummary.experiment_cutover_ts_ms)}.
+                  {' '}Realized outside experiment {formatCurrencyCents(paperSummary.non_experiment_realized_pnl_cents)}.
+                </p>
+              )}
+
+              {(paperSummary?.portfolio_unmarked_positions_count ?? 0) > 0 && (
                 <p className="text-xs text-amber-300">
-                  {paperSummary?.unrealized_unmarked_positions_count} positions unmarked
+                  {paperSummary?.portfolio_unmarked_positions_count} portfolio positions unmarked
                   ({paperSummary?.unmarked_contracts} contracts, {formatCurrencyCents(paperSummary?.unmarked_cost_basis_cents)} cost).
-                  {' '}Marked positions subtotal {formatCurrencyCents(paperSummary?.marked_unrealized_pnl_cents)}.
+                  {' '}Marked positions subtotal {formatCurrencyCents(paperSummary?.portfolio_marked_unrealized_pnl_cents)}.
                 </p>
               )}
 
@@ -1158,6 +1167,7 @@ export default function App() {
                       <th className="text-left px-3 py-2">Price</th>
                       <th className="text-left px-3 py-2">Size</th>
                       <th className="text-left px-3 py-2">Queue@Fill</th>
+                      <th className="text-left px-3 py-2">Execution</th>
                       <th className="text-left px-3 py-2">Intent</th>
                     </tr>
                   </thead>
@@ -1171,6 +1181,9 @@ export default function App() {
                         <td className="px-3 py-2 tabular-nums">{fill.fill_price_cents.toFixed(2)}</td>
                         <td className="px-3 py-2 tabular-nums">{fill.fill_size}</td>
                         <td className="px-3 py-2 tabular-nums">{formatMetric(fill.queue_ahead_at_fill)}</td>
+                        <td className="px-3 py-2">
+                          {fill.settlement_ts_ms != null ? 'Settlement' : fill.execution_source?.replace(/_/g, ' ') ?? '—'}
+                        </td>
                         <td className="px-3 py-2">
                           <button
                             onClick={() => handleFillIntentDebugOpen(fill.intent_id)}
@@ -1199,7 +1212,7 @@ export default function App() {
                       <th className="text-left px-3 py-2">Side</th>
                       <th className="text-left px-3 py-2">Net Contracts</th>
                       <th className="text-left px-3 py-2">Avg Entry</th>
-                      <th className="text-left px-3 py-2">Realized PnL</th>
+                      <th className="text-left px-3 py-2">All-history Realized PnL</th>
                     </tr>
                   </thead>
                   <tbody>

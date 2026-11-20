@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, NamedTuple
 
-from kalshi_edge_engine.engine.fees import estimate_taker_fee_cents
+from kalshi_edge_engine.engine.fees import LEGACY_FEE_PROFILE, FeeProfile
 
 
 class BestLevel(NamedTuple):
@@ -45,6 +45,7 @@ class LiquidationQuote:
     implied_ask_cents: float | None
     bid_levels: tuple[tuple[float, int], ...]
     observed_ts_ms: int
+    fee_profile: FeeProfile = LEGACY_FEE_PROFILE
 
     @property
     def midpoint_cents(self) -> float | None:
@@ -57,7 +58,12 @@ class LiquidationQuote:
 
 
 def quote_liquidation(
-    orderbook: dict[str, Any], side: str, size_contracts: int, observed_ts_ms: int
+    orderbook: dict[str, Any],
+    side: str,
+    size_contracts: int,
+    observed_ts_ms: int,
+    *,
+    fee_profile: FeeProfile = LEGACY_FEE_PROFILE,
 ) -> LiquidationQuote | None:
     """Price an immediate full sale against the held contract's bid ladder."""
     if not isinstance(orderbook, dict) or side not in ("YES", "NO") or size_contracts <= 0:
@@ -81,11 +87,15 @@ def quote_liquidation(
             return LiquidationQuote(
                 size_contracts=size_contracts,
                 price_cents=sum(price * size for price, size in levels) / size_contracts,
-                exit_fee_cents=sum(estimate_taker_fee_cents(price, size) for price, size in levels),
+                exit_fee_cents=sum(
+                    fee_profile.fee_cents(price, size, liquidity="taker", sale=True)
+                    for price, size in levels
+                ),
                 best_bid_cents=bids[0][0],
                 implied_ask_cents=implied_ask,
                 bid_levels=tuple(levels),
                 observed_ts_ms=observed_ts_ms,
+                fee_profile=fee_profile,
             )
     return None
 

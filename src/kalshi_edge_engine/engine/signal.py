@@ -5,8 +5,8 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from kalshi_edge_engine.engine.fees import (
-    estimate_maker_fee_cents,
-    estimate_taker_fee_cents,
+    LEGACY_FEE_PROFILE,
+    FeeProfile,
 )
 from kalshi_edge_engine.engine.orderbook import (
     get_best_bid_size,
@@ -19,6 +19,7 @@ SPREAD_TOO_SMALL = "SPREAD_TOO_SMALL"
 LOW_LIQUIDITY = "LOW_LIQUIDITY"
 MARKET_INELIGIBLE = "MARKET_INELIGIBLE"
 DATA_STALE = "DATA_STALE"
+FEE_DATA_UNAVAILABLE = "FEE_DATA_UNAVAILABLE"
 SIGNAL_VALID = "SIGNAL_VALID"
 
 VALID_REASON_CODES = {
@@ -26,6 +27,7 @@ VALID_REASON_CODES = {
     LOW_LIQUIDITY,
     MARKET_INELIGIBLE,
     DATA_STALE,
+    FEE_DATA_UNAVAILABLE,
     SIGNAL_VALID,
 }
 
@@ -103,6 +105,7 @@ class Signal:
     net_edge_after_round_trip_fee_yes_cents: float | None = None
     net_edge_after_round_trip_fee_no_cents: float | None = None
     universe: str = "NBA"
+    fee_profile: FeeProfile | None = LEGACY_FEE_PROFILE
 
 
 def score_signal(
@@ -116,6 +119,7 @@ def score_signal(
     min_liquidity: int = 10,  # Minimum contracts at best level per side
     safety_buffer: float = 0.1,  # Safety margin below inside width (cents)
     imbalance_threshold: float = 1.5,  # Minimum structural imbalance gap (cents)
+    fee_profile: FeeProfile | None = LEGACY_FEE_PROFILE,
 ) -> Signal:
     """Score an orderbook snapshot and emit a structured signal with reason code.
 
@@ -187,26 +191,32 @@ def score_signal(
     if intended_quote_no_cents is not None and cross_no is not None:
         capturable_edge_to_cross_no_cents = cross_no - float(intended_quote_no_cents)
 
-    # Select fee function based on mode
-    fee_func = estimate_maker_fee_cents if fee_mode == "maker" else estimate_taker_fee_cents
-
     # Compute entry fees for each side (based on intended quote price)
     fee_yes: float | None = None
     fee_no: float | None = None
-    if intended_quote_yes_cents is not None:
-        fee_yes = fee_func(float(intended_quote_yes_cents), contracts_for_fee)
-    if intended_quote_no_cents is not None:
-        fee_no = fee_func(float(intended_quote_no_cents), contracts_for_fee)
+    if fee_profile is not None:
+        if intended_quote_yes_cents is not None:
+            fee_yes = fee_profile.fee_cents(
+                intended_quote_yes_cents, contracts_for_fee, liquidity=fee_mode
+            )
+        if intended_quote_no_cents is not None:
+            fee_no = fee_profile.fee_cents(
+                intended_quote_no_cents, contracts_for_fee, liquidity=fee_mode
+            )
 
     # Compute exit fees if round_trip=True (use taker rate at cross price)
     fee_exit_yes: float | None = None
     fee_exit_no: float | None = None
-    if round_trip:
-        # Exit fee uses cross price (where we'd hit to exit), not entry bid
+    if round_trip and fee_profile is not None:
+        # Hypothetical sale at the implied ask for this spread-room score.
         if cross_yes is not None:
-            fee_exit_yes = estimate_taker_fee_cents(cross_yes, contracts_for_fee)
+            fee_exit_yes = fee_profile.fee_cents(
+                cross_yes, contracts_for_fee, liquidity="taker", sale=True
+            )
         if cross_no is not None:
-            fee_exit_no = estimate_taker_fee_cents(cross_no, contracts_for_fee)
+            fee_exit_no = fee_profile.fee_cents(
+                cross_no, contracts_for_fee, liquidity="taker", sale=True
+            )
 
     # Calculate total fees per side
     total_fee_yes: float | None = None
@@ -240,6 +250,8 @@ def score_signal(
     elif imbalance_gap is not None and imbalance_gap < imbalance_threshold:
         # Structural imbalance too small
         reason_code = SPREAD_TOO_SMALL
+    elif fee_profile is None:
+        reason_code = FEE_DATA_UNAVAILABLE
     else:
         # Determine side usability based on actual intended quote constructability.
         usable_yes = (
@@ -346,4 +358,5 @@ def score_signal(
         net_edge_after_entry_fee_no_cents=net_edge_after_entry_fee_no_cents,
         net_edge_after_round_trip_fee_yes_cents=net_edge_after_round_trip_fee_yes_cents,
         net_edge_after_round_trip_fee_no_cents=net_edge_after_round_trip_fee_no_cents,
+        fee_profile=fee_profile,
     )

@@ -6,7 +6,7 @@ import os
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import httpx
 from cryptography.hazmat.primitives import hashes, serialization
@@ -302,6 +302,35 @@ class KalshiClient:
                 },
             )
             raise KalshiAPIError(f"Request failed {method} {path}: {str(e)}") from e
+
+    async def get_market(self, ticker: str) -> dict[str, Any]:
+        """Read market metadata, with a historical lookup after an HTTP 404."""
+        market_path = f"/markets/{quote(ticker, safe='')}"
+        try:
+            data = await self._authenticated_request("GET", market_path)
+        except KalshiAPIError as exc:
+            cause = exc.__cause__
+            if not isinstance(cause, httpx.HTTPStatusError) or cause.response.status_code != 404:
+                raise
+            data = await self._authenticated_request("GET", f"/historical{market_path}")
+        return self._validated_record(data, "market", "ticker", ticker)
+
+    async def get_event(self, ticker: str) -> dict[str, Any]:
+        data = await self._authenticated_request("GET", f"/events/{quote(ticker, safe='')}")
+        return self._validated_record(data, "event", "event_ticker", ticker)
+
+    async def get_series_details(self, ticker: str) -> dict[str, Any]:
+        data = await self._authenticated_request("GET", f"/series/{quote(ticker, safe='')}")
+        return self._validated_record(data, "series", "ticker", ticker)
+
+    @staticmethod
+    def _validated_record(
+        data: dict[str, Any], record_type: str, ticker_key: str, ticker: str
+    ) -> dict[str, Any]:
+        record = data.get(record_type)
+        if not isinstance(record, dict) or record.get(ticker_key) != ticker:
+            raise KalshiAPIError(f"Invalid {record_type} response for {ticker}")
+        return record
 
     async def get_series(
         self,

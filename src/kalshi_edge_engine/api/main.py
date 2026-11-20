@@ -3,7 +3,7 @@
 import asyncio
 import logging
 import time
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 from typing import Any
 
 from dotenv import load_dotenv
@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from kalshi_edge_engine.db.paper_store import PaperStore
+from kalshi_edge_engine.engine.fees import LEGACY_FEE_PROFILE
 from kalshi_edge_engine.engine.paper import build_quote_intents
 from kalshi_edge_engine.engine.paper_sim import (
     OrderRequest,
@@ -29,6 +30,7 @@ from kalshi_edge_engine.kalshi.client import (
 from kalshi_edge_engine.runtime import config as runtime_config
 from kalshi_edge_engine.runtime import paper_runtime as _runtime_paper_runtime_module
 from kalshi_edge_engine.runtime import state as runtime_state
+from kalshi_edge_engine.runtime.market_fees import MarketFees
 from kalshi_edge_engine.runtime.paper_exit_runtime import (
     _close_position as _runtime_close_position,
 )
@@ -101,6 +103,7 @@ class SignalResponse(BaseModel):
     net_edge_after_round_trip_fee_no_cents: float | None = None
     fee_mode: str
     round_trip: bool
+    fee_profile: dict[str, Any] | None = None
     liq_yes: int
     liq_no: int
     top_liquidity: int
@@ -288,7 +291,6 @@ _paper_store: PaperStore | None = runtime_state.paper_store
 _paper_enabled: bool = runtime_state.paper_enabled
 _paper_simulation_tasks: set[asyncio.Task[Any]] = runtime_state.paper_simulation_tasks
 _paper_pnl_snapshot_interval_ms = runtime_config.PAPER_PNL_SNAPSHOT_INTERVAL_MS
-_last_pnl_snapshot_ts_ms = runtime_state.last_pnl_snapshot_ts_ms
 _paper_ticker_cooldown: dict[str, int] = runtime_state.paper_ticker_cooldown
 _paper_intent_timestamps: list[int] = runtime_state.paper_intent_timestamps
 _paper_daily_loss_breached: bool = runtime_state.paper_daily_loss_breached
@@ -307,6 +309,7 @@ PAPER_INTENT_ACTIVE_STATUSES = {
     PAPER_INTENT_STATUS_FILLED,
     PAPER_INTENT_STATUS_EXPIRED,
     PAPER_INTENT_STATUS_ERROR,
+    "CANCELED",
 }
 PAPER_INTENT_LEGACY_STATUSES = {
     PAPER_INTENT_STATUS_TAKE_PROFIT,
@@ -352,7 +355,6 @@ def _sync_runtime_from_legacy() -> None:
     runtime_state.paper_store = _paper_store
     runtime_state.paper_enabled = _paper_enabled
     runtime_state.paper_simulation_tasks = _paper_simulation_tasks
-    runtime_state.last_pnl_snapshot_ts_ms = _last_pnl_snapshot_ts_ms
     runtime_state.paper_ticker_cooldown = _paper_ticker_cooldown
     runtime_state.paper_intent_timestamps = _paper_intent_timestamps
     runtime_state.paper_daily_loss_breached = _paper_daily_loss_breached
@@ -389,7 +391,6 @@ def _sync_legacy_from_runtime() -> None:
     global _paper_store
     global _paper_enabled
     global _paper_simulation_tasks
-    global _last_pnl_snapshot_ts_ms
     global _paper_ticker_cooldown
     global _paper_intent_timestamps
     global _paper_daily_loss_breached
@@ -429,7 +430,6 @@ def _sync_legacy_from_runtime() -> None:
     _paper_store = runtime_state.paper_store
     _paper_enabled = runtime_state.paper_enabled
     _paper_simulation_tasks = runtime_state.paper_simulation_tasks
-    _last_pnl_snapshot_ts_ms = runtime_state.last_pnl_snapshot_ts_ms
     _paper_ticker_cooldown = runtime_state.paper_ticker_cooldown
     _paper_intent_timestamps = runtime_state.paper_intent_timestamps
     _paper_daily_loss_breached = runtime_state.paper_daily_loss_breached
@@ -510,7 +510,6 @@ async def _process_paper_intents(
 
 async def _nba_scanner_loop(client: KalshiClient) -> None:
     _sync_runtime_from_legacy()
-    maintenance = asyncio.create_task(_paper_maintenance_loop(client))
     try:
         await _runtime_nba_scanner_loop(
             client,
@@ -519,9 +518,6 @@ async def _nba_scanner_loop(client: KalshiClient) -> None:
             top_signals_snapshot_model=TopSignalsSnapshot,
         )
     finally:
-        maintenance.cancel()
-        await asyncio.gather(maintenance, return_exceptions=True)
-        runtime_state.paper_liquidation_marks = {}
         _sync_legacy_from_runtime()
 
 
@@ -558,6 +554,7 @@ def _signal_to_response(signal: Signal) -> dict[str, Any]:
         "net_edge_after_round_trip_fee_no_cents": signal.net_edge_after_round_trip_fee_no_cents,
         "fee_mode": signal.fee_mode,
         "round_trip": signal.round_trip,
+        "fee_profile": signal.fee_profile.audit() if signal.fee_profile is not None else None,
         "liq_yes": signal.liq_yes,
         "liq_no": signal.liq_no,
         "top_liquidity": signal.top_liquidity,
@@ -712,7 +709,9 @@ async def get_live_signal(ticker: str, request: Request) -> dict[str, Any]:
         orderbook = await client.get_orderbook(ticker)
 
         # Score signal
-        signal = score_signal(ticker, orderbook)
+        resolver = runtime_state.market_fees
+        profile = await resolver.resolve(ticker) if resolver is not None else LEGACY_FEE_PROFILE
+        signal = score_signal(ticker, orderbook, fee_profile=profile)
 
         latency_ms = (time.time() - start_time) * 1000
         logger.info(
@@ -802,7 +801,13 @@ async def scan_live_signals(tickers: str, request: Request) -> list[dict[str, An
             async with semaphore:
                 try:
                     orderbook = await client.get_orderbook(ticker)
-                    return score_signal(ticker, orderbook)
+                    resolver = runtime_state.market_fees
+                    profile = (
+                        await resolver.resolve(ticker)
+                        if resolver is not None
+                        else LEGACY_FEE_PROFILE
+                    )
+                    return score_signal(ticker, orderbook, fee_profile=profile)
                 except KalshiAPIError as e:
                     logger.warning(
                         "scan_ticker_failed",
@@ -1030,17 +1035,15 @@ async def stop_scanner(request: Request) -> dict[str, Any]:
 
     # Cancel task
     current_task.cancel()
-    try:
-        await current_task
-    except asyncio.CancelledError:
-        logger.info("Scanner task cancelled successfully")
+    await asyncio.gather(current_task, return_exceptions=True)
 
-    _scanner_state.enabled = False
-    request.app.state.scanner_task = None
     global _top_signals_snapshot
-    _top_signals_snapshot = None
-    runtime_state.top_signals_snapshot = None
-    _sync_legacy_from_runtime()
+    if request.app.state.scanner_task is current_task:
+        _scanner_state.enabled = False
+        request.app.state.scanner_task = None
+        _top_signals_snapshot = None
+        runtime_state.top_signals_snapshot = None
+        _sync_legacy_from_runtime()
 
     logger.info("NBA scanner stopped via POST /scanner/stop")
     return {"stopped": True}
@@ -1169,7 +1172,9 @@ async def get_paper_positions() -> dict[str, Any]:
     return {
         "positions": positions,
         "count": metrics["open_positions_count"],
-        "total_realized_pnl_cents": metrics["realized_pnl_cents"],
+        "total_realized_pnl_cents": metrics["clean_realized_pnl_cents"],
+        "non_experiment_realized_pnl_cents": metrics["non_experiment_realized_pnl_cents"],
+        "experiment_id": metrics["experiment_id"],
     }
 
 
@@ -1182,15 +1187,20 @@ async def get_paper_pnl_snapshot() -> dict[str, Any]:
     if not _paper_store:
         raise HTTPException(status_code=503, detail="Paper trading not enabled")
 
-    snapshot = _paper_store.get_latest_pnl_snapshot()
+    snapshot = _paper_store.get_latest_pnl_snapshot(clean_only=True)
     if not snapshot:
+        metrics = _paper_store.compute_paper_metrics(
+            liquidation_marks=runtime_state.paper_liquidation_marks
+        )
         return {
             "ts_ms": None,
-            "realized_pnl_cents": 0.0,
-            "unrealized_pnl_cents": 0.0,
-            "total_pnl_cents": 0.0,
-            "open_positions_count": 0,
-            "open_orders_count": 0,
+            "experiment_id": metrics["experiment_id"],
+            "experiment_cutover_ts_ms": metrics["experiment_cutover_ts_ms"],
+            "realized_pnl_cents": metrics["clean_realized_pnl_cents"],
+            "unrealized_pnl_cents": metrics["clean_unrealized_pnl_cents"],
+            "total_pnl_cents": metrics["clean_total_pnl_cents"],
+            "open_positions_count": metrics["open_positions_count"],
+            "open_orders_count": metrics["open_orders_count"],
         }
     return snapshot
 
@@ -1208,7 +1218,7 @@ async def get_paper_summary() -> dict[str, Any]:
     metrics = _paper_store.compute_paper_metrics(
         liquidation_marks=runtime_state.paper_liquidation_marks
     )
-    snapshot = _paper_store.get_latest_pnl_snapshot()
+    snapshot = _paper_store.get_latest_pnl_snapshot(clean_only=True)
     nba_effective = runtime_config.get_effective_paper_config("NBA")
 
     entry_summary_all_paths = _paper_store.get_entry_outcome_summary(
@@ -1249,16 +1259,25 @@ async def get_paper_summary() -> dict[str, Any]:
         "total_intents_created": _paper_store.count_intents_total(),
         "total_fills": _paper_store.count_fills_total(),
         "total_positions": metrics["open_positions_count"],
-        "realized_pnl_cents": metrics["realized_pnl_cents"],
-        "unrealized_pnl_cents": metrics.get("unrealized_pnl_cents", 0.0),
-        "total_pnl_cents": metrics["total_pnl_cents"],
+        "realized_pnl_cents": metrics["clean_realized_pnl_cents"],
+        "unrealized_pnl_cents": metrics["clean_unrealized_pnl_cents"],
+        "total_pnl_cents": metrics["clean_total_pnl_cents"],
+        "clean_realized_pnl_cents": metrics["clean_realized_pnl_cents"],
+        "non_experiment_realized_pnl_cents": metrics["non_experiment_realized_pnl_cents"],
+        "experiment_id": metrics["experiment_id"],
+        "experiment_cutover_ts_ms": metrics["experiment_cutover_ts_ms"],
+        "clean_open_positions_count": metrics["clean_open_positions_count"],
         "bid_sweep_realized_pnl_cents": metrics["bid_sweep_realized_pnl_cents"],
+        "settlement_realized_pnl_cents": metrics["settlement_realized_pnl_cents"],
         "legacy_realized_balance_cents": metrics["legacy_realized_balance_cents"],
-        "marked_unrealized_pnl_cents": metrics["marked_unrealized_pnl_cents"],
+        "marked_unrealized_pnl_cents": metrics["clean_marked_unrealized_pnl_cents"],
+        "portfolio_marked_unrealized_pnl_cents": metrics["marked_unrealized_pnl_cents"],
+        "portfolio_unmarked_positions_count": metrics["unrealized_unmarked_positions_count"],
         "unmarked_contracts": metrics["unmarked_contracts"],
         "unmarked_cost_basis_cents": metrics["unmarked_cost_basis_cents"],
         "oldest_mark_ts_ms": metrics["oldest_mark_ts_ms"],
         "entry_fill_model": "inferred_from_polled_books",
+        "outcome_sample_scope": "all_timestamped_entry_horizons_across_experiments",
         "entry_fill_path_evidence": {
             "queue_cleared": "displayed_size_decrease_may_include_cancels",
             "moved_through": "higher_same_side_bid_with_heuristic_volume",
@@ -1326,12 +1345,10 @@ async def get_paper_summary() -> dict[str, Any]:
             "meets_concentration_threshold"
         ),
         "headline_is_confidence_eligible": headline_metrics.get("is_confidence_eligible"),
-        "unrealized_marks_available": metrics.get("unrealized_marks_available", False),
-        "unrealized_pnl_status": metrics.get("unrealized_pnl_status", "marks_unavailable"),
-        "unrealized_marked_positions_count": metrics.get("unrealized_marked_positions_count", 0),
-        "unrealized_unmarked_positions_count": metrics.get(
-            "unrealized_unmarked_positions_count", 0
-        ),
+        "unrealized_marks_available": metrics["clean_marked_positions_count"] > 0,
+        "unrealized_pnl_status": metrics["clean_unrealized_status"],
+        "unrealized_marked_positions_count": metrics["clean_marked_positions_count"],
+        "unrealized_unmarked_positions_count": metrics["clean_unmarked_positions_count"],
         "latest_snapshot_ts_ms": snapshot["ts_ms"] if snapshot else None,
     }
 
@@ -1771,68 +1788,83 @@ async def get_scanner_status(request: Request) -> dict[str, Any]:
     }
 
 
-# Lifespan managers
+_production_lifespan_active = False
+
+
+async def _supervise_paper_maintenance(client: KalshiClient) -> None:
+    while True:
+        try:
+            await _paper_maintenance_loop(client)
+            logger.error("paper_maintenance_returned_unexpectedly")
+        except Exception:
+            logger.exception("paper_maintenance_failed_restarting")
+        runtime_state.paper_liquidation_marks = {}
+        await asyncio.sleep(1)
+
+
 @asynccontextmanager
 async def lifespan_production(app: FastAPI) -> Any:
-    """Manage app lifecycle: initialize singleton client on startup, close on shutdown."""
-    # Startup
-    # Note: scanner task may be started here via auto-start, or later via POST /scanner/start.
-    # Always check app.state.scanner_task in shutdown, not a local variable.
+    """Own the client, scanner and single database maintenance worker."""
+    global _production_lifespan_active
+    if _production_lifespan_active:
+        raise RuntimeError("A production application lifespan is already active in this process")
+    _production_lifespan_active = True
+    client: KalshiClient | None = None
     try:
         _sync_runtime_from_legacy()
         client = KalshiClient()
         app.state.kalshi_client = client
-        app.state.scanner_task = None  # Initialize scanner_task; may be updated below
-        logger.info("KalshiClient initialized and stored on app.state")
+        app.state.scanner_task = None
+        app.state.paper_maintenance_task = None
+        runtime_state.market_fees = MarketFees(client)
 
-        # Initialize paper trading store if enabled
-        if _ENABLE_PAPER_TRADING:
-            _init_paper_store()
-
-        # Check if NBA scanner is enabled via environment variable
-        enable_scanner = runtime_config.is_nba_scanner_enabled_from_env()
-
-        if enable_scanner:
-            # Start background NBA scanner
-            scanner_task = asyncio.create_task(_nba_scanner_loop(client))
-            app.state.scanner_task = scanner_task
-            logger.info("NBA scanner background task started (ENABLE_NBA_SCANNER=true)")
-        else:
-            _scanner_state.enabled = False
-            logger.info("NBA scanner disabled (ENABLE_NBA_SCANNER=false)")
-
-    except Exception as e:
-        logger.exception("Failed to initialize KalshiClient on startup", extra={"error": str(e)})
-        raise
-
-    yield
-
-    # Shutdown
-    try:
-        _sync_runtime_from_legacy()
-        # Cancel scanner task from app.state, not local variable, to catch tasks
-        # started via POST /scanner/start
-        current_task = getattr(app.state, "scanner_task", None)
-        if current_task and not current_task.done():
-            current_task.cancel()
+        with ExitStack() as resources:
+            if _ENABLE_PAPER_TRADING:
+                _init_paper_store()
+                if _paper_store is None:
+                    raise RuntimeError("Paper trading enabled without a working database")
+                resources.enter_context(_paper_store.claim_worker())
+                recovered = _paper_store.recover_interrupted_intents()
+                logger.info("paper_intents_recovered", extra={"count": recovered})
+                runtime_state.paper_liquidation_marks = {}
+                runtime_state.last_pnl_snapshot_ts_ms = 0
+                app.state.paper_maintenance_task = asyncio.create_task(
+                    _supervise_paper_maintenance(client), name="paper-maintenance"
+                )
             try:
-                await current_task
-            except asyncio.CancelledError:
-                logger.info("NBA scanner task cancelled on shutdown")
+                if runtime_config.is_nba_scanner_enabled_from_env():
+                    app.state.scanner_task = asyncio.create_task(
+                        _nba_scanner_loop(client), name="market-scanner"
+                    )
+                else:
+                    _scanner_state.enabled = False
+                yield
+            finally:
+                scanner = app.state.scanner_task
+                if scanner is not None:
+                    scanner.cancel()
+                    await asyncio.gather(scanner, return_exceptions=True)
 
-        paper_tasks = list(_paper_simulation_tasks)
-        for task in paper_tasks:
-            task.cancel()
-        if paper_tasks:
-            await asyncio.gather(*paper_tasks, return_exceptions=True)
-            logger.info("paper_simulation_tasks_cancelled")
-
-        if hasattr(app.state, "kalshi_client"):
-            await app.state.kalshi_client.aclose()
-            logger.info("KalshiClient closed on shutdown")
-        _sync_legacy_from_runtime()
-    except Exception as e:
-        logger.exception("Error during shutdown", extra={"error": str(e)})
+                tasks = list(_paper_simulation_tasks)
+                if app.state.paper_maintenance_task is not None:
+                    tasks.append(app.state.paper_maintenance_task)
+                for task in tasks:
+                    task.cancel()
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                app.state.scanner_task = None
+                app.state.paper_maintenance_task = None
+                _scanner_state.enabled = False
+                runtime_state.paper_enabled = False
+                _sync_legacy_from_runtime()
+    finally:
+        runtime_state.market_fees = None
+        runtime_state.paper_liquidation_marks = {}
+        try:
+            if client is not None:
+                await client.aclose()
+        finally:
+            _production_lifespan_active = False
 
 
 @asynccontextmanager

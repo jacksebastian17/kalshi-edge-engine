@@ -7,6 +7,7 @@ import pytest
 
 from kalshi_edge_engine.db.paper_store import PaperStore
 from kalshi_edge_engine.engine.fees import estimate_taker_fee_cents
+from kalshi_edge_engine.engine.orderbook import quote_liquidation
 from kalshi_edge_engine.runtime import state as runtime_state
 from kalshi_edge_engine.runtime.paper_exit_runtime import _close_position
 
@@ -39,7 +40,6 @@ class TestPnLEndpointConsistency:
 
         # Create entry intent ID (UUID string)
         entry_intent_id = "intent-1-entry"
-        exit_intent_id = "intent-1-exit"
 
         # Insert entry intent into database
         with sqlite3.connect(paper_store.db_path) as conn:
@@ -54,28 +54,6 @@ class TestPnLEndpointConsistency:
                     ticker,
                     side,
                     entry_price,
-                    contracts,
-                    now_ms,
-                    0.5,  # net_edge
-                    1.0,  # inside_width
-                    None,  # imbalance_gap
-                    "taker",  # fee_mode
-                    False,  # round_trip
-                    "filled",
-                ),
-            )
-            # Insert exit intent for the reverse (closing) order
-            conn.execute(
-                """
-                INSERT INTO quote_intents
-                (id, ticker, side, quote_price_cents, size_contracts, created_ts_ms, net_edge, inside_width, imbalance_gap, fee_mode, round_trip, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    exit_intent_id,
-                    ticker,
-                    side,
-                    exit_price,
                     contracts,
                     now_ms,
                     0.5,  # net_edge
@@ -126,36 +104,20 @@ class TestPnLEndpointConsistency:
         total_realized_before_exit = paper_store.get_total_realized_pnl_cents()
         assert total_realized_before_exit == 0.0
 
-        # Insert exit fill at higher price (using exit_intent_id)
+        # Estimated taker cost for the exit bid
         exit_fee = estimate_taker_fee_cents(exit_price, contracts)
-        paper_store.insert_fill(
-            fill_id="fill-exit-1",
-            intent_id=exit_intent_id,
-            fill_ts_ms=now_ms + 2_000,
-            fill_price_cents=exit_price,
-            fill_size=contracts,
-            remaining_size=0,
-            queue_ahead_at_fill=0,
-            fill_fee_cents=exit_fee,
-            best_bid_at_fill_cents=exit_price,
-            cross_at_fill_cents=exit_price,
-            note="exit",
-        )
-
         # Calculate expected profit
         price_delta = exit_price - entry_price
         profit_before_fees = price_delta * contracts
         total_fees = entry_fee + exit_fee
         expected_realized = profit_before_fees - total_fees
 
-        # Update position to closed (net_contracts=0) with realized PnL increment
-        paper_store.upsert_position(
-            ticker=ticker,
-            side=side,
-            net_contracts=0,
-            avg_entry_price_cents=entry_price,
-            realized_pnl_cents=expected_realized,
-            first_open_ts_ms=now_ms + 1_000,
+        quote = quote_liquidation(
+            {side.lower(): [[exit_price, contracts]]}, side, contracts, now_ms + 2_000
+        )
+        assert quote is not None
+        assert paper_store.close_position(
+            paper_store.get_positions()[0], quote, now_ms=now_ms + 2_000, reason="time_stop"
         )
 
         # Verify get_positions() no longer shows this position (net_contracts=0 filtered)
@@ -172,11 +134,11 @@ class TestPnLEndpointConsistency:
         with sqlite3.connect(paper_store.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT id, note, fill_price_cents, fill_size FROM paper_fills WHERE note = 'exit'",
+                "SELECT id, note, fill_price_cents, fill_size FROM paper_fills WHERE note = 'exit_time_stop'",
             )
             exit_fills = cursor.fetchall()
             assert len(exit_fills) == 1
-            assert exit_fills[0][1] == "exit"
+            assert exit_fills[0][1] == "exit_time_stop"
             assert exit_fills[0][2] == exit_price
             assert exit_fills[0][3] == contracts
 
@@ -199,7 +161,6 @@ class TestPnLEndpointConsistency:
 
         # Insert entry and exit intents (must be separate due to overfill prevention)
         entry_intent_id = "intent-2-entry"
-        exit_intent_id = "intent-2-exit"
         with sqlite3.connect(paper_store.db_path) as conn:
             conn.execute(
                 """
@@ -212,27 +173,6 @@ class TestPnLEndpointConsistency:
                     ticker,
                     side,
                     entry_price,
-                    contracts,
-                    now_ms,
-                    0.5,  # net_edge
-                    1.0,  # inside_width
-                    None,  # imbalance_gap
-                    "taker",  # fee_mode
-                    False,  # round_trip
-                    "filled",
-                ),
-            )
-            conn.execute(
-                """
-                INSERT INTO quote_intents
-                (id, ticker, side, quote_price_cents, size_contracts, created_ts_ms, net_edge, inside_width, imbalance_gap, fee_mode, round_trip, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    exit_intent_id,
-                    ticker,
-                    side,
-                    exit_price,
                     contracts,
                     now_ms,
                     0.5,  # net_edge
@@ -271,30 +211,15 @@ class TestPnLEndpointConsistency:
 
         # Exit
         exit_fee = estimate_taker_fee_cents(exit_price, contracts)
-        price_delta = entry_price - exit_price  # NO side: profit if price goes down
+        price_delta = exit_price - entry_price  # Long NO uses NO-price coordinates
         realized_pnl = (price_delta * contracts) - entry_fee - exit_fee
 
-        paper_store.insert_fill(
-            fill_id="fill-exit-2",
-            intent_id=exit_intent_id,
-            fill_ts_ms=now_ms + 2_000,
-            fill_price_cents=exit_price,
-            fill_size=contracts,
-            remaining_size=0,
-            queue_ahead_at_fill=0,
-            fill_fee_cents=exit_fee,
-            best_bid_at_fill_cents=exit_price,
-            cross_at_fill_cents=exit_price,
-            note="exit",
+        quote = quote_liquidation(
+            {side.lower(): [[exit_price, contracts]]}, side, contracts, now_ms + 2_000
         )
-
-        paper_store.upsert_position(
-            ticker=ticker,
-            side=side,
-            net_contracts=0,
-            avg_entry_price_cents=entry_price,
-            realized_pnl_cents=realized_pnl,
-            first_open_ts_ms=now_ms + 1_000,
+        assert quote is not None
+        assert paper_store.close_position(
+            paper_store.get_positions()[0], quote, now_ms=now_ms + 2_000, reason="time_stop"
         )
 
         # TEST: get_total_realized_pnl_cents() should return the realized PnL

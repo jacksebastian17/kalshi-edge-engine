@@ -3,17 +3,88 @@
 import asyncio
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from kalshi_edge_engine.db.paper_store import MARK_MAX_AGE_MS, OUTCOME_MAX_DELAY_MS, PaperStore
-from kalshi_edge_engine.engine.fees import estimate_taker_fee_cents
+from kalshi_edge_engine.engine.fees import LEGACY_FEE_PROFILE, FeeProfile, estimate_taker_fee_cents
 from kalshi_edge_engine.engine.orderbook import LiquidationQuote, quote_liquidation
 from kalshi_edge_engine.engine.position_exit import decide_position_exit, should_take_profit
 from kalshi_edge_engine.kalshi.client import KalshiClient
+from kalshi_edge_engine.kalshi.market import read_settlement
 from kalshi_edge_engine.runtime import config as runtime_config
 from kalshi_edge_engine.runtime import state as runtime_state
 
 logger = logging.getLogger(__name__)
+SETTLEMENT_POLL_SECONDS = 15
+
+
+async def _position_fee_profiles(tickers: set[str]) -> dict[str, FeeProfile | None]:
+    resolver = runtime_state.market_fees
+    if resolver is None:
+        return dict.fromkeys(tickers)
+    limit = asyncio.Semaphore(5)
+
+    async def resolve(ticker: str) -> FeeProfile | None:
+        async with limit:
+            return await resolver.resolve(ticker)
+
+    ordered = sorted(tickers)
+    profiles = await asyncio.gather(*(resolve(ticker) for ticker in ordered))
+    return dict(zip(ordered, profiles, strict=True))
+
+
+async def _reconcile_markets(
+    store: PaperStore,
+    client: KalshiClient,
+    tickers: set[str],
+    checks: dict[str, tuple[float, dict[str, Any] | None]],
+) -> set[str]:
+    """Poll held markets independently of depth and keep known nontrading markets off the bid path."""
+    limit = asyncio.Semaphore(5)
+
+    async def refresh(ticker: str) -> None:
+        deadline, previous = checks.get(ticker, (0, None))
+        if time.monotonic() < deadline:
+            return
+        market: dict[str, Any] | None = previous
+        async with limit:
+            try:
+                fetched = await client.get_market(ticker)
+                if isinstance(fetched, dict) and fetched.get("ticker") == ticker:
+                    market = fetched
+            except Exception:
+                logger.debug(
+                    "paper_market_status_unavailable", extra={"ticker": ticker}, exc_info=True
+                )
+        checks[ticker] = (time.monotonic() + SETTLEMENT_POLL_SECONDS, market)
+
+    for stale_ticker in checks.keys() - tickers:
+        del checks[stale_ticker]
+    await asyncio.gather(*(refresh(ticker) for ticker in sorted(tickers)))
+    blocked: set[str] = set()
+    for ticker, (_, market) in checks.items():
+        if not market:
+            continue
+        if market.get("status") in (
+            "initialized",
+            "inactive",
+            "closed",
+            "determined",
+            "disputed",
+            "amended",
+            "finalized",
+            "settled",
+        ):
+            blocked.add(ticker)
+        settlement = read_settlement(market)
+        if settlement is not None and store.reconcile_market_settlement(
+            settlement, now_ms=int(time.time() * 1000)
+        ):
+            logger.info(
+                "paper_market_settled", extra={"ticker": ticker, "result": settlement.result}
+            )
+    return blocked
 
 
 async def _fetch_books(
@@ -49,12 +120,23 @@ async def _observe_due_outcomes(store: PaperStore, client: KalshiClient, now_ms:
             earliest_ts_ms=now_ms - horizon * 1000 - OUTCOME_MAX_DELAY_MS,
         )
     ]
-    books = await _fetch_books(client, {row["ticker"] for _, row in pending})
+    tickers = {row["ticker"] for _, row in pending}
+    profiles = await _position_fee_profiles(tickers)
+    books = await _fetch_books(client, tickers)
     for horizon, row in pending:
         if row["ticker"] not in books:
             continue
         book, observed_ts_ms = books[row["ticker"]]
-        quote = quote_liquidation(book, row["side"], row["fill_size"], observed_ts_ms)
+        profile = profiles[row["ticker"]]
+        if profile is None and row["experiment_id"]:
+            continue
+        quote = quote_liquidation(
+            book,
+            row["side"],
+            row["fill_size"],
+            observed_ts_ms,
+            fee_profile=profile or LEGACY_FEE_PROFILE,
+        )
         if quote is None:
             continue
         pnl = store.compute_short_horizon_fill_pnl_cents(
@@ -71,14 +153,26 @@ async def _observe_due_outcomes(store: PaperStore, client: KalshiClient, now_ms:
             mark_after_fill_cents=quote.price_cents,
             pnl_after_fill_cents=pnl,
             observed_ts_ms=observed_ts_ms,
+            liquidation=quote,
         )
 
 
 async def _refresh_positions(
-    store: PaperStore, client: KalshiClient
+    store: PaperStore,
+    client: KalshiClient,
+    *,
+    market_checks: dict[str, tuple[float, dict[str, Any] | None]] | None = None,
 ) -> dict[tuple[str, str], LiquidationQuote]:
     positions = store.get_positions()
-    books = await _fetch_books(client, {pos["ticker"] for pos in positions})
+    tickers = {pos["ticker"] for pos in positions}
+    blocked = await _reconcile_markets(
+        store,
+        client,
+        tickers | store.get_open_intent_tickers(),
+        market_checks if market_checks is not None else {},
+    )
+    profiles = await _position_fee_profiles(tickers - blocked)
+    books = await _fetch_books(client, tickers - blocked)
     now_ms = int(time.time() * 1000)
     marks: dict[tuple[str, str], LiquidationQuote] = {}
     for pos in positions:
@@ -86,7 +180,12 @@ async def _refresh_positions(
         if ticker not in books:
             continue
         book, observed_ts_ms = books[ticker]
-        quote = quote_liquidation(book, side, size, observed_ts_ms)
+        profile = profiles[ticker]
+        if profile is None and pos["clean_lifecycle"]:
+            continue
+        quote = quote_liquidation(
+            book, side, size, observed_ts_ms, fee_profile=profile or LEGACY_FEE_PROFILE
+        )
         if quote is None or not quote.is_fresh(now_ms, MARK_MAX_AGE_MS):
             continue
         entry_fees = pos["open_entry_fees_cents"]
@@ -126,9 +225,14 @@ async def _refresh_positions(
 
 async def _paper_maintenance_loop(client: KalshiClient) -> None:
     """Maintain exposure and outcomes even when discovery returns no markets."""
+
+    async def run(worker: Callable[[KalshiClient], Awaitable[None]]) -> None:
+        await worker(client)
+        raise RuntimeError("Paper maintenance child task returned")
+
     async with asyncio.TaskGroup() as tasks:
-        tasks.create_task(_position_maintenance_loop(client))
-        tasks.create_task(_outcome_maintenance_loop(client))
+        tasks.create_task(run(_position_maintenance_loop))
+        tasks.create_task(run(_outcome_maintenance_loop))
 
 
 async def _outcome_maintenance_loop(client: KalshiClient) -> None:
@@ -143,11 +247,12 @@ async def _outcome_maintenance_loop(client: KalshiClient) -> None:
 
 
 async def _position_maintenance_loop(client: KalshiClient) -> None:
+    market_checks: dict[str, tuple[float, dict[str, Any] | None]] = {}
     while True:
         store = runtime_state.paper_store
         if runtime_config.ENABLE_PAPER_TRADING and store is not None:
             try:
-                marks = await _refresh_positions(store, client)
+                marks = await _refresh_positions(store, client, market_checks=market_checks)
                 runtime_state.paper_liquidation_marks = marks
                 now_ms = int(time.time() * 1000)
                 risk = store.evaluate_daily_loss(
@@ -161,22 +266,25 @@ async def _position_maintenance_loop(client: KalshiClient) -> None:
                 ):
                     metrics = store.compute_paper_metrics(liquidation_marks=marks, now_ms=now_ms)
                     detail_keys = (
-                        "marked_unrealized_pnl_cents",
-                        "unrealized_pnl_status",
-                        "unrealized_marks_available",
-                        "unrealized_marked_positions_count",
-                        "unrealized_unmarked_positions_count",
-                        "unmarked_contracts",
-                        "unmarked_cost_basis_cents",
-                        "oldest_mark_ts_ms",
+                        "experiment_id",
+                        "experiment_cutover_ts_ms",
+                        "non_experiment_realized_pnl_cents",
+                        "clean_open_positions_count",
                     )
                     store.insert_pnl_snapshot(
                         ts_ms=now_ms,
-                        realized_pnl_cents=metrics["realized_pnl_cents"],
-                        unrealized_pnl_cents=metrics["unrealized_pnl_cents"],
+                        realized_pnl_cents=metrics["clean_realized_pnl_cents"],
+                        unrealized_pnl_cents=metrics["clean_unrealized_pnl_cents"],
                         open_positions_count=metrics["open_positions_count"],
                         open_orders_count=metrics["open_orders_count"],
-                        valuation_details={**{key: metrics[key] for key in detail_keys}, **risk},
+                        valuation_details={
+                            **{key: metrics[key] for key in detail_keys},
+                            "unrealized_pnl_status": metrics["clean_unrealized_status"],
+                            "unrealized_unmarked_positions_count": metrics[
+                                "clean_unmarked_positions_count"
+                            ],
+                            **risk,
+                        },
                     )
                     runtime_state.last_pnl_snapshot_ts_ms = now_ms
             except Exception:

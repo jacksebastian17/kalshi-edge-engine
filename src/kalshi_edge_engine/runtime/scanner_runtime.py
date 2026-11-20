@@ -6,6 +6,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+from kalshi_edge_engine.engine.fees import LEGACY_FEE_PROFILE
 from kalshi_edge_engine.engine.signal import Signal, score_signal
 from kalshi_edge_engine.engine.universe import discover_nba_universe
 from kalshi_edge_engine.kalshi.client import KalshiClient
@@ -156,6 +157,12 @@ async def _nba_scanner_loop(
                 """Fetch orderbook and score signal. Returns (ticker, signal or None)."""
                 async with sem:
                     try:
+                        resolver = runtime_state.market_fees
+                        fee_profile = (
+                            await resolver.resolve(ticker, for_entry=True)
+                            if resolver is not None
+                            else LEGACY_FEE_PROFILE
+                        )
                         orderbook = await api_client.get_orderbook(ticker)
                         universe_key = runtime_state.scanner_state.ticker_universe_map.get(
                             ticker,
@@ -163,7 +170,9 @@ async def _nba_scanner_loop(
                         )
                         return (
                             ticker,
-                            score_signal(ticker, orderbook, universe=universe_key),
+                            score_signal(
+                                ticker, orderbook, universe=universe_key, fee_profile=fee_profile
+                            ),
                         )
                     except Exception as e:
                         logger.debug(

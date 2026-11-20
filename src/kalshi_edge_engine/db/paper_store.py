@@ -4,15 +4,21 @@ import json
 import logging
 import sqlite3
 import statistics
+import sys
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
+from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
-from kalshi_edge_engine.engine.fees import estimate_taker_fee_cents
+from kalshi_edge_engine.engine.fees import LEGACY_FEE_PROFILE, FeeProfile, estimate_taker_fee_cents
 from kalshi_edge_engine.engine.orderbook import LiquidationQuote
 from kalshi_edge_engine.engine.paper import PaperFill, PaperOutcome, QuoteIntent
 from kalshi_edge_engine.engine.position_exit import compute_realized_exit_pnl_cents
+from kalshi_edge_engine.kalshi.market import MarketSettlement
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +35,7 @@ UTC_DAY_MS = 86_400_000
 MARK_MAX_AGE_MS = 10_000
 OUTCOME_ON_TIME_MS = 2_000
 OUTCOME_MAX_DELAY_MS = 15_000
+CLEAN_EXPERIMENT_ID = "series_fees_and_settlement_v1"
 
 
 @dataclass(frozen=True)
@@ -69,6 +76,25 @@ class PaperStore:
         """
         self.db_path = db_path
         self._init_schema()
+
+    @contextmanager
+    def claim_worker(self) -> Iterator[None]:
+        """Exclusively own recovery and maintenance of this database until shutdown."""
+        lock_path = Path(f"{Path(self.db_path).resolve()}.paper-worker.lock")
+        with lock_path.open("a+b") as lock:
+            try:
+                lock.seek(0)
+                if sys.platform == "win32":
+                    import msvcrt
+
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise RuntimeError(f"Paper maintenance already owns {self.db_path}") from exc
+            yield  # Closing the handle releases the OS lock, including on process exit.
 
     def _init_schema(self) -> None:
         """Create tables if they don't exist."""
@@ -195,6 +221,35 @@ class PaperStore:
                     )
                     """
                 )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS paper_experiments (
+                        id TEXT PRIMARY KEY,
+                        cutover_ts_ms INTEGER NOT NULL
+                    )
+                    """
+                )
+                cursor.execute(
+                    "INSERT OR IGNORE INTO paper_experiments VALUES (?, ?)",
+                    (CLEAN_EXPERIMENT_ID, int(time.time() * 1000)),
+                )
+                self.cutover_ts_ms = int(
+                    cursor.execute(
+                        "SELECT cutover_ts_ms FROM paper_experiments WHERE id = ?",
+                        (CLEAN_EXPERIMENT_ID,),
+                    ).fetchone()[0]
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS paper_market_settlements (
+                        ticker TEXT PRIMARY KEY,
+                        result TEXT NOT NULL,
+                        yes_payout_cents REAL NOT NULL,
+                        settlement_ts_ms INTEGER NOT NULL,
+                        reconciled_ts_ms INTEGER NOT NULL
+                    )
+                    """
+                )
 
                 # Create indices for performance
                 cursor.execute(
@@ -239,6 +294,27 @@ class PaperStore:
         Safe to call multiple times - checks columns via PRAGMA before running ALTER TABLE.
         """
         migrations = [
+            (
+                "quote_intents",
+                "fee_profile",
+                "ALTER TABLE quote_intents ADD COLUMN fee_profile TEXT",
+            ),
+            ("paper_fills", "fee_profile", "ALTER TABLE paper_fills ADD COLUMN fee_profile TEXT"),
+            (
+                "paper_fills",
+                "experiment_id",
+                "ALTER TABLE paper_fills ADD COLUMN experiment_id TEXT",
+            ),
+            (
+                "paper_fills",
+                "outcome_fee_audit",
+                "ALTER TABLE paper_fills ADD COLUMN outcome_fee_audit TEXT",
+            ),
+            (
+                "paper_positions",
+                "clean_lifecycle",
+                "ALTER TABLE paper_positions ADD COLUMN clean_lifecycle INTEGER NOT NULL DEFAULT 0",
+            ),
             (
                 "paper_positions",
                 "open_entry_fees_cents",
@@ -377,7 +453,8 @@ class PaperStore:
         max_hold_seconds: int | None = None,
         best_bid_at_submit_cents: float | None = None,
         cross_at_submit_cents: float | None = None,
-    ) -> None:
+        fee_profile: FeeProfile = LEGACY_FEE_PROFILE,
+    ) -> bool:
         """Insert a quote intent with optional runtime parameters.
 
         Args:
@@ -395,14 +472,15 @@ class PaperStore:
         )
         try:
             with sqlite3.connect(self.db_path) as conn:
-                conn.execute(
+                cursor = conn.execute(
                     """
                     INSERT INTO quote_intents
                     (id, ticker, universe, side, quote_price_cents, size_contracts, created_ts_ms,
                      status, net_edge, inside_width, imbalance_gap, fee_mode, round_trip,
                      entry_fee_cents, take_profit_cents, max_hold_seconds,
-                     best_bid_at_submit_cents, cross_at_submit_cents)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     best_bid_at_submit_cents, cross_at_submit_cents, fee_profile)
+                    SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    WHERE NOT EXISTS (SELECT 1 FROM paper_market_settlements WHERE ticker = ?)
                     """,
                     (
                         intent.id,
@@ -423,9 +501,11 @@ class PaperStore:
                         max_hold_seconds,
                         best_bid_at_submit_cents,
                         cross_at_submit_cents,
+                        json.dumps(fee_profile.audit()),
+                        intent.ticker,
                     ),
                 )
-                conn.commit()
+                return cursor.rowcount == 1
         except sqlite3.Error as e:
             logger.exception(
                 "paper_store_insert_intent_error",
@@ -851,6 +931,7 @@ class PaperStore:
         apply_to_position: bool = False,
         execution_source: str | None = None,
         observed_30s_ts_ms: int | None = None,
+        fee_profile: FeeProfile | None = None,
         **kwargs: Any,
     ) -> FillInsertResult:
         """Insert a paper fill event and return a structured result.
@@ -921,7 +1002,7 @@ class PaperStore:
 
                     # Load intent to get size_contracts
                     cursor.execute(
-                        "SELECT size_contracts, universe, ticker, side, status "
+                        "SELECT size_contracts, universe, ticker, side, status, created_ts_ms, fee_profile, fee_mode "
                         "FROM quote_intents WHERE id = ?",
                         (intent_id,),
                     )
@@ -977,9 +1058,30 @@ class PaperStore:
                         intent_row[4] != "OPEN"
                         or str(intent_id).startswith("exit_intent:")
                         or str(fill_dict["note"]).startswith("exit")
+                        or conn.execute(
+                            "SELECT 1 FROM paper_market_settlements WHERE ticker = ?",
+                            (intent_row[2],),
+                        ).fetchone()
+                        is not None
                     ):
                         return FillInsertResult(status=FILL_REJECTED_INACTIVE_INTENT)
 
+                    clean = (
+                        apply_to_position
+                        and fee_profile is not None
+                        and fee_profile.series_aware
+                        and json.dumps(fee_profile.audit()) == intent_row[6]
+                        and fill_dict["fill_fee_cents"]
+                        == fee_profile.fee_cents(
+                            fill_dict["fill_price_cents"],
+                            fill_dict["fill_size"],
+                            liquidity=intent_row[7],
+                        )
+                        and str(fill_dict["note"]).startswith("entry_")
+                        and execution_source is not None
+                        and execution_source.startswith("simulated_")
+                        and min(intent_row[5], fill_dict["fill_ts_ms"]) >= self.cutover_ts_ms
+                    )
                     # Compute corrected remaining_size for consistency
                     # remaining_size should be (size_contracts - (filled_so_far + fill_size))
                     corrected_remaining_size = max(0, size_contracts - (filled_so_far + fill_size))
@@ -996,8 +1098,8 @@ class PaperStore:
                          remaining_size, queue_ahead_at_fill, fill_fee_cents, note, universe,
                          best_bid_at_fill_cents, cross_at_fill_cents,
                          mark_30s_after_fill_cents, pnl_30s_after_fill_cents,
-                         execution_source, observed_30s_ts_ms)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         execution_source, observed_30s_ts_ms, fee_profile, experiment_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             fill_dict["fill_id"],
@@ -1016,6 +1118,8 @@ class PaperStore:
                             fill_dict["pnl_30s_after_fill_cents"],
                             execution_source,
                             observed_30s_ts_ms,
+                            json.dumps(fee_profile.audit()) if fee_profile is not None else None,
+                            CLEAN_EXPERIMENT_ID if clean else None,
                         ),
                     )
 
@@ -1031,7 +1135,7 @@ class PaperStore:
                     )
                     if apply_to_position:
                         self._apply_entry_fill(
-                            conn, intent_row[2], intent_row[3], fill_dict, now_ms
+                            conn, intent_row[2], intent_row[3], fill_dict, now_ms, clean=clean
                         )
 
                     # Commit the transaction
@@ -1075,7 +1179,14 @@ class PaperStore:
         return result.inserted_new_fill or result.already_exists
 
     def _apply_entry_fill(
-        self, conn: sqlite3.Connection, ticker: str, side: str, fill: dict[str, Any], now_ms: int
+        self,
+        conn: sqlite3.Connection,
+        ticker: str,
+        side: str,
+        fill: dict[str, Any],
+        now_ms: int,
+        *,
+        clean: bool,
     ) -> None:
         row = conn.execute(
             """
@@ -1091,8 +1202,9 @@ class PaperStore:
             """
             INSERT INTO paper_positions
                 (id, ticker, side, net_contracts, avg_entry_price_cents, realized_pnl_cents,
-                 first_open_ts_ms, last_update_ts_ms, open_entry_fees_cents, opening_intent_id)
-            VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+                 first_open_ts_ms, last_update_ts_ms, open_entry_fees_cents, opening_intent_id,
+                 clean_lifecycle)
+            VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
             ON CONFLICT(ticker, side) DO UPDATE SET
                 avg_entry_price_cents =
                     (net_contracts * avg_entry_price_cents
@@ -1104,6 +1216,8 @@ class PaperStore:
                     ELSE opening_intent_id END,
                 open_entry_fees_cents = CASE WHEN net_contracts = 0 THEN excluded.open_entry_fees_cents
                     ELSE COALESCE(open_entry_fees_cents, 0) + excluded.open_entry_fees_cents END,
+                clean_lifecycle = CASE WHEN net_contracts = 0 THEN excluded.clean_lifecycle
+                    ELSE clean_lifecycle AND excluded.clean_lifecycle END,
                 net_contracts = net_contracts + excluded.net_contracts,
                 last_update_ts_ms = excluded.last_update_ts_ms
             """,
@@ -1117,6 +1231,7 @@ class PaperStore:
                 now_ms,
                 fee,
                 fill["intent_id"],
+                clean,
             ),
         )
 
@@ -1142,8 +1257,8 @@ class PaperStore:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 """
-                SELECT net_contracts, avg_entry_price_cents, first_open_ts_ms,
-                       open_entry_fees_cents, opening_intent_id, last_update_ts_ms
+                SELECT side, net_contracts, avg_entry_price_cents, first_open_ts_ms,
+                       open_entry_fees_cents, opening_intent_id, last_update_ts_ms, clean_lifecycle
                 FROM paper_positions WHERE ticker = ? AND side = ?
                 """,
                 (ticker, side),
@@ -1151,91 +1266,218 @@ class PaperStore:
             expected = (size, position["avg_entry_price_cents"], position["first_open_ts_ms"])
             if (
                 row is None
-                or row[:3] != expected
-                or row[5] != position.get("last_update_ts_ms", row[5])
+                or row[1:4] != expected
+                or row[6] != position.get("last_update_ts_ms", row[6])
             ):
                 return False
-            _, entry_price, first_open_ts, entry_fees, opening_intent, _ = row
-            if entry_fees is None:
-                entry_fees = self._lifecycle_fees(conn, ticker, side, first_open_ts)
-            realized_delta = (
-                compute_realized_exit_pnl_cents(
-                    side=side,
-                    avg_entry_price_cents=entry_price,
-                    mark_price_cents=quote.price_cents,
-                    net_contracts=size,
-                    exit_fee_cents=quote.exit_fee_cents,
-                )
-                - entry_fees
-            )
-            universe_row = conn.execute(
-                "SELECT universe FROM quote_intents WHERE id = ?", (opening_intent,)
-            ).fetchone()
-            universe = universe_row[0] if universe_row else None
-            event_id = str(uuid.uuid4())
-            intent_id = f"exit_intent:{event_id}"
-            conn.execute(
-                """
-                INSERT INTO quote_intents
-                    (id, ticker, side, universe, quote_price_cents, size_contracts, created_ts_ms,
-                     status, net_edge, inside_width, fee_mode, round_trip, last_update_ts_ms)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'FILLED', 0, 0, 'taker', 0, ?)
-                """,
-                (intent_id, ticker, side, universe, quote.price_cents, size, now_ms, now_ms),
-            )
-            conn.execute(
-                """
-                INSERT INTO paper_fills
-                    (id, intent_id, universe, fill_ts_ms, fill_price_cents, fill_size,
-                     remaining_size, queue_ahead_at_fill, fill_fee_cents, note,
-                     best_bid_at_fill_cents, cross_at_fill_cents, execution_source,
-                     bid_levels, realized_pnl_delta_cents)
-                VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    f"exit:{event_id}",
-                    intent_id,
-                    universe,
-                    now_ms,
-                    quote.price_cents,
-                    size,
-                    quote.exit_fee_cents,
-                    f"exit_{reason}",
-                    quote.best_bid_cents,
-                    quote.implied_ask_cents,
-                    execution_source,
-                    json.dumps(quote.bid_levels),
-                    realized_delta,
+            self._record_position_exit(
+                conn,
+                ticker,
+                row,
+                price_cents=quote.price_cents,
+                now_ms=now_ms,
+                reason=reason,
+                execution_source=execution_source,
+                quote=quote,
+                clean=bool(
+                    row[7]
+                    and quote.fee_profile.series_aware
+                    and execution_source == "simulated_displayed_bid_sweep"
                 ),
             )
-            conn.execute(
+        return True
+
+    def reconcile_market_settlement(self, settlement: MarketSettlement, *, now_ms: int) -> bool:
+        """Book a finalized market once, including both sides and all open remainders."""
+        if settlement.settlement_ts_ms > now_ms or not 0 <= settlement.yes_payout_cents <= 100:
+            return False
+        ticker = settlement.ticker
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            inserted = conn.execute(
                 """
-                UPDATE paper_positions SET net_contracts = 0, open_entry_fees_cents = 0,
-                    realized_pnl_cents = COALESCE(realized_pnl_cents, 0) + ?, last_update_ts_ms = ?
-                WHERE ticker = ? AND side = ?
+                INSERT OR IGNORE INTO paper_market_settlements
+                    (ticker, result, yes_payout_cents, settlement_ts_ms, reconciled_ts_ms)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (realized_delta, now_ms, ticker, side),
+                (
+                    ticker,
+                    settlement.result,
+                    settlement.yes_payout_cents,
+                    settlement.settlement_ts_ms,
+                    now_ms,
+                ),
             )
-            conn.execute(
+            if not inserted.rowcount:
+                return False
+            rows = conn.execute(
                 """
-                UPDATE quote_intents SET exit_ts_ms = ?, mark_price_cents = ?
-                WHERE ticker = ? AND side = ? AND exit_ts_ms IS NULL
-                  AND id NOT LIKE 'exit_intent:%'
-                  AND EXISTS (
-                      SELECT 1 FROM paper_fills f
-                      WHERE f.intent_id = quote_intents.id AND f.fill_ts_ms >= ?
-                  )
+                SELECT side, net_contracts, avg_entry_price_cents, first_open_ts_ms,
+                       open_entry_fees_cents, opening_intent_id, last_update_ts_ms, clean_lifecycle
+                FROM paper_positions WHERE ticker = ? AND net_contracts > 0
                 """,
-                (now_ms, quote.price_cents, ticker, side, first_open_ts),
-            )
+                (ticker,),
+            ).fetchall()
+            for position in rows:
+                side = position[0]
+                payout = (
+                    settlement.yes_payout_cents
+                    if side == "YES"
+                    else float(Decimal("100") - Decimal(str(settlement.yes_payout_cents)))
+                )
+                late_entry = conn.execute(
+                    """
+                    SELECT 1 FROM paper_fills f JOIN quote_intents i ON f.intent_id = i.id
+                    WHERE i.ticker = ? AND i.side = ? AND i.exit_ts_ms IS NULL
+                      AND i.id NOT LIKE 'exit_intent:%' AND f.fill_ts_ms >= ?
+                      AND f.fill_ts_ms > ?
+                    LIMIT 1
+                    """,
+                    (
+                        ticker,
+                        side,
+                        position[3],
+                        min(
+                            settlement.settlement_ts_ms,
+                            settlement.close_ts_ms or settlement.settlement_ts_ms,
+                        ),
+                    ),
+                ).fetchone()
+                self._record_position_exit(
+                    conn,
+                    ticker,
+                    position,
+                    price_cents=payout,
+                    now_ms=now_ms,
+                    reason="settlement",
+                    execution_source="kalshi_market_settlement",
+                    clean=bool(position[7] and late_entry is None),
+                )
             conn.execute(
                 """
                 UPDATE quote_intents SET status = 'CANCELED', last_update_ts_ms = ?
-                WHERE ticker = ? AND side = ? AND status = 'OPEN'
+                WHERE ticker = ? AND status IN ('OPEN', 'NEW')
                 """,
-                (now_ms, ticker, side),
+                (now_ms, ticker),
             )
         return True
+
+    def _record_position_exit(
+        self,
+        conn: sqlite3.Connection,
+        ticker: str,
+        row: tuple[Any, ...],
+        *,
+        price_cents: float,
+        now_ms: int,
+        reason: str,
+        execution_source: str,
+        clean: bool,
+        quote: LiquidationQuote | None = None,
+    ) -> None:
+        side, size, entry_price, first_open_ts, entry_fees, opening_intent, _, _ = row
+        if entry_fees is None:
+            entry_fees = self._lifecycle_fees(conn, ticker, side, first_open_ts)
+        exit_fee = quote.exit_fee_cents if quote is not None else 0.0
+        realized_delta = (
+            compute_realized_exit_pnl_cents(
+                side=side,
+                avg_entry_price_cents=entry_price,
+                mark_price_cents=price_cents,
+                net_contracts=size,
+                exit_fee_cents=exit_fee,
+            )
+            - entry_fees
+        )
+        universe_row = conn.execute(
+            "SELECT universe FROM quote_intents WHERE id = ?", (opening_intent,)
+        ).fetchone()
+        universe = universe_row[0] if universe_row else None
+        event_id = str(uuid.uuid4()) if quote else f"settlement:{ticker}:{side}"
+        intent_id = f"exit_intent:{event_id}"
+        profile = (
+            quote.fee_profile.audit()
+            if quote
+            else {
+                "version": "kalshi_settlement_no_fee_2026_07",
+                "source": "kalshi_fee_schedule",
+            }
+        )
+        profile_json = json.dumps(profile)
+        conn.execute(
+            """
+            INSERT INTO quote_intents
+                (id, ticker, side, universe, quote_price_cents, size_contracts, created_ts_ms,
+                 status, net_edge, inside_width, fee_mode, round_trip, last_update_ts_ms, fee_profile)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'FILLED', 0, 0, ?, 0, ?, ?)
+            """,
+            (
+                intent_id,
+                ticker,
+                side,
+                universe,
+                price_cents,
+                size,
+                now_ms,
+                "taker" if quote else "settlement",
+                now_ms,
+                profile_json,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO paper_fills
+                (id, intent_id, universe, fill_ts_ms, fill_price_cents, fill_size,
+                 remaining_size, queue_ahead_at_fill, fill_fee_cents, note,
+                 best_bid_at_fill_cents, cross_at_fill_cents, execution_source,
+                 bid_levels, realized_pnl_delta_cents, fee_profile, experiment_id)
+            VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                f"exit:{event_id}",
+                intent_id,
+                universe,
+                now_ms,
+                price_cents,
+                size,
+                exit_fee,
+                f"exit_{reason}",
+                quote.best_bid_cents if quote else None,
+                quote.implied_ask_cents if quote else None,
+                execution_source,
+                json.dumps(quote.bid_levels) if quote else None,
+                realized_delta,
+                profile_json,
+                CLEAN_EXPERIMENT_ID if clean else None,
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE paper_positions SET net_contracts = 0, open_entry_fees_cents = 0,
+                realized_pnl_cents = COALESCE(realized_pnl_cents, 0) + ?, last_update_ts_ms = ?
+            WHERE ticker = ? AND side = ?
+            """,
+            (realized_delta, now_ms, ticker, side),
+        )
+        conn.execute(
+            """
+            UPDATE quote_intents SET exit_ts_ms = ?, mark_price_cents = ?
+            WHERE ticker = ? AND side = ? AND exit_ts_ms IS NULL
+              AND id NOT LIKE 'exit_intent:%'
+              AND EXISTS (
+                  SELECT 1 FROM paper_fills f
+                  WHERE f.intent_id = quote_intents.id AND f.fill_ts_ms >= ?
+              )
+            """,
+            (now_ms, price_cents, ticker, side, first_open_ts),
+        )
+        conn.execute(
+            """
+            UPDATE quote_intents SET status = 'CANCELED', last_update_ts_ms = ?
+            WHERE ticker = ? AND side = ? AND status IN ('OPEN', 'NEW')
+            """,
+            (now_ms, ticker, side),
+        )
 
     def recover_interrupted_intents(self) -> int:
         """Expire orphaned remainders after the single paper worker restarts."""
@@ -1254,6 +1496,15 @@ class PaperStore:
             )
             return cursor.rowcount
 
+    def get_open_intent_tickers(self) -> set[str]:
+        with sqlite3.connect(self.db_path) as conn:
+            return {
+                row[0]
+                for row in conn.execute(
+                    "SELECT DISTINCT ticker FROM quote_intents WHERE status = 'OPEN'"
+                )
+            }
+
     def upsert_position(
         self,
         ticker: str,
@@ -1263,67 +1514,48 @@ class PaperStore:
         realized_pnl_cents: float,
         first_open_ts_ms: int,
     ) -> None:
-        """Insert or update a position."""
-        try:
-            side = side.strip().upper()
-            pos_id = f"{ticker}_{side}_{int(time.time())}"
-            now_ms = int(time.time() * 1000)
-
-            with sqlite3.connect(self.db_path) as conn:
-                # Try update first
-                conn.execute(
-                    """
-                    UPDATE paper_positions
-                    SET net_contracts = ?, avg_entry_price_cents = ?,
-                        realized_pnl_cents = CASE WHEN net_contracts = 0 AND ? > 0
-                            THEN realized_pnl_cents ELSE ? END,
-                        first_open_ts_ms = CASE WHEN net_contracts = 0 AND ? > 0
-                            THEN ? ELSE first_open_ts_ms END,
-                        open_entry_fees_cents = CASE WHEN ? = 0 THEN 0
-                            WHEN net_contracts = 0 THEN NULL ELSE open_entry_fees_cents END,
-                        last_update_ts_ms = ?
-                    WHERE ticker = ? AND side = ?
-                    """,
-                    (
-                        net_contracts,
-                        avg_entry_price_cents,
-                        net_contracts,
-                        realized_pnl_cents,
-                        net_contracts,
-                        first_open_ts_ms,
-                        net_contracts,
-                        now_ms,
-                        ticker,
-                        side,
-                    ),
-                )
-
-                if conn.total_changes == 0:
-                    # No row updated, insert new
-                    conn.execute(
-                        """
-                        INSERT INTO paper_positions
-                        (id, ticker, side, net_contracts, avg_entry_price_cents,
-                         realized_pnl_cents, first_open_ts_ms, last_update_ts_ms)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            pos_id,
-                            ticker,
-                            side,
-                            net_contracts,
-                            avg_entry_price_cents,
-                            realized_pnl_cents,
-                            first_open_ts_ms,
-                            now_ms,
-                        ),
-                    )
-
-                conn.commit()
-        except sqlite3.Error as e:
-            logger.exception(
-                "paper_store_upsert_position_error",
-                extra={"ticker": ticker, "side": side, "error": str(e)},
+        """Import legacy inventory. The realized balance is seeded on first insertion only."""
+        side = side.strip().upper()
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                "SELECT opening_intent_id FROM paper_positions WHERE ticker = ? AND side = ?",
+                (ticker, side),
+            ).fetchone()
+            if current is not None and current[0] is not None:
+                raise ValueError("Fill-backed positions must be updated through the ledger")
+            if (
+                net_contracts > 0
+                and conn.execute(
+                    "SELECT 1 FROM paper_market_settlements WHERE ticker = ?", (ticker,)
+                ).fetchone()
+            ):
+                raise ValueError("Settled markets cannot acquire inventory")
+            conn.execute(
+                """
+                INSERT INTO paper_positions
+                    (id, ticker, side, net_contracts, avg_entry_price_cents,
+                     realized_pnl_cents, first_open_ts_ms, last_update_ts_ms)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(ticker, side) DO UPDATE SET
+                    avg_entry_price_cents = excluded.avg_entry_price_cents,
+                    first_open_ts_ms = CASE WHEN net_contracts = 0 AND excluded.net_contracts > 0
+                        THEN excluded.first_open_ts_ms ELSE first_open_ts_ms END,
+                    open_entry_fees_cents = CASE WHEN excluded.net_contracts = 0 THEN 0
+                        WHEN net_contracts = 0 THEN NULL ELSE open_entry_fees_cents END,
+                    net_contracts = excluded.net_contracts,
+                    last_update_ts_ms = excluded.last_update_ts_ms
+                """,
+                (
+                    str(uuid.uuid4()),
+                    ticker,
+                    side,
+                    net_contracts,
+                    avg_entry_price_cents,
+                    realized_pnl_cents,
+                    first_open_ts_ms,
+                    int(time.time() * 1000),
+                ),
             )
 
     def get_positions(self) -> list[dict[str, Any]]:
@@ -1336,7 +1568,7 @@ class PaperStore:
                     SELECT p.ticker, p.side, p.net_contracts, p.avg_entry_price_cents,
                            COALESCE(p.realized_pnl_cents, 0), p.first_open_ts_ms,
                            p.last_update_ts_ms, p.open_entry_fees_cents,
-                           i.take_profit_cents, i.max_hold_seconds
+                           i.take_profit_cents, i.max_hold_seconds, p.clean_lifecycle
                     FROM paper_positions p
                     LEFT JOIN quote_intents i ON i.id = p.opening_intent_id
                     WHERE p.net_contracts > 0
@@ -1356,6 +1588,7 @@ class PaperStore:
                             "open_entry_fees_cents": row[7],
                             "take_profit_cents": row[8],
                             "max_hold_seconds": row[9],
+                            "clean_lifecycle": bool(row[10]),
                         }
                     )
                 return positions
@@ -1405,7 +1638,7 @@ class PaperStore:
                 extra={"error": str(e)},
             )
 
-    def get_latest_pnl_snapshot(self) -> dict[str, Any] | None:
+    def get_latest_pnl_snapshot(self, *, clean_only: bool = False) -> dict[str, Any] | None:
         """Get the most recent PnL snapshot."""
         try:
             with sqlite3.connect(self.db_path) as conn:
@@ -1415,9 +1648,11 @@ class PaperStore:
                     SELECT ts_ms, realized_pnl_cents, unrealized_pnl_cents, total_pnl_cents,
                            open_positions_count, open_orders_count, valuation_details
                     FROM pnl_snapshots
+                    WHERE (? = 0 OR json_extract(valuation_details, '$.experiment_id') = ?)
                     ORDER BY ts_ms DESC
                     LIMIT 1
-                    """
+                    """,
+                    (clean_only, CLEAN_EXPERIMENT_ID),
                 )
                 row = cursor.fetchone()
                 if row:
@@ -1456,7 +1691,7 @@ class PaperStore:
                     SELECT id, ticker, side, quote_price_cents, size_contracts,
                               universe,
                            created_ts_ms, status, last_seen_best_bid,
-                           queue_ahead_contracts, last_update_ts_ms
+                           queue_ahead_contracts, last_update_ts_ms, fee_profile
                     FROM quote_intents
                     WHERE status = ?
                     ORDER BY last_update_ts_ms DESC
@@ -1479,6 +1714,7 @@ class PaperStore:
                             "last_seen_best_bid": row[8],
                             "queue_ahead_contracts": row[9],
                             "last_update_ts_ms": row[10],
+                            "fee_profile": json.loads(row[11]) if row[11] else None,
                         }
                     )
                 return intents
@@ -1503,7 +1739,7 @@ class PaperStore:
                            net_edge, inside_width, imbalance_gap,
                            fee_mode, round_trip, entry_fee_cents,
                               take_profit_cents, max_hold_seconds,
-                              best_bid_at_submit_cents, cross_at_submit_cents
+                              best_bid_at_submit_cents, cross_at_submit_cents, fee_profile
                     FROM quote_intents
                     WHERE id = ?
                     LIMIT 1
@@ -1539,6 +1775,7 @@ class PaperStore:
                     "max_hold_seconds": row[18],
                     "best_bid_at_submit_cents": row[19],
                     "cross_at_submit_cents": row[20],
+                    "fee_profile": json.loads(row[21]) if row[21] else None,
                 }
         except sqlite3.Error as e:
             logger.exception(
@@ -1754,7 +1991,7 @@ class PaperStore:
         return conn.execute(
             """
             SELECT ticker, side, net_contracts, avg_entry_price_cents, realized_pnl_cents,
-                   first_open_ts_ms, open_entry_fees_cents
+                   first_open_ts_ms, open_entry_fees_cents, clean_lifecycle
             FROM paper_positions
             """
         ).fetchall()
@@ -1770,7 +2007,7 @@ class PaperStore:
         marked = unmarked = unmarked_contracts = 0
         marked_pnl = downside = unmarked_cost = 0.0
         oldest_mark_ts_ms: int | None = None
-        for ticker, side, size, entry, _, first_open, entry_fees in positions:
+        for ticker, side, size, entry, _, first_open, entry_fees, _ in positions:
             if size <= 0:
                 continue
             if entry_fees is None:
@@ -1885,6 +2122,8 @@ class PaperStore:
     ) -> dict[str, Any]:
         """Compute metrics with fresh, whole-position liquidation marks.
 
+        Unprefixed P&L keys are the all-inventory compatibility view. Research
+        consumers use the clean_* keys and the persisted experiment cutover.
         The compatibility mapping accepts caller-supplied executable prices for the
         entire position. Runtime callers supply size- and time-qualified quotes.
         """
@@ -1899,9 +2138,34 @@ class PaperStore:
                 valuation = self._value_positions(
                     conn, positions, liquidation_marks, now_ms, mark_price_dict
                 )
-                audited_realized = cursor.execute(
-                    "SELECT COALESCE(SUM(realized_pnl_delta_cents), 0) FROM paper_fills"
+                audited_realized, bid_sweep_realized, settlement_realized = cursor.execute(
+                    """
+                    SELECT COALESCE(SUM(realized_pnl_delta_cents), 0),
+                           COALESCE(SUM(CASE WHEN execution_source = 'simulated_displayed_bid_sweep'
+                               THEN realized_pnl_delta_cents END), 0),
+                           COALESCE(SUM(CASE WHEN execution_source = 'kalshi_market_settlement'
+                               THEN realized_pnl_delta_cents END), 0)
+                    FROM paper_fills
+                    """
+                ).fetchone()
+                clean_realized = cursor.execute(
+                    """
+                    SELECT COALESCE(SUM(realized_pnl_delta_cents), 0)
+                    FROM paper_fills WHERE experiment_id = ?
+                    """,
+                    (CLEAN_EXPERIMENT_ID,),
                 ).fetchone()[0]
+                clean_valuation = self._value_positions(
+                    conn,
+                    [row for row in positions if row[7]],
+                    {
+                        key: mark
+                        for key, mark in (liquidation_marks or {}).items()
+                        if mark.fee_profile.series_aware
+                    },
+                    now_ms,
+                )
+                clean_unrealized = clean_valuation["unrealized_pnl_cents"]
 
                 # Count OPEN intents
                 cursor.execute("SELECT COUNT(*) FROM quote_intents WHERE status = 'OPEN'")
@@ -2260,8 +2524,28 @@ class PaperStore:
                 return {
                     **valuation,
                     "realized_pnl_cents": float(realized_pnl_cents),
-                    "bid_sweep_realized_pnl_cents": audited_realized,
+                    "bid_sweep_realized_pnl_cents": bid_sweep_realized,
+                    "settlement_realized_pnl_cents": settlement_realized,
                     "legacy_realized_balance_cents": realized_pnl_cents - audited_realized,
+                    "experiment_id": CLEAN_EXPERIMENT_ID,
+                    "experiment_cutover_ts_ms": self.cutover_ts_ms,
+                    "clean_realized_pnl_cents": clean_realized,
+                    "non_experiment_realized_pnl_cents": realized_pnl_cents - clean_realized,
+                    "clean_unrealized_pnl_cents": clean_unrealized,
+                    "clean_total_pnl_cents": (
+                        clean_realized + clean_unrealized if clean_unrealized is not None else None
+                    ),
+                    "clean_unrealized_status": clean_valuation["unrealized_pnl_status"],
+                    "clean_marked_unrealized_pnl_cents": clean_valuation[
+                        "marked_unrealized_pnl_cents"
+                    ],
+                    "clean_marked_positions_count": clean_valuation[
+                        "unrealized_marked_positions_count"
+                    ],
+                    "clean_unmarked_positions_count": clean_valuation[
+                        "unrealized_unmarked_positions_count"
+                    ],
+                    "clean_open_positions_count": clean_valuation["open_positions_count"],
                     "total_pnl_cents": (
                         realized_pnl_cents + unrealized if unrealized is not None else None
                     ),
@@ -2470,9 +2754,13 @@ class PaperStore:
                                         COALESCE(f.universe, i.universe),
                                     f.execution_source, f.bid_levels, f.realized_pnl_delta_cents,
                                     f.observed_5s_ts_ms, f.observed_15s_ts_ms,
-                                    f.observed_30s_ts_ms, f.observed_60s_ts_ms
+                                    f.observed_30s_ts_ms, f.observed_60s_ts_ms,
+                                    f.fee_profile, f.experiment_id, s.settlement_ts_ms,
+                                    f.outcome_fee_audit, s.result
                     FROM paper_fills f
                     JOIN quote_intents i ON f.intent_id = i.id
+                    LEFT JOIN paper_market_settlements s
+                        ON s.ticker = i.ticker AND f.execution_source = 'kalshi_market_settlement'
                     ORDER BY f.fill_ts_ms DESC
                     LIMIT ?
                     """,
@@ -2507,6 +2795,11 @@ class PaperStore:
                             "execution_source": row[22] or "legacy_unverified",
                             "bid_levels": json.loads(row[23]) if row[23] else None,
                             "realized_pnl_delta_cents": row[24],
+                            "fee_profile": json.loads(row[29]) if row[29] else None,
+                            "experiment_id": row[30],
+                            "settlement_ts_ms": row[31],
+                            "outcome_fee_audit": json.loads(row[32]) if row[32] else None,
+                            "settlement_result": row[33],
                             **{
                                 f"observed_{horizon}s_ts_ms": observed
                                 for horizon, observed in zip(
@@ -2595,7 +2888,7 @@ class PaperStore:
                     SELECT f.id, f.intent_id, f.fill_ts_ms, f.fill_price_cents,
                            f.fill_size, f.fill_fee_cents, f.note,
                            i.ticker, i.side, i.net_edge, i.quote_price_cents
-                              , COALESCE(f.universe, i.universe)
+                              , COALESCE(f.universe, i.universe), f.experiment_id
                     FROM paper_fills f
                     JOIN quote_intents i ON i.id = f.intent_id
                     WHERE f.fill_ts_ms BETWEEN ? AND ?
@@ -2623,6 +2916,7 @@ class PaperStore:
                         "net_edge": row[9],
                         "quote_price_cents": row[10],
                         "universe": row[11],
+                        "experiment_id": row[12],
                     }
                     for row in rows
                 ]
@@ -2663,11 +2957,22 @@ class PaperStore:
         mark_after_fill_cents: float,
         pnl_after_fill_cents: float,
         observed_ts_ms: int | None = None,
+        liquidation: LiquidationQuote | None = None,
     ) -> bool:
         """Persist follow-up mark and short-horizon PnL for a fill/horizon."""
         mark_col = self._mark_column_for_horizon(horizon_seconds)
         pnl_col = self._pnl_column_for_horizon(horizon_seconds)
         observed_col = self._observation_column_for_horizon(horizon_seconds)
+        fee_audit = (
+            json.dumps(
+                {
+                    "profile": liquidation.fee_profile.audit(),
+                    "exit_fee_cents": liquidation.exit_fee_cents,
+                }
+            )
+            if liquidation is not None
+            else None
+        )
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
@@ -2676,7 +2981,9 @@ class PaperStore:
                     UPDATE paper_fills
                     SET {mark_col} = ?,
                         {pnl_col} = ?,
-                        {observed_col} = ?
+                        {observed_col} = ?,
+                        outcome_fee_audit = CASE WHEN ? IS NULL THEN outcome_fee_audit
+                            ELSE json_set(COALESCE(outcome_fee_audit, '{{}}'), ?, json(?)) END
                     WHERE id = ?
                       AND {mark_col} IS NULL
                       AND {pnl_col} IS NULL
@@ -2689,6 +2996,9 @@ class PaperStore:
                         mark_after_fill_cents,
                         pnl_after_fill_cents,
                         observed_ts_ms,
+                        fee_audit,
+                        f'$."{horizon_seconds}s"',
+                        fee_audit,
                         fill_id,
                         observed_ts_ms,
                         observed_ts_ms,

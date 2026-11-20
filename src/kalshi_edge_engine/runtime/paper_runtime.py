@@ -6,7 +6,6 @@ import time
 from typing import Any
 
 from kalshi_edge_engine.db.paper_store import PaperStore
-from kalshi_edge_engine.engine.fees import estimate_maker_fee_cents, estimate_taker_fee_cents
 from kalshi_edge_engine.engine.orderbook import parse_orderbook
 from kalshi_edge_engine.engine.paper import QuoteIntent, build_quote_intents
 from kalshi_edge_engine.engine.paper_sim import Fill, OrderRequest, RealisticOrderSimulator
@@ -67,10 +66,8 @@ def _init_paper_store() -> None:
     if runtime_config.ENABLE_PAPER_TRADING and runtime_state.paper_store is None:
         try:
             store = PaperStore()
-            recovered = store.recover_interrupted_intents()
             runtime_state.paper_store = store
             runtime_state.paper_liquidation_marks = {}
-            logger.info("paper_intents_recovered", extra={"count": recovered})
             logger.info("paper_store_initialized")
         except Exception as e:
             logger.exception("paper_store_init_error", extra={"error": str(e)})
@@ -122,6 +119,12 @@ async def _process_paper_intents(
         not runtime_config.ENABLE_PAPER_TRADING
         or runtime_state.paper_store is None
         or not runtime_state.paper_enabled
+    ):
+        return
+
+    fee_profile = signal.fee_profile
+    if fee_profile is None or (
+        runtime_state.market_fees is not None and not fee_profile.series_aware
     ):
         return
 
@@ -417,10 +420,9 @@ async def _process_paper_intents(
             continue
 
         try:
-            fee_func = (
-                estimate_maker_fee_cents if intent.fee_mode == "maker" else estimate_taker_fee_cents
+            entry_fee_cents = fee_profile.fee_cents(
+                intent.quote_price_cents, intent.size_contracts, liquidity=intent.fee_mode
             )
-            entry_fee_cents = fee_func(intent.quote_price_cents, intent.size_contracts)
 
             best_bid_at_submit_cents: float | None = None
             cross_at_submit_cents: float | None = None
@@ -447,7 +449,7 @@ async def _process_paper_intents(
             if _get_rate_limit_or_cooldown_reason(intent.ticker, now_ms) is not None:
                 continue
 
-            runtime_state.paper_store.insert_intent(
+            inserted = runtime_state.paper_store.insert_intent(
                 intent,
                 universe=intent.universe,
                 entry_fee_cents=entry_fee_cents,
@@ -455,7 +457,10 @@ async def _process_paper_intents(
                 max_hold_seconds=effective_config.max_hold_seconds,
                 best_bid_at_submit_cents=best_bid_at_submit_cents,
                 cross_at_submit_cents=cross_at_submit_cents,
+                fee_profile=fee_profile,
             )
+            if not inserted:
+                continue
             runtime_state.paper_intent_timestamps.append(now_ms)
             runtime_state.paper_ticker_cooldown[intent.ticker] = now_ms + (
                 effective_config.ticker_cooldown_seconds * 1000
@@ -507,11 +512,6 @@ async def _process_paper_intents(
 
                 total_filled = 0
                 processed_fill_ids: set[str] = set()
-                fee_for_fill = (
-                    estimate_maker_fee_cents
-                    if intent_param.fee_mode == "maker"
-                    else estimate_taker_fee_cents
-                )
 
                 def persist_fill(fill: Fill) -> bool:
                     nonlocal total_filled
@@ -537,12 +537,15 @@ async def _process_paper_intents(
                         fill_size=fill.fill_size,
                         remaining_size=fill.remaining_size,
                         queue_ahead_at_fill=fill.queue_ahead_at_fill,
-                        fill_fee_cents=fee_for_fill(fill.fill_price_cents, fill.fill_size),
+                        fill_fee_cents=fee_profile.fee_cents(
+                            fill.fill_price_cents, fill.fill_size, liquidity=intent_param.fee_mode
+                        ),
                         best_bid_at_fill_cents=fill.best_bid_at_fill_cents,
                         cross_at_fill_cents=fill.cross_at_fill_cents,
                         note=f"entry_{fill.fill_path_type or 'unknown'}",
                         execution_source=fill.execution_source,
                         apply_to_position=True,
+                        fee_profile=fee_profile,
                     )
                     if result.inserted_new_fill:
                         total_filled += fill.fill_size
