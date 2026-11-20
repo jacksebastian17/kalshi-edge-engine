@@ -9,6 +9,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from kalshi_edge_engine.engine.orderbook import displayed_quote_size
 from kalshi_edge_engine.engine.position_exit import compute_price_delta_cents_per_contract
 from kalshi_edge_engine.kalshi.client import KalshiClient
 
@@ -234,6 +235,7 @@ class OrderRequest:
     take_profit_cents: float | None = None
     entry_fee_per_contract_cents: float | None = None
     may_poll: Callable[[], bool] | None = None
+    on_unprocessed_poll: Callable[[str], None] | None = None
 
     def __post_init__(self) -> None:
         """Normalize take-profit semantics to per-contract cents."""
@@ -371,13 +373,17 @@ class RealisticOrderSimulator:
         fill_sequence = 0
 
         while elapsed_ms < horizon_ms and remaining_size > 0:
+            awaiting_decision = False
             try:
                 if order.may_poll is not None and not order.may_poll():
                     exit_reason = "entry_canceled"
                     break
                 # Fetch current orderbook
+                awaiting_decision = True
                 orderbook = await client.get_orderbook(order.ticker)
                 if order.may_poll is not None and not order.may_poll():
+                    if order.on_unprocessed_poll:
+                        order.on_unprocessed_poll("entry_inactive_after_read")
                     exit_reason = "entry_canceled"
                     break
 
@@ -523,6 +529,27 @@ class RealisticOrderSimulator:
 
                 accepted = None
                 if on_poll is not None:
+                    if price_improves:
+                        poll_class = "price_improving"
+                    elif at_displayed_quote:
+                        poll_class = "at_displayed_quote"
+                    elif eligibility["price_moved_through"]:
+                        poll_class = "moved_through"
+                    else:
+                        poll_class = "ineligible"
+                    diagnostics["poll_class"] = poll_class
+                    diagnostics["displayed_quote_size"] = displayed_quote_size(
+                        orderbook, order.side, order.quote_price_cents
+                    )
+                    if fill is None:
+                        if at_displayed_quote and traded_volume <= queue_ahead_before_decrement:
+                            reason = "insufficient_volume_beyond_queue"
+                        elif poll_class == "ineligible":
+                            reason = "missing_bid" if best_bid is None else "price_ineligible"
+                        else:
+                            reason = "probability_draw_missed"
+                        diagnostics["no_candidate_reason"] = reason
+                    awaiting_decision = False
                     accepted = on_poll(
                         {
                             "intent_id": order.id,
@@ -553,7 +580,13 @@ class RealisticOrderSimulator:
                     exit_reason = "filled"
                     break
 
+            except asyncio.CancelledError:
+                if awaiting_decision and order.on_unprocessed_poll:
+                    order.on_unprocessed_poll("poll_interrupted")
+                raise
             except Exception as e:
+                if awaiting_decision and order.on_unprocessed_poll:
+                    order.on_unprocessed_poll(f"poll_error:{type(e).__name__}")
                 last_best_size_at_bid = None
                 queue_initialized = False
                 queue_ahead = 0

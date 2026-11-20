@@ -294,6 +294,11 @@ The goal is to reduce that bridge later, but only after tests are migrated to pa
 - `GET /paper/pnl-snapshot`
 - `GET /paper/summary`
 - `GET /paper/metrics`
+- `GET /paper/diagnostics/fill-funnel`
+- `GET /paper/diagnostics/intents/{intent_id}`
+- `GET /market-data/recorder/status`
+
+For the historical evidence fields, passive recorder settings, replay ordering and Windows deployment procedure, see the [Phase B1 operator guide](docs/phase-b1.md).
 
 ### Outcome / research endpoints
 

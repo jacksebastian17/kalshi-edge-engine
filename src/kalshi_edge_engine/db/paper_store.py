@@ -14,6 +14,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from kalshi_edge_engine.db.fill_funnel import FillFunnel, create_poll_table
 from kalshi_edge_engine.engine.fees import LEGACY_FEE_PROFILE, FeeProfile, estimate_taker_fee_cents
 from kalshi_edge_engine.engine.orderbook import LiquidationQuote
 from kalshi_edge_engine.engine.paper import PaperFill, PaperOutcome, QuoteIntent
@@ -84,6 +85,7 @@ class PaperStore:
             db_path: Path to SQLite database file.
         """
         self.db_path = db_path
+        self.fill_funnel = FillFunnel(db_path)
         self._clock_ms = clock_ms if clock_ms is not None else lambda: int(time.time() * 1000)
         self._init_schema()
 
@@ -295,6 +297,7 @@ class PaperStore:
                 # Migrate existing tables by adding new columns if they don't exist
                 # Safe to call multiple times: we PRAGMA-check columns before ALTER TABLE ADD COLUMN
                 self._migrate_schema(cursor)
+                create_poll_table(cursor)
                 if inserted_experiment:
                     cursor.execute("UPDATE paper_positions SET clean_lifecycle = 0")
 
@@ -314,6 +317,16 @@ class PaperStore:
         Safe to call multiple times - checks columns via PRAGMA before running ALTER TABLE.
         """
         migrations = [
+            (
+                "quote_intents",
+                "submission_evidence",
+                "ALTER TABLE quote_intents ADD COLUMN submission_evidence TEXT",
+            ),
+            (
+                "quote_intents",
+                "terminal_detail",
+                "ALTER TABLE quote_intents ADD COLUMN terminal_detail TEXT",
+            ),
             (
                 "quote_intents",
                 "market_at_submit",
@@ -656,6 +669,7 @@ class PaperStore:
         cross_at_submit_cents: float | None = None,
         fee_profile: FeeProfile = LEGACY_FEE_PROFILE,
         market_observation: MarketObservation | None = None,
+        submission_evidence: dict[str, Any] | None = None,
     ) -> bool:
         """Insert a quote intent with optional runtime parameters.
 
@@ -699,8 +713,8 @@ class PaperStore:
                      status, net_edge, inside_width, imbalance_gap, fee_mode, round_trip,
                      entry_fee_cents, take_profit_cents, max_hold_seconds,
                      best_bid_at_submit_cents, cross_at_submit_cents, fee_profile,
-                     market_at_submit, market_close_ts_ms)
-                    SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                     market_at_submit, market_close_ts_ms, submission_evidence)
+                    SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                     WHERE NOT EXISTS (SELECT 1 FROM paper_market_settlements WHERE ticker = ?)
                     """,
                     (
@@ -727,6 +741,7 @@ class PaperStore:
                         if market_observation is not None
                         else None,
                         market_observation.close_ts_ms if market_observation is not None else None,
+                        json.dumps(submission_evidence or {"schema_version": 1}),
                         intent.ticker,
                     ),
                 )
@@ -973,6 +988,7 @@ class PaperStore:
         queue_ahead: int | None = None,
         *,
         only_if_open: bool = False,
+        terminal_detail: str | None = None,
     ) -> None:
         """Update intent status and tracking fields.
 
@@ -989,7 +1005,7 @@ class PaperStore:
                     """
                     UPDATE quote_intents
                     SET status = ?, last_seen_best_bid = ?, queue_ahead_contracts = ?,
-                        last_update_ts_ms = ?
+                        last_update_ts_ms = ?, terminal_detail = COALESCE(?, terminal_detail)
                     WHERE id = ? AND (? = 0 OR status = 'OPEN')
                       AND (market_at_submit IS NULL OR status = 'OPEN' OR status = ?)
                     """,
@@ -998,6 +1014,7 @@ class PaperStore:
                         last_seen_best_bid,
                         queue_ahead,
                         now_ms,
+                        terminal_detail,
                         intent_id,
                         only_if_open,
                         status,
@@ -1668,7 +1685,7 @@ class PaperStore:
                 )
             conn.execute(
                 """
-                UPDATE quote_intents SET status = 'CANCELED', last_update_ts_ms = ?
+                UPDATE quote_intents SET status = 'CANCELED', last_update_ts_ms = ?, terminal_detail = 'settlement'
                 WHERE ticker = ? AND status IN ('OPEN', 'NEW')
                 """,
                 (now_ms, ticker),
@@ -1787,10 +1804,10 @@ class PaperStore:
         )
         conn.execute(
             """
-            UPDATE quote_intents SET status = 'CANCELED', last_update_ts_ms = ?
+            UPDATE quote_intents SET status = 'CANCELED', last_update_ts_ms = ?, terminal_detail = ?
             WHERE ticker = ? AND side = ? AND status IN ('OPEN', 'NEW')
             """,
-            (now_ms, ticker, side),
+            (now_ms, f"position_exit:{reason}", ticker, side),
         )
 
     def recover_interrupted_intents(self) -> int:
@@ -2454,7 +2471,7 @@ class PaperStore:
             if max_loss_cents > 0 and breach is not None:
                 conn.execute(
                     """
-                    UPDATE quote_intents SET status = 'CANCELED', last_update_ts_ms = ?
+                    UPDATE quote_intents SET status = 'CANCELED', last_update_ts_ms = ?, terminal_detail = 'daily_loss_limit'
                     WHERE status = 'OPEN' AND id NOT LIKE 'exit_intent:%'
                     """,
                     (now_ms,),

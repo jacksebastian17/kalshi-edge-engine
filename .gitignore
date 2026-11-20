@@ -20,6 +20,8 @@ kalshi-key.pem
 
 # Local runtime data
 paper_trading.db
+market_data_recorder.db
+market_data_recorder.db-journal
 *.paper-worker.lock
 
 # Frontend local/build artifacts

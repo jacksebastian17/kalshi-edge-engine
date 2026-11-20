@@ -194,6 +194,25 @@ def _parse_price_cents(price_value: Any, *, prices_are_dollars: bool) -> float |
     return None
 
 
+def displayed_quote_size(book: dict[str, Any], side: str, quote: float) -> float | None:
+    """Reported size at the real bid level, including levels below the best bid."""
+    yes, no, dollars = _extract_prices_from(book)
+    levels = yes if side == "YES" else no
+    for level in levels if isinstance(levels, list) else []:
+        if (
+            isinstance(level, (list, tuple))
+            and len(level) >= 2
+            and _parse_price_cents(level[0], prices_are_dollars=dollars) == quote
+        ):
+            try:
+                count = Decimal(str(level[1]))
+            except InvalidOperation:
+                continue
+            if count.is_finite() and count >= 0:
+                return float(count)
+    return None
+
+
 def _extract_best_bid(prices: list[Any], *, prices_are_dollars: bool = False) -> BestLevel | None:
     """Extract best bid (highest price) from ladder.
 

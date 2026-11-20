@@ -353,3 +353,12 @@ async def test_cancel_running_simulation_preserves_checkpointed_fill(tmp_path, m
     assert store.get_intents_by_status("OPEN") == []
     assert len(store.get_intents_by_status("CANCELED")) == 1
     assert store.get_positions()[0]["net_contracts"] == 1
+    summary = store.fill_funnel.aggregate()
+    assert summary["terminal_reasons"] == {"task_canceled": 1}
+    assert summary["intents_by_status"] == {"CANCELED": 1}
+    assert summary["simulated_candidates"] == summary["policy_accepted_candidates"] == 1
+    assert (
+        summary["persisted_candidate_fills"]
+        == summary["ledger_entry_fills_for_instrumented_intents"]
+        == 1
+    )

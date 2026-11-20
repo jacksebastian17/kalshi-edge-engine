@@ -3,11 +3,13 @@
 import asyncio
 import logging
 import time
-from dataclasses import replace
+from dataclasses import asdict, replace
+from functools import partial
 from typing import Any
 
+from kalshi_edge_engine.db.market_recorder import capture_origin
 from kalshi_edge_engine.db.paper_store import PaperStore
-from kalshi_edge_engine.engine.orderbook import parse_orderbook
+from kalshi_edge_engine.engine.orderbook import displayed_quote_size, parse_orderbook
 from kalshi_edge_engine.engine.paper import QuoteIntent, build_quote_intents
 from kalshi_edge_engine.engine.paper_sim import Fill, OrderRequest, RealisticOrderSimulator
 from kalshi_edge_engine.engine.signal import SIGNAL_VALID, Signal
@@ -428,21 +430,35 @@ async def _process_paper_intents(
 
             best_bid_at_submit_cents: float | None = None
             cross_at_submit_cents: float | None = None
+            submission: dict[str, Any] = {
+                "schema_version": 1,
+                "signal_ts_ms": signal.timestamp_ms,
+                "signal_top_liquidity": signal.top_liquidity,
+                "signal_exit_fee_cents": signal.fee_exit_yes
+                if intent.side == "YES"
+                else signal.fee_exit_no,
+                "execution_config": asdict(effective_config),
+            }
             try:
-                with read_priority("entry"):
+                with (
+                    read_priority("entry"),
+                    capture_origin("entry_submission", universe_key, intent.id),
+                ):
                     orderbook_snapshot = await client.get_orderbook(intent.ticker)
                 parsed_ob = parse_orderbook(orderbook_snapshot)
-                if intent.side == "YES":
-                    best_bid_at_submit_cents = (
-                        parsed_ob.bid_yes.price if parsed_ob.bid_yes else None
-                    )
-                    cross_at_submit_cents = (
-                        parsed_ob.cross_yes.price if parsed_ob.cross_yes else None
-                    )
-                else:
-                    best_bid_at_submit_cents = parsed_ob.bid_no.price if parsed_ob.bid_no else None
-                    cross_at_submit_cents = parsed_ob.cross_no.price if parsed_ob.cross_no else None
+                bid = parsed_ob.bid_yes if intent.side == "YES" else parsed_ob.bid_no
+                cross = parsed_ob.cross_yes if intent.side == "YES" else parsed_ob.cross_no
+                best_bid_at_submit_cents = bid.price if bid else None
+                cross_at_submit_cents = cross.price if cross else None
+                submission.update(
+                    book_observed_ts_ms=int(time.time() * 1000),
+                    best_bid_size=bid.size if bid else None,
+                    displayed_quote_size=displayed_quote_size(
+                        orderbook_snapshot, intent.side, intent.quote_price_cents
+                    ),
+                )
             except Exception as e:
+                submission["book_error"] = type(e).__name__
                 logger.warning(
                     "paper_intent_telemetry_snapshot_failed",
                     extra={"intent_id": intent.id, "error": str(e)},
@@ -450,7 +466,10 @@ async def _process_paper_intents(
 
             market_observation = None
             if resolver is not None:
-                with read_priority("entry"):
+                with (
+                    read_priority("entry"),
+                    capture_origin("entry_submission", universe_key, intent.id),
+                ):
                     market_observation = await resolver.observe_entry_market(intent.ticker)
                 if market_observation is None:
                     continue
@@ -470,6 +489,7 @@ async def _process_paper_intents(
                 cross_at_submit_cents=cross_at_submit_cents,
                 fee_profile=fee_profile,
                 market_observation=market_observation,
+                submission_evidence=submission,
             )
             if not inserted:
                 continue
@@ -500,6 +520,14 @@ async def _process_paper_intents(
                 def may_poll() -> bool:
                     return store.entry_can_poll(intent_param.id)
 
+                funnel = store.fill_funnel
+                record_decision = partial(funnel.decision, intent_param.id)
+
+                def unprocessed(reason: str) -> None:
+                    funnel.record_poll(
+                        intent_param.id, {"diagnostics": {"no_candidate_reason": reason}}
+                    )
+
                 order_request = OrderRequest(
                     id=intent_param.id,
                     ticker=intent_param.ticker,
@@ -517,6 +545,7 @@ async def _process_paper_intents(
                         else 0.0
                     ),
                     may_poll=may_poll if guarded else None,
+                    on_unprocessed_poll=unprocessed,
                 )
 
                 simulator = RealisticOrderSimulator(
@@ -530,7 +559,9 @@ async def _process_paper_intents(
                 total_filled = 0
                 processed_fill_ids: set[str] = set()
 
-                def persist_fill(fill: Fill, observation: MarketObservation | None = None) -> bool:
+                def persist_fill(
+                    fill: Fill, poll_id: int | None, observation: MarketObservation | None = None
+                ) -> bool:
                     nonlocal total_filled
                     if fill.id in processed_fill_ids:
                         return False
@@ -541,6 +572,7 @@ async def _process_paper_intents(
                         config=effective_config_param,
                     )
                     if not allowed:
+                        record_decision(poll_id, rejection=reason, observation=observation)
                         logger.info(
                             "paper_fill_rejected_by_path_policy",
                             extra={"fill_id": fill.id, "reason": reason},
@@ -568,7 +600,11 @@ async def _process_paper_intents(
                     )
                     if result.inserted_new_fill:
                         total_filled += fill.fill_size
+                        # The committed ledger row proves policy acceptance even across a crash.
                         return True
+                    record_decision(
+                        poll_id, accepted=True, rejection=result.status, observation=observation
+                    )
                     logger.info(
                         "paper_fill_insert_skipped",
                         extra={"fill_id": fill.id, "insert_status": result.status},
@@ -577,27 +613,63 @@ async def _process_paper_intents(
 
                 async def guarded_poll(runtime_update: dict[str, Any]) -> bool:
                     assert resolver is not None
-                    observation = await resolver.observe_entry_market(intent_param.ticker)
+                    poll_id = funnel.record_poll(intent_param.id, runtime_update)
+                    try:
+                        observation = await resolver.observe_entry_market(intent_param.ticker)
+                        return validate_poll(runtime_update, poll_id, observation)
+                    except asyncio.CancelledError:
+                        record_decision(poll_id, rejection="validation_interrupted")
+                        raise
+                    except Exception as exc:
+                        record_decision(poll_id, rejection=f"validation_error:{type(exc).__name__}")
+                        raise
+
+                def validate_poll(
+                    runtime_update: dict[str, Any],
+                    poll_id: int | None,
+                    observation: MarketObservation | None,
+                ) -> bool:
                     if observation is None:
                         store.cancel_market_entry(intent_param.id, "market_status_unavailable")
+                        record_decision(poll_id, rejection="market_status_unavailable")
                         return False
                     if not store.record_market_observation(observation):
+                        record_decision(
+                            poll_id,
+                            rejection="market_observation_rejected",
+                            observation=observation,
+                        )
                         return False
                     if not may_poll():
+                        record_decision(
+                            poll_id,
+                            rejection="entry_inactive_at_validation",
+                            observation=observation,
+                        )
                         return False
                     if not observation.tradable_at(int(time.time() * 1000)):
                         store.cancel_market_entry(
                             intent_param.id, "market_status_stale_or_incomplete"
+                        )
+                        record_decision(
+                            poll_id,
+                            rejection="market_status_stale_or_incomplete",
+                            observation=observation,
                         )
                         return False
                     if int(time.time() * 1000) >= (
                         intent_param.created_ts_ms
                         + effective_config_param.fill_horizon_seconds * 1000
                     ):
+                        record_decision(
+                            poll_id,
+                            rejection="horizon_elapsed_at_validation",
+                            observation=observation,
+                        )
                         return False
                     fill = runtime_update.get("fill")
                     if isinstance(fill, Fill):
-                        return persist_fill(fill, observation)
+                        return persist_fill(fill, poll_id, observation)
                     update_poll(runtime_update)
                     return False
 
@@ -611,9 +683,10 @@ async def _process_paper_intents(
                     )
 
                 def unguarded_poll(runtime_update: dict[str, Any]) -> bool | None:
+                    poll_id = funnel.record_poll(intent_param.id, runtime_update)
                     fill = runtime_update.get("fill")
                     if isinstance(fill, Fill):
-                        return persist_fill(fill)
+                        return persist_fill(fill, poll_id)
                     update_poll(runtime_update)
                     return None
 
@@ -625,7 +698,8 @@ async def _process_paper_intents(
                 )
                 if not guarded:
                     for fill in fills:
-                        persist_fill(fill)
+                        if fill.id not in processed_fill_ids:
+                            unguarded_poll({"fill": fill, "last_update_ts_ms": fill.fill_ts_ms})
 
                 entry_order_exit_reason = order_state.get("exit_reason", "timeout")
                 store.update_intent_status(
@@ -634,6 +708,7 @@ async def _process_paper_intents(
                     last_seen_best_bid=order_state.get("last_seen_best_bid"),
                     queue_ahead=order_state.get("queue_ahead_contracts"),
                     only_if_open=True,
+                    terminal_detail=entry_order_exit_reason,
                 )
 
                 logger.info(
@@ -654,10 +729,13 @@ async def _process_paper_intents(
                 )
                 if runtime_state.paper_store is not None:
                     runtime_state.paper_store.update_intent_status(
-                        intent_param.id, PAPER_INTENT_STATUS_ERROR, only_if_open=True
+                        intent_param.id,
+                        PAPER_INTENT_STATUS_ERROR,
+                        only_if_open=True,
+                        terminal_detail=f"simulation_error:{type(e).__name__}",
                     )
 
-        with read_priority("entry"):
+        with read_priority("entry"), capture_origin("entry_simulator", universe_key, intent.id):
             task = asyncio.create_task(
                 _simulate_task(intent, entry_fee_cents, effective_config, resolver is not None)
             )
@@ -668,8 +746,12 @@ async def _process_paper_intents(
             intent_id: str = intent.id,
             store: PaperStore | None = runtime_state.paper_store,
         ) -> None:
+            if store is not None:
+                store.fill_funnel.flush_gaps()
             if t.cancelled() and store is not None:
-                store.update_intent_status(intent_id, "CANCELED", only_if_open=True)
+                store.update_intent_status(
+                    intent_id, "CANCELED", only_if_open=True, terminal_detail="task_canceled"
+                )
             runtime_state.paper_simulation_tasks.discard(t)
 
         task.add_done_callback(_cleanup)

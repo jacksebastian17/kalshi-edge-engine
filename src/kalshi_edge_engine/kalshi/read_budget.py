@@ -49,6 +49,10 @@ class ReadBudgetTimeout(RuntimeError):
     """The read could not fit within its local queue deadline."""
 
 
+def current_read_lane() -> ReadLane:
+    return _lane.get()
+
+
 @dataclass(eq=False)
 class _Read:
     lane: ReadLane

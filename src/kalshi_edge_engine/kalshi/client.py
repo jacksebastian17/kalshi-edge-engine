@@ -12,7 +12,8 @@ import httpx
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
-from kalshi_edge_engine.kalshi.read_budget import ReadBudget, ReadBudgetTimeout
+from kalshi_edge_engine.db.market_recorder import MarketRecorder
+from kalshi_edge_engine.kalshi.read_budget import ReadBudget, ReadBudgetTimeout, current_read_lane
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,7 @@ class KalshiClient:
     private_key: rsa.RSAPrivateKey
     base_url: str
     _client: httpx.AsyncClient | None
+    recorder: MarketRecorder | None = None
 
     def __init__(
         self,
@@ -213,11 +215,21 @@ class KalshiClient:
                     response = await client.request(
                         method, url, headers=headers, params=params, timeout=10.0
                     )
+                received_ns = time.time_ns() if self.recorder else 0
                 self.read_budget.observe(path, cost, response.status_code, response.headers)
                 if response.status_code == 429 and attempt == 0:
                     continue
                 response.raise_for_status()
                 data: dict[str, Any] = response.json()
+                if self.recorder is not None:
+                    self.recorder.capture(
+                        path,
+                        current_read_lane(),
+                        received_ns,
+                        data,
+                        response.content,
+                        self.base_url,
+                    )
                 return data
         except ReadBudgetTimeout as exc:
             raise KalshiReadBudgetError(str(exc)) from exc

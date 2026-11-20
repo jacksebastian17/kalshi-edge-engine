@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from kalshi_edge_engine.db.paper_store import CLEAN_EXPERIMENT_ID, PaperStore
+from kalshi_edge_engine.db.paper_store import CLEAN_EXPERIMENT_ID, FillInsertResult, PaperStore
 from kalshi_edge_engine.engine.fees import series_fee_profile
 from kalshi_edge_engine.engine.orderbook import quote_liquidation
 from kalshi_edge_engine.engine.paper import QuoteIntent
@@ -187,21 +187,33 @@ def test_authoritative_early_close_invalidates_already_booked_clean_lifecycle(tm
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", ["inactive", "active"])
+@pytest.mark.parametrize(
+    "status", ["inactive", "active", "disabled_inside", "disabled_moved", "ledger_rejected"]
+)
 async def test_guarded_simulator_rechecks_market_before_candidate(
     tmp_path, profile, monkeypatch, status
 ):
     store = PaperStore(str(tmp_path / "paper.db"))
+    if status == "ledger_rejected":
+        monkeypatch.setattr(
+            store, "insert_fill_result", lambda **_kwargs: FillInsertResult("rejected_market_state")
+        )
     client = AsyncMock()
     book = {"yes": [[40, 500]], "no": [[45, 500]]}
     moved = {"yes": [[44, 500]], "no": [[45, 500]]}
-    client.get_orderbook.side_effect = [book, moved]
+    first_poll = book if status == "disabled_inside" else moved
+    client.get_orderbook.side_effect = [book, first_poll]
     resolver = AsyncMock()
 
     async def observe(*_args):
         now_ms = int(time.time() * 1000)
         first = resolver.observe_entry_market.await_count == 1
-        return _observation("active" if first else status, now_ms, now_ms, now_ms + 60_000)
+        return _observation(
+            "inactive" if not first and status == "inactive" else "active",
+            now_ms,
+            now_ms,
+            now_ms + 60_000,
+        )
 
     resolver.observe_entry_market.side_effect = observe
     tasks = set()
@@ -222,11 +234,13 @@ async def test_guarded_simulator_rechecks_market_before_candidate(
         min_capturable_edge_to_cross_cents=0,
         min_abs_distance_from_50_cents=0,
         min_reentry_delay_seconds_same_ticker_side=0,
-        allow_moved_through=True,
+        allow_moved_through=status != "disabled_moved",
+        allow_price_improves=False,
+        fill_probability_price_improves=1,
         min_edge_cents_moved_through=None,
         fill_probability_price_moved=1,
-        poll_interval_seconds=0.01,
-        fill_horizon_seconds=2,
+        poll_interval_seconds=0.01 if status in ("active", "inactive") else 1,
+        fill_horizon_seconds=2 if status in ("active", "inactive") else 1,
     )
     monkeypatch.setattr(config, "get_effective_paper_config", lambda _universe: effective)
     await paper_runtime._process_paper_intents(
@@ -236,11 +250,39 @@ async def test_guarded_simulator_rechecks_market_before_candidate(
     await asyncio.wait_for(asyncio.gather(*tasks), timeout=3)
     assert client.get_orderbook.await_count == 2
     assert resolver.observe_entry_market.await_count == 2
+    aggregate = store.fill_funnel.aggregate()
+    assert aggregate["instrumented_intents"] == aggregate["simulated_candidates"] == 1
+    assert aggregate["polls"] == sum(aggregate["intents_by_status"].values()) == 1
+    [terminal] = aggregate["terminal_reasons"]
+    [intent] = store.get_intents_by_status(next(iter(aggregate["intents_by_status"])))
+    history = store.fill_funnel.intent(intent["id"])
+    assert history["terminal_reason"] == terminal
+    assert history["submission_evidence"]["best_bid_size"] == 500
+    assert history["submission_evidence"]["execution_config"]["allow_price_improves"] is False
+    assert aggregate["persisted_candidate_fills"] == (status == "active")
+    assert aggregate["policy_accepted_candidates"] == (status in ("active", "ledger_rejected"))
+    if status == "ledger_rejected":
+        assert aggregate["polls_by_rejection_reason"] == {"rejected_market_state": 1}
+        assert history["polls"][0]["policy_accepted"]
+        assert history["persisted_fills"] == []
+        return
+    if status.startswith("disabled"):
+        path = "price_improves" if status == "disabled_inside" else "moved_through"
+        assert aggregate["polls_by_rejection_reason"] == {f"fill_path_{path}_disabled": 1}
+        assert history["polls"][0]["candidate"]["fill_path_type"] == path
+        assert terminal == "timeout"
+        assert history["quote_ever_observed"] is False
+        assert store.get_positions() == []
+        return
     if status == "inactive":
+        assert terminal == "inactive"
+        assert history["polls"][0]["evidence"]["market_at_validation"]["status"] == "inactive"
+        assert aggregate["polls_by_rejection_reason"] == {"entry_inactive_at_validation": 1}
         assert len(store.get_intents_by_status("CANCELED")) == 1
         assert store.count_fills_total() == 0
         assert store.get_positions() == []
     else:
+        assert terminal == "filled"
         [fill] = store.get_recent_fills()
         assert fill["entry_market_evidence"]["market"]["status"] == "active"
         assert fill["experiment_id"] == CLEAN_EXPERIMENT_ID

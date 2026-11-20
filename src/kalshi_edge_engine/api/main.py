@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from kalshi_edge_engine.db.market_recorder import MarketRecorder, capture_origin
 from kalshi_edge_engine.db.paper_store import PaperStore
 from kalshi_edge_engine.engine.fees import LEGACY_FEE_PROFILE
 from kalshi_edge_engine.engine.paper import build_quote_intents
@@ -512,12 +513,13 @@ async def _process_paper_intents(
 async def _nba_scanner_loop(client: KalshiClient) -> None:
     _sync_runtime_from_legacy()
     try:
-        await _runtime_nba_scanner_loop(
-            client,
-            signal_to_response=_signal_to_response,
-            signal_response_model=SignalResponse,
-            top_signals_snapshot_model=TopSignalsSnapshot,
-        )
+        with capture_origin("scanner"):
+            await _runtime_nba_scanner_loop(
+                client,
+                signal_to_response=_signal_to_response,
+                signal_response_model=SignalResponse,
+                top_signals_snapshot_model=TopSignalsSnapshot,
+            )
     finally:
         _sync_legacy_from_runtime()
 
@@ -1620,6 +1622,29 @@ async def get_paper_config() -> dict[str, Any]:
     }
 
 
+def get_fill_funnel() -> dict[str, Any]:
+    if _paper_store is None:
+        raise HTTPException(status_code=503, detail="Paper store unavailable")
+    return _paper_store.fill_funnel.aggregate()
+
+
+def get_intent_diagnostics(intent_id: str) -> dict[str, Any]:
+    if _paper_store is None:
+        raise HTTPException(status_code=503, detail="Paper store unavailable")
+    result = _paper_store.fill_funnel.intent(intent_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Entry intent not found")
+    return result
+
+
+async def get_recorder_status(request: Request) -> dict[str, Any]:
+    recorder: MarketRecorder | None = getattr(request.app.state, "recorder", None)
+    if recorder is None:
+        error = getattr(request.app.state, "recorder_config_error", None)
+        return {"enabled": error is not None, "ready": False, "last_error": error}
+    return recorder.status()
+
+
 async def get_paper_debug_intent(intent_id: str, request: Request) -> dict[str, Any]:
     """Debug simulator inputs/diagnostics for a single paper intent."""
     if not _paper_store:
@@ -1665,6 +1690,7 @@ async def get_paper_debug_intent(intent_id: str, request: Request) -> dict[str, 
 
     return {
         "intent": intent,
+        "evidence_source": "current_orderbook_debug_snapshot",
         "top_of_book": extract_top_of_book_snapshot(orderbook),
         "simulator": {
             "best_yes_bid": diagnostics["best_yes_bid"],
@@ -1829,6 +1855,8 @@ async def lifespan_production(app: FastAPI) -> Any:
         raise RuntimeError("A production application lifespan is already active in this process")
     _production_lifespan_active = True
     client: KalshiClient | None = None
+    recorder: MarketRecorder | None = None
+    recorder_task: asyncio.Task[None] | None = None
     try:
         _sync_runtime_from_legacy()
         client = KalshiClient()
@@ -1836,6 +1864,20 @@ async def lifespan_production(app: FastAPI) -> Any:
         app.state.scanner_task = None
         app.state.paper_maintenance_task = None
         runtime_state.market_fees = MarketFees(client)
+        app.state.recorder_config_error = None
+        try:
+            recorder = MarketRecorder.from_env(
+                lambda ticker: runtime_state.scanner_state.ticker_universe_map.get(
+                    ticker, "UNKNOWN"
+                )
+            )
+        except ValueError as exc:
+            app.state.recorder_config_error = str(exc)
+            logger.error("market_recorder_config_error: %s", exc)
+        app.state.recorder = recorder
+        if recorder is not None:
+            client.recorder = recorder
+            recorder_task = asyncio.create_task(recorder.run(), name="market-recorder")
 
         with ExitStack() as resources:
             if _ENABLE_PAPER_TRADING:
@@ -1877,6 +1919,9 @@ async def lifespan_production(app: FastAPI) -> Any:
                 runtime_state.paper_enabled = False
                 _sync_legacy_from_runtime()
     finally:
+        if recorder is not None and recorder_task is not None:
+            recorder.stop.set()
+            await recorder_task
         runtime_state.market_fees = None
         runtime_state.paper_liquidation_marks = {}
         try:
@@ -1950,6 +1995,9 @@ def create_app(testing: bool = False) -> FastAPI:
     app_instance.get("/paper/metrics/outcomes/concentration")(get_paper_outcome_concentration)
     app_instance.get("/paper/metrics/outcomes/entry-summary")(get_paper_outcome_entry_summary)
     app_instance.get("/paper/config")(get_paper_config)
+    app_instance.get("/paper/diagnostics/fill-funnel")(get_fill_funnel)
+    app_instance.get("/paper/diagnostics/intents/{intent_id}")(get_intent_diagnostics)
+    app_instance.get("/market-data/recorder/status")(get_recorder_status)
     app_instance.get("/paper/debug/intent/{intent_id}")(get_paper_debug_intent)
     app_instance.post("/paper/debug/force-fill")(post_paper_debug_force_fill)
 
