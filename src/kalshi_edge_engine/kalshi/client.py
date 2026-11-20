@@ -12,6 +12,8 @@ import httpx
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
+from kalshi_edge_engine.kalshi.read_budget import ReadBudget, ReadBudgetTimeout
+
 logger = logging.getLogger(__name__)
 
 
@@ -31,6 +33,10 @@ class KalshiAPIError(KalshiClientError):
     """Raised when the Kalshi API returns an error."""
 
     pass
+
+
+class KalshiReadBudgetError(KalshiAPIError):
+    """Transient congestion in the client or venue read budget."""
 
 
 class KalshiClient:
@@ -59,6 +65,7 @@ class KalshiClient:
         api_key_file: str | None = None,
         api_secret: str | None = None,
         base_url: str | None = None,
+        read_budget: ReadBudget | None = None,
     ) -> None:
         """Initialize the Kalshi client.
 
@@ -87,6 +94,7 @@ class KalshiClient:
 
         self.api_key_id = api_key_id_value
         self.base_url = base_url_value
+        self.read_budget = read_budget if read_budget is not None else ReadBudget.from_env()
         self._client = None
 
         # Load RSA private key from file (preferred) or inline string
@@ -169,73 +177,12 @@ class KalshiClient:
         return base64.b64encode(signature).decode("utf-8")
 
     async def get_orderbook(self, ticker: str) -> dict[str, Any]:
-        """Fetch orderbook for a given ticker using RSA signature authentication.
-
-        Args:
-            ticker: Market ticker symbol (e.g., 'KXNBAGAME-26MAR01SASNYK').
-
-        Returns:
-            Orderbook data from Kalshi API.
-
-        Raises:
-            KalshiAPIError: If the API request fails.
-        """
+        """Fetch orderbook data through the same read budget as market metadata."""
         if not ticker or not isinstance(ticker, str):
             raise ValueError("Ticker must be a non-empty string")
-
-        url = f"{self.base_url}/markets/{ticker}/orderbook"
-        # Derive path from URL to ensure signature matches actual request
-        parsed_url = urlparse(url)
-        path = parsed_url.path
-        method = "GET"
-
-        # Generate signature
-        timestamp_ms = int(time.time() * 1000)
-        signature = self._sign_request(timestamp_ms, method, path)
-
-        headers: dict[str, str] = {
-            "KALSHI-ACCESS-KEY": self.api_key_id,
-            "KALSHI-ACCESS-TIMESTAMP": str(timestamp_ms),
-            "KALSHI-ACCESS-SIGNATURE": signature,
-        }
-
-        try:
-            client = await self._get_client()
-            response = await client.get(
-                url,
-                headers=headers,
-                timeout=10.0,
-            )
-            response.raise_for_status()
-            data: dict[str, Any] = response.json()
-            logger.info(
-                "orderbook_fetch_success",
-                extra={
-                    "ticker": ticker,
-                    "url": url,
-                    "status_code": response.status_code,
-                },
-            )
-            return data
-        except httpx.HTTPStatusError as e:
-            logger.error(
-                "orderbook_fetch_status_error",
-                extra={
-                    "ticker": ticker,
-                    "status_code": e.response.status_code,
-                    "error": str(e),
-                },
-            )
-            raise KalshiAPIError(f"API error for {ticker}: {e.response.status_code}") from e
-        except httpx.RequestError as e:
-            logger.error(
-                "orderbook_fetch_request_error",
-                extra={
-                    "ticker": ticker,
-                    "error": str(e),
-                },
-            )
-            raise KalshiAPIError(f"Request failed for {ticker}: {str(e)}") from e
+        return await self._authenticated_request(
+            "GET", f"/markets/{quote(ticker, safe='')}/orderbook"
+        )
 
     async def _authenticated_request(
         self,
@@ -243,65 +190,47 @@ class KalshiClient:
         path: str,
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Make an authenticated request to Kalshi API.
-
-        Args:
-            method: HTTP method (GET, POST, etc.).
-            path: Request path (e.g., /series).
-            params: Optional query parameters.
-
-        Returns:
-            JSON response from Kalshi API.
-
-        Raises:
-            KalshiAPIError: If the API request fails.
-        """
+        """Reserve read tokens before signing every HTTP attempt."""
+        if method != "GET":
+            raise ValueError("This Kalshi client supports read requests only")
         url = f"{self.base_url}{path}"
-        # Derive path from URL to ensure signature matches actual request
-        parsed_url = urlparse(url)
-        sign_path = parsed_url.path
-        timestamp_ms = int(time.time() * 1000)
-        signature = self._sign_request(timestamp_ms, method, sign_path)
-
-        headers: dict[str, str] = {
-            "KALSHI-ACCESS-KEY": self.api_key_id,
-            "KALSHI-ACCESS-TIMESTAMP": str(timestamp_ms),
-            "KALSHI-ACCESS-SIGNATURE": signature,
-        }
-
+        sign_path = urlparse(url).path
         try:
             client = await self._get_client()
-            response = await client.request(
-                method,
-                url,
-                headers=headers,
-                params=params,
-                timeout=10.0,
+            for attempt in range(2):
+                cost = await self.read_budget.acquire(path)
+                if attempt:
+                    self.read_budget.record_retry()
+                timestamp_ms = int(time.time() * 1000)
+                headers = {
+                    "KALSHI-ACCESS-KEY": self.api_key_id,
+                    "KALSHI-ACCESS-TIMESTAMP": str(timestamp_ms),
+                    "KALSHI-ACCESS-SIGNATURE": self._sign_request(timestamp_ms, method, sign_path),
+                }
+                if path.endswith("/orderbook"):
+                    response = await client.get(url, headers=headers, timeout=10.0)
+                else:
+                    response = await client.request(
+                        method, url, headers=headers, params=params, timeout=10.0
+                    )
+                self.read_budget.observe(path, cost, response.status_code, response.headers)
+                if response.status_code == 429 and attempt == 0:
+                    continue
+                response.raise_for_status()
+                data: dict[str, Any] = response.json()
+                return data
+        except ReadBudgetTimeout as exc:
+            raise KalshiReadBudgetError(str(exc)) from exc
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 429:
+                raise KalshiReadBudgetError(f"Kalshi read rate limited for {path}") from exc
+            logger.debug(
+                "kalshi_read_status_error", extra={"path": path, "status": exc.response.status_code}
             )
-            response.raise_for_status()
-            data: dict[str, Any] = response.json()
-            return data
-        except httpx.HTTPStatusError as e:
-            logger.error(
-                "api_request_status_error",
-                extra={
-                    "method": method,
-                    "path": path,
-                    "status_code": e.response.status_code,
-                    "error": str(e),
-                },
-            )
-            raise KalshiAPIError(f"API error {method} {path}: {e.response.status_code}") from e
-        except httpx.RequestError as e:
-            logger.error(
-                "api_request_error",
-                extra={
-                    "method": method,
-                    "path": path,
-                    "error": str(e),
-                },
-            )
-            raise KalshiAPIError(f"Request failed {method} {path}: {str(e)}") from e
+            raise KalshiAPIError(f"API error {method} {path}: {exc.response.status_code}") from exc
+        except httpx.RequestError as exc:
+            raise KalshiAPIError(f"Request failed {method} {path}: {exc}") from exc
+        raise RuntimeError("The Kalshi read exhausted its request attempts")
 
     async def get_market(self, ticker: str) -> dict[str, Any]:
         """Read market metadata, with a historical lookup after an HTTP 404."""

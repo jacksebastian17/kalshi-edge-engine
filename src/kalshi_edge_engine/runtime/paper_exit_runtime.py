@@ -6,12 +6,18 @@ import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from kalshi_edge_engine.db.paper_store import MARK_MAX_AGE_MS, OUTCOME_MAX_DELAY_MS, PaperStore
+from kalshi_edge_engine.db.paper_store import (
+    MARK_MAX_AGE_MS,
+    OUTCOME_MAX_DELAY_MS,
+    OUTCOME_ON_TIME_MS,
+    PaperStore,
+)
 from kalshi_edge_engine.engine.fees import LEGACY_FEE_PROFILE, FeeProfile, estimate_taker_fee_cents
 from kalshi_edge_engine.engine.orderbook import LiquidationQuote, quote_liquidation
 from kalshi_edge_engine.engine.position_exit import decide_position_exit, should_take_profit
 from kalshi_edge_engine.kalshi.client import KalshiClient
-from kalshi_edge_engine.kalshi.market import read_settlement
+from kalshi_edge_engine.kalshi.market import read_market_observation, read_settlement
+from kalshi_edge_engine.kalshi.read_budget import ReadBudget, read_priority
 from kalshi_edge_engine.runtime import config as runtime_config
 from kalshi_edge_engine.runtime import state as runtime_state
 
@@ -50,9 +56,17 @@ async def _reconcile_markets(
         market: dict[str, Any] | None = previous
         async with limit:
             try:
+                requested_ms = int(time.time() * 1000)
                 fetched = await client.get_market(ticker)
                 if isinstance(fetched, dict) and fetched.get("ticker") == ticker:
-                    market = fetched
+                    observation = read_market_observation(
+                        fetched,
+                        ticker,
+                        requested_ts_ms=requested_ms,
+                        observed_ts_ms=int(time.time() * 1000),
+                    )
+                    if observation is None or store.record_market_observation(observation):
+                        market = fetched
             except Exception:
                 logger.debug(
                     "paper_market_status_unavailable", extra={"ticker": ticker}, exc_info=True
@@ -62,7 +76,7 @@ async def _reconcile_markets(
     for stale_ticker in checks.keys() - tickers:
         del checks[stale_ticker]
     await asyncio.gather(*(refresh(ticker) for ticker in sorted(tickers)))
-    blocked: set[str] = set()
+    blocked = {ticker for ticker in tickers if store.market_blocks_trading(ticker)}
     for ticker, (_, market) in checks.items():
         if not market:
             continue
@@ -120,41 +134,56 @@ async def _observe_due_outcomes(store: PaperStore, client: KalshiClient, now_ms:
             earliest_ts_ms=now_ms - horizon * 1000 - OUTCOME_MAX_DELAY_MS,
         )
     ]
-    tickers = {row["ticker"] for _, row in pending}
-    profiles = await _position_fee_profiles(tickers)
-    books = await _fetch_books(client, tickers)
-    for horizon, row in pending:
-        if row["ticker"] not in books:
-            continue
-        book, observed_ts_ms = books[row["ticker"]]
-        profile = profiles[row["ticker"]]
-        if profile is None and row["experiment_id"]:
-            continue
-        quote = quote_liquidation(
-            book,
-            row["side"],
-            row["fill_size"],
-            observed_ts_ms,
-            fee_profile=profile or LEGACY_FEE_PROFILE,
-        )
-        if quote is None:
-            continue
-        pnl = store.compute_short_horizon_fill_pnl_cents(
-            side=row["side"],
-            fill_price_cents=row["fill_price_cents"],
-            fill_size=row["fill_size"],
-            mark_price_cents=quote.price_cents,
-            fill_fee_cents=row["fill_fee_cents"],
-            exit_fee_cents=quote.exit_fee_cents,
-        )
-        store.update_fill_outcome(
-            fill_id=row["fill_id"],
-            horizon_seconds=horizon,
-            mark_after_fill_cents=quote.price_cents,
-            pnl_after_fill_cents=pnl,
-            observed_ts_ms=observed_ts_ms,
-            liquidation=quote,
-        )
+
+    # Give on-time opportunities precedence over retries for already-late observations.
+    def deadline(item: tuple[int, dict[str, Any]]) -> tuple[bool, int]:
+        horizon, row = item
+        target = int(row["fill_ts_ms"]) + horizon * 1000
+        return now_ms > target + OUTCOME_ON_TIME_MS, target
+
+    by_ticker: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    for horizon, row in sorted(pending, key=deadline):
+        by_ticker.setdefault(row["ticker"], []).append((horizon, row))
+    limit = asyncio.Semaphore(5)
+
+    async def observe(ticker: str, rows: list[tuple[int, dict[str, Any]]]) -> None:
+        async with limit:
+            # Sample the book before waiting for fee metadata. Persist each ticker as it finishes.
+            books = await _fetch_books(client, {ticker})
+            if ticker not in books:
+                return
+            book, observed_ts_ms = books[ticker]
+            profile = (await _position_fee_profiles({ticker}))[ticker]
+            for horizon, row in rows:
+                if profile is None and row["experiment_id"]:
+                    continue
+                quote = quote_liquidation(
+                    book,
+                    row["side"],
+                    row["fill_size"],
+                    observed_ts_ms,
+                    fee_profile=profile or LEGACY_FEE_PROFILE,
+                )
+                if quote is None:
+                    continue
+                pnl = store.compute_short_horizon_fill_pnl_cents(
+                    side=row["side"],
+                    fill_price_cents=row["fill_price_cents"],
+                    fill_size=row["fill_size"],
+                    mark_price_cents=quote.price_cents,
+                    fill_fee_cents=row["fill_fee_cents"],
+                    exit_fee_cents=quote.exit_fee_cents,
+                )
+                store.update_fill_outcome(
+                    fill_id=row["fill_id"],
+                    horizon_seconds=horizon,
+                    mark_after_fill_cents=quote.price_cents,
+                    pnl_after_fill_cents=pnl,
+                    observed_ts_ms=observed_ts_ms,
+                    liquidation=quote,
+                )
+
+    await asyncio.gather(*(observe(ticker, rows) for ticker, rows in by_ticker.items()))
 
 
 async def _refresh_positions(
@@ -168,7 +197,9 @@ async def _refresh_positions(
     blocked = await _reconcile_markets(
         store,
         client,
-        tickers | store.get_open_intent_tickers(),
+        tickers
+        | store.get_open_intent_tickers()
+        | store.get_recent_guarded_fill_tickers(int(time.time() * 1000) - 90_000),
         market_checks if market_checks is not None else {},
     )
     profiles = await _position_fee_profiles(tickers - blocked)
@@ -231,8 +262,10 @@ async def _paper_maintenance_loop(client: KalshiClient) -> None:
         raise RuntimeError("Paper maintenance child task returned")
 
     async with asyncio.TaskGroup() as tasks:
-        tasks.create_task(run(_position_maintenance_loop))
-        tasks.create_task(run(_outcome_maintenance_loop))
+        with read_priority("inventory"):
+            tasks.create_task(run(_position_maintenance_loop))
+        with read_priority("outcome"):
+            tasks.create_task(run(_outcome_maintenance_loop))
 
 
 async def _outcome_maintenance_loop(client: KalshiClient) -> None:
@@ -271,6 +304,15 @@ async def _position_maintenance_loop(client: KalshiClient) -> None:
                         "non_experiment_realized_pnl_cents",
                         "clean_open_positions_count",
                     )
+                    budget = getattr(client, "read_budget", None)
+                    budget_details = (
+                        {
+                            "kalshi_read_budget": budget.snapshot(),
+                            "missed_horizons_last_hour": store.get_missed_horizons_last_hour(),
+                        }
+                        if isinstance(budget, ReadBudget)
+                        else {}
+                    )
                     store.insert_pnl_snapshot(
                         ts_ms=now_ms,
                         realized_pnl_cents=metrics["clean_realized_pnl_cents"],
@@ -283,6 +325,7 @@ async def _position_maintenance_loop(client: KalshiClient) -> None:
                             "unrealized_unmarked_positions_count": metrics[
                                 "clean_unmarked_positions_count"
                             ],
+                            **budget_details,
                             **risk,
                         },
                     )

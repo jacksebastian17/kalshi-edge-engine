@@ -15,7 +15,7 @@ from kalshi_edge_engine.engine.orderbook import quote_liquidation
 from kalshi_edge_engine.engine.paper import QuoteIntent
 from kalshi_edge_engine.engine.signal import FEE_DATA_UNAVAILABLE, score_signal
 from kalshi_edge_engine.kalshi.client import KalshiAPIError, KalshiClient
-from kalshi_edge_engine.kalshi.market import read_settlement
+from kalshi_edge_engine.kalshi.market import MarketObservation, read_settlement
 from kalshi_edge_engine.runtime import config, paper_exit_runtime, state
 from kalshi_edge_engine.runtime.market_fees import MarketFees
 
@@ -32,24 +32,34 @@ def _profile(series="KXNBAGAME", fee_type="quadratic_with_maker_fees", **overrid
 
 def _entry(store, ticker, side, price, now, *, size=1, profile=LEGACY_FEE_PROFILE):
     intent_id = f"entry:{ticker}:{side}:{now}"
-    assert store.insert_intent(
-        QuoteIntent(intent_id, ticker, side, price, size, now, 5, 8, 8, "maker", True),
-        max_hold_seconds=3600,
-        fee_profile=profile,
+    market = (
+        MarketObservation(ticker, "active", now, now, now + 60_000)
+        if profile.series_aware
+        else None
     )
-    assert store.insert_fill(
-        fill_id=f"fill:{intent_id}",
-        intent_id=intent_id,
-        fill_ts_ms=now,
-        fill_price_cents=price,
-        fill_size=1,
-        remaining_size=size - 1,
-        fill_fee_cents=profile.fee_cents(price, 1, liquidity="maker"),
-        note="entry_queue_cleared",
-        execution_source="simulated_displayed_size_decrease",
-        fee_profile=profile,
-        apply_to_position=True,
-    )
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(store, "_clock_ms", lambda: now)
+        assert store.insert_intent(
+            QuoteIntent(intent_id, ticker, side, price, size, now, 5, 8, 8, "maker", True),
+            max_hold_seconds=3600,
+            fee_profile=profile,
+            market_observation=market,
+        )
+        assert store.insert_fill(
+            fill_id=f"fill:{intent_id}",
+            intent_id=intent_id,
+            fill_ts_ms=now,
+            fill_price_cents=price,
+            fill_size=1,
+            remaining_size=size - 1,
+            fill_fee_cents=profile.fee_cents(price, 1, liquidity="maker"),
+            note="entry_queue_cleared",
+            execution_source="simulated_displayed_size_decrease",
+            fee_profile=profile,
+            apply_to_position=True,
+            market_observation=market,
+            book_observed_ts_ms=now if market is not None else None,
+        )
     return intent_id
 
 

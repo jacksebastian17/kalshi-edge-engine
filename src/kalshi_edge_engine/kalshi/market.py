@@ -5,6 +5,21 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+MAX_ENTRY_OBSERVATION_AGE_MS = 2_000
+NONTRADING_STATUSES = frozenset(
+    {
+        "initialized",
+        "inactive",
+        "closed",
+        "determined",
+        "disputed",
+        "amended",
+        "finalized",
+        "settled",
+    }
+)
+FINAL_STATUSES = frozenset({"finalized", "settled"})
+
 
 def timestamp_ms(value: Any) -> int | None:
     if not isinstance(value, str):
@@ -16,6 +31,78 @@ def timestamp_ms(value: Any) -> int | None:
         return (date - datetime(1970, 1, 1, tzinfo=UTC)) // timedelta(milliseconds=1)
     except (ValueError, OverflowError, OSError):
         return None
+
+
+@dataclass(frozen=True)
+class MarketObservation:
+    ticker: str
+    status: str
+    requested_ts_ms: int
+    observed_ts_ms: int
+    close_ts_ms: int | None
+    updated_ts_ms: int | None = None
+    settlement_ts_ms: int | None = None
+
+    def tradable_at(self, now_ms: int) -> bool:
+        return (
+            self.status == "active"
+            and self.close_ts_ms is not None
+            and self.requested_ts_ms <= self.observed_ts_ms <= now_ms < self.close_ts_ms
+            and now_ms - self.requested_ts_ms <= MAX_ENTRY_OBSERVATION_AGE_MS
+        )
+
+    def can_replace(self, previous: "MarketObservation") -> bool:
+        if previous == self:
+            return True
+        if previous.status in FINAL_STATUSES and self.status not in FINAL_STATUSES:
+            return False
+        if (
+            self.updated_ts_ms is not None
+            and previous.updated_ts_ms is not None
+            and self.updated_ts_ms < previous.updated_ts_ms
+        ):
+            return False
+        if self.requested_ts_ms < previous.requested_ts_ms and not (
+            self.status in NONTRADING_STATUSES and self.observed_ts_ms >= previous.observed_ts_ms
+        ):
+            return False
+        if self.status == "active" and previous.status in NONTRADING_STATUSES:
+            newer_exchange_update = (
+                self.updated_ts_ms is not None
+                and previous.updated_ts_ms is not None
+                and self.updated_ts_ms > previous.updated_ts_ms
+            )
+            moved_close = (
+                self.close_ts_ms is not None
+                and previous.close_ts_ms is not None
+                and self.close_ts_ms > previous.close_ts_ms
+            )
+            return self.requested_ts_ms > previous.observed_ts_ms and (
+                newer_exchange_update or moved_close
+            )
+        return self.observed_ts_ms >= previous.observed_ts_ms
+
+
+def read_market_observation(
+    market: dict[str, Any], ticker: str, *, requested_ts_ms: int, observed_ts_ms: int
+) -> MarketObservation | None:
+    status = market.get("status")
+    if (
+        market.get("ticker") != ticker
+        or not isinstance(status, str)
+        or (status != "active" and status not in NONTRADING_STATUSES)
+        or observed_ts_ms < requested_ts_ms
+    ):
+        return None
+    return MarketObservation(
+        ticker,
+        status,
+        requested_ts_ms,
+        observed_ts_ms,
+        timestamp_ms(market.get("close_time")),
+        timestamp_ms(market.get("updated_time")),
+        timestamp_ms(market.get("settlement_ts")),
+    )
 
 
 @dataclass(frozen=True)

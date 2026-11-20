@@ -27,6 +27,7 @@ from kalshi_edge_engine.kalshi.client import (
     KalshiAuthError,
     KalshiClient,
 )
+from kalshi_edge_engine.kalshi.read_budget import ReadBudget
 from kalshi_edge_engine.runtime import config as runtime_config
 from kalshi_edge_engine.runtime import paper_runtime as _runtime_paper_runtime_module
 from kalshi_edge_engine.runtime import state as runtime_state
@@ -1353,6 +1354,20 @@ async def get_paper_summary() -> dict[str, Any]:
     }
 
 
+async def get_kalshi_read_budget(request: Request) -> dict[str, Any]:
+    """Expose request-budget and horizon coverage diagnostics."""
+    client = getattr(request.app.state, "kalshi_client", None)
+    budget = getattr(client, "read_budget", None)
+    if not isinstance(budget, ReadBudget):
+        raise HTTPException(status_code=503, detail="Kalshi read budget unavailable")
+    return {
+        **budget.snapshot(),
+        "missed_horizons_last_hour": (
+            _paper_store.get_missed_horizons_last_hour() if _paper_store is not None else None
+        ),
+    }
+
+
 async def get_paper_metrics() -> dict[str, Any]:
     """Get lightweight paper activity metrics for dashboard observability."""
     if not _paper_store:
@@ -1686,6 +1701,10 @@ async def post_paper_debug_force_fill(request: ForceFillRequest) -> dict[str, An
 
     if intent_id.startswith("exit_intent:"):
         raise HTTPException(status_code=400, detail="Expected an entry intent")
+    if intent.get("market_at_submit") is not None:
+        raise HTTPException(
+            status_code=409, detail="Market-guarded intents require simulated fill evidence"
+        )
 
     already_filled = _paper_store.get_filled_size_for_intent(intent_id)
     size_contracts = int(intent["size_contracts"])
@@ -1913,6 +1932,7 @@ def create_app(testing: bool = False) -> FastAPI:
     app_instance.get("/signals/top")(get_top_signals)
     app_instance.get("/universe/nba", response_model=NBAUniverseResponse)(get_nba_universe)
     app_instance.get("/scanner/status", response_model=ScannerStatusResponse)(get_scanner_status)
+    app_instance.get("/kalshi/read-budget")(get_kalshi_read_budget)
     app_instance.post("/scanner/start", response_model=ScannerStartResponse)(start_scanner)
     app_instance.post("/scanner/stop", response_model=ScannerStopResponse)(stop_scanner)
 

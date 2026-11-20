@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import time
+from dataclasses import replace
 from typing import Any
 
 from kalshi_edge_engine.db.paper_store import PaperStore
@@ -11,6 +12,8 @@ from kalshi_edge_engine.engine.paper import QuoteIntent, build_quote_intents
 from kalshi_edge_engine.engine.paper_sim import Fill, OrderRequest, RealisticOrderSimulator
 from kalshi_edge_engine.engine.signal import SIGNAL_VALID, Signal
 from kalshi_edge_engine.kalshi.client import KalshiClient
+from kalshi_edge_engine.kalshi.market import MarketObservation
+from kalshi_edge_engine.kalshi.read_budget import read_priority
 from kalshi_edge_engine.runtime import config as runtime_config
 from kalshi_edge_engine.runtime import state as runtime_state
 
@@ -123,9 +126,8 @@ async def _process_paper_intents(
         return
 
     fee_profile = signal.fee_profile
-    if fee_profile is None or (
-        runtime_state.market_fees is not None and not fee_profile.series_aware
-    ):
+    resolver = runtime_state.market_fees
+    if fee_profile is None or (resolver is not None and not fee_profile.series_aware):
         return
 
     now_ms = int(time.time() * 1000)
@@ -427,7 +429,8 @@ async def _process_paper_intents(
             best_bid_at_submit_cents: float | None = None
             cross_at_submit_cents: float | None = None
             try:
-                orderbook_snapshot = await client.get_orderbook(intent.ticker)
+                with read_priority("entry"):
+                    orderbook_snapshot = await client.get_orderbook(intent.ticker)
                 parsed_ob = parse_orderbook(orderbook_snapshot)
                 if intent.side == "YES":
                     best_bid_at_submit_cents = (
@@ -445,9 +448,17 @@ async def _process_paper_intents(
                     extra={"intent_id": intent.id, "error": str(e)},
                 )
 
+            market_observation = None
+            if resolver is not None:
+                with read_priority("entry"):
+                    market_observation = await resolver.observe_entry_market(intent.ticker)
+                if market_observation is None:
+                    continue
             now_ms = int(time.time() * 1000)
             if _get_rate_limit_or_cooldown_reason(intent.ticker, now_ms) is not None:
                 continue
+            if market_observation is not None:
+                intent = replace(intent, created_ts_ms=now_ms)
 
             inserted = runtime_state.paper_store.insert_intent(
                 intent,
@@ -458,6 +469,7 @@ async def _process_paper_intents(
                 best_bid_at_submit_cents=best_bid_at_submit_cents,
                 cross_at_submit_cents=cross_at_submit_cents,
                 fee_profile=fee_profile,
+                market_observation=market_observation,
             )
             if not inserted:
                 continue
@@ -476,6 +488,7 @@ async def _process_paper_intents(
             intent_param: QuoteIntent,
             entry_fee_param: float,
             effective_config_param: runtime_config.PaperRuntimeConfig,
+            guarded: bool,
         ) -> None:
             try:
                 store = runtime_state.paper_store
@@ -483,6 +496,9 @@ async def _process_paper_intents(
                     return
 
                 entry_fee_cents = entry_fee_param
+
+                def may_poll() -> bool:
+                    return store.entry_can_poll(intent_param.id)
 
                 order_request = OrderRequest(
                     id=intent_param.id,
@@ -500,6 +516,7 @@ async def _process_paper_intents(
                         if intent_param.size_contracts > 0
                         else 0.0
                     ),
+                    may_poll=may_poll if guarded else None,
                 )
 
                 simulator = RealisticOrderSimulator(
@@ -513,7 +530,7 @@ async def _process_paper_intents(
                 total_filled = 0
                 processed_fill_ids: set[str] = set()
 
-                def persist_fill(fill: Fill) -> bool:
+                def persist_fill(fill: Fill, observation: MarketObservation | None = None) -> bool:
                     nonlocal total_filled
                     if fill.id in processed_fill_ids:
                         return False
@@ -546,6 +563,8 @@ async def _process_paper_intents(
                         execution_source=fill.execution_source,
                         apply_to_position=True,
                         fee_profile=fee_profile,
+                        market_observation=observation,
+                        book_observed_ts_ms=fill.fill_ts_ms if observation is not None else None,
                     )
                     if result.inserted_new_fill:
                         total_filled += fill.fill_size
@@ -556,10 +575,33 @@ async def _process_paper_intents(
                     )
                     return False
 
-                def _on_simulator_poll(runtime_update: dict[str, Any]) -> bool | None:
+                async def guarded_poll(runtime_update: dict[str, Any]) -> bool:
+                    assert resolver is not None
+                    observation = await resolver.observe_entry_market(intent_param.ticker)
+                    if observation is None:
+                        store.cancel_market_entry(intent_param.id, "market_status_unavailable")
+                        return False
+                    if not store.record_market_observation(observation):
+                        return False
+                    if not may_poll():
+                        return False
+                    if not observation.tradable_at(int(time.time() * 1000)):
+                        store.cancel_market_entry(
+                            intent_param.id, "market_status_stale_or_incomplete"
+                        )
+                        return False
+                    if int(time.time() * 1000) >= (
+                        intent_param.created_ts_ms
+                        + effective_config_param.fill_horizon_seconds * 1000
+                    ):
+                        return False
                     fill = runtime_update.get("fill")
                     if isinstance(fill, Fill):
-                        return persist_fill(fill)
+                        return persist_fill(fill, observation)
+                    update_poll(runtime_update)
+                    return False
+
+                def update_poll(runtime_update: dict[str, Any]) -> None:
                     store.update_intent_status(
                         intent_param.id,
                         PAPER_INTENT_STATUS_OPEN,
@@ -567,16 +609,23 @@ async def _process_paper_intents(
                         queue_ahead=runtime_update.get("queue_ahead_contracts"),
                         only_if_open=True,
                     )
+
+                def unguarded_poll(runtime_update: dict[str, Any]) -> bool | None:
+                    fill = runtime_update.get("fill")
+                    if isinstance(fill, Fill):
+                        return persist_fill(fill)
+                    update_poll(runtime_update)
                     return None
 
                 fills, order_state = await simulator.simulate_order_fills(
                     client,
                     order_request,
                     horizon_seconds=effective_config_param.fill_horizon_seconds,
-                    on_poll=_on_simulator_poll,
+                    on_poll=guarded_poll if guarded else unguarded_poll,
                 )
-                for fill in fills:
-                    persist_fill(fill)
+                if not guarded:
+                    for fill in fills:
+                        persist_fill(fill)
 
                 entry_order_exit_reason = order_state.get("exit_reason", "timeout")
                 store.update_intent_status(
@@ -608,7 +657,10 @@ async def _process_paper_intents(
                         intent_param.id, PAPER_INTENT_STATUS_ERROR, only_if_open=True
                     )
 
-        task = asyncio.create_task(_simulate_task(intent, entry_fee_cents, effective_config))
+        with read_priority("entry"):
+            task = asyncio.create_task(
+                _simulate_task(intent, entry_fee_cents, effective_config, resolver is not None)
+            )
         runtime_state.paper_simulation_tasks.add(task)
 
         def _cleanup(

@@ -5,10 +5,15 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
+from weakref import WeakValueDictionary
 
 from kalshi_edge_engine.engine.fees import FeeProfile, series_fee_profile
 from kalshi_edge_engine.kalshi.client import KalshiClient
-from kalshi_edge_engine.kalshi.market import timestamp_ms
+from kalshi_edge_engine.kalshi.market import (
+    MarketObservation,
+    read_market_observation,
+    timestamp_ms,
+)
 
 logger = logging.getLogger(__name__)
 ObservedMetadata = tuple[dict[str, Any], int]
@@ -20,13 +25,16 @@ class MarketFees:
     def __init__(self, client: KalshiClient) -> None:
         self.client = client
         self._cache: dict[tuple[str, str], tuple[float, ObservedMetadata | None]] = {}
-        self._locks = [asyncio.Lock() for _ in range(16)]
+        self._locks: WeakValueDictionary[tuple[str, str], asyncio.Lock] = WeakValueDictionary()
 
     async def _record(
         self, kind: str, ticker: str, fetch: Callable[[str], Awaitable[dict[str, Any]]]
     ) -> ObservedMetadata | None:
         key = (kind, ticker)
-        async with self._locks[hash(key) % len(self._locks)]:
+        lock = self._locks.get(key)
+        if lock is None:
+            lock = self._locks[key] = asyncio.Lock()
+        async with lock:
             now = time.monotonic()
             cached = self._cache.get(key)
             if cached is not None and now < cached[0]:
@@ -44,6 +52,18 @@ class MarketFees:
                 record = None
             self._cache[key] = (time.monotonic() + (60 if record is not None else 10), record)
             return record
+
+    async def observe_entry_market(self, ticker: str) -> MarketObservation | None:
+        """Get a fresh market response for submission or an outstanding entry."""
+        try:
+            requested = int(time.time() * 1000)
+            market = await self.client.get_market(ticker)
+        except Exception:
+            logger.debug("paper_entry_market_unavailable", extra={"ticker": ticker}, exc_info=True)
+            return None
+        return read_market_observation(
+            market, ticker, requested_ts_ms=requested, observed_ts_ms=int(time.time() * 1000)
+        )
 
     async def resolve(self, ticker: str, *, for_entry: bool = False) -> FeeProfile | None:
         market_record = await self._record("market", ticker, self.client.get_market)

@@ -233,6 +233,7 @@ class OrderRequest:
     # Backward-compat alias: interpreted as cents PER CONTRACT.
     take_profit_cents: float | None = None
     entry_fee_per_contract_cents: float | None = None
+    may_poll: Callable[[], bool] | None = None
 
     def __post_init__(self) -> None:
         """Normalize take-profit semantics to per-contract cents."""
@@ -371,8 +372,14 @@ class RealisticOrderSimulator:
 
         while elapsed_ms < horizon_ms and remaining_size > 0:
             try:
+                if order.may_poll is not None and not order.may_poll():
+                    exit_reason = "entry_canceled"
+                    break
                 # Fetch current orderbook
                 orderbook = await client.get_orderbook(order.ticker)
+                if order.may_poll is not None and not order.may_poll():
+                    exit_reason = "entry_canceled"
+                    break
 
                 diagnostics = compute_simulator_diagnostics(
                     order=order,

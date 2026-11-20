@@ -9,7 +9,8 @@ from typing import Any
 from kalshi_edge_engine.engine.fees import LEGACY_FEE_PROFILE
 from kalshi_edge_engine.engine.signal import Signal, score_signal
 from kalshi_edge_engine.engine.universe import discover_nba_universe
-from kalshi_edge_engine.kalshi.client import KalshiClient
+from kalshi_edge_engine.kalshi.client import KalshiClient, KalshiReadBudgetError
+from kalshi_edge_engine.kalshi.read_budget import ReadBudget
 from kalshi_edge_engine.runtime import config as runtime_config
 from kalshi_edge_engine.runtime import state as runtime_state
 from kalshi_edge_engine.runtime.paper_runtime import _process_paper_intents
@@ -133,8 +134,14 @@ async def _nba_scanner_loop(
             available_tickers: list[str] = []
             skipped_count = 0
 
+            budget = getattr(client, "read_budget", None)
+            cycle_slice = (
+                budget.discovery_slice_size(TARGET_CYCLE_SECONDS, scan_slice_size)
+                if isinstance(budget, ReadBudget)
+                else scan_slice_size
+            )
             idx = start_idx
-            while len(available_tickers) < scan_slice_size and len(
+            while len(available_tickers) < cycle_slice and len(
                 available_tickers
             ) + skipped_count < len(market_tickers):
                 ticker = market_tickers[idx % len(market_tickers)]
@@ -153,8 +160,8 @@ async def _nba_scanner_loop(
 
             async def fetch_and_score(
                 ticker: str, sem: asyncio.Semaphore, api_client: KalshiClient
-            ) -> tuple[str, Signal | None]:
-                """Fetch orderbook and score signal. Returns (ticker, signal or None)."""
+            ) -> tuple[str, Signal | None, bool]:
+                """Fetch a signal and distinguish budget pressure from ticker-specific errors."""
                 async with sem:
                     try:
                         resolver = runtime_state.market_fees
@@ -173,19 +180,24 @@ async def _nba_scanner_loop(
                             score_signal(
                                 ticker, orderbook, universe=universe_key, fee_profile=fee_profile
                             ),
+                            False,
                         )
+                    except KalshiReadBudgetError:
+                        return ticker, None, True
                     except Exception as e:
                         logger.debug(
                             "multi_universe_scanner_ticker_failed",
                             extra={"ticker": ticker, "error": str(e)},
                         )
-                        return (ticker, None)
+                        return ticker, None, False
 
             results = await asyncio.gather(
                 *[fetch_and_score(t, semaphore, client) for t in slice_tickers]
             )
 
-            for ticker, signal in results:
+            for ticker, signal, budget_deferred in results:
+                if budget_deferred:
+                    continue
                 if signal is None:
                     runtime_state.scanner_state.tickers_failed_last_cycle.append(ticker)
                     fail_now_ms = int(time.time() * 1000)
