@@ -11,8 +11,11 @@ Key concepts:
 - Inside width = cross - best_bid (room to quote between bid and cross)
 """
 
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, NamedTuple
+
+from kalshi_edge_engine.engine.fees import estimate_taker_fee_cents
 
 
 class BestLevel(NamedTuple):
@@ -29,6 +32,80 @@ class ParsedOrderbook(NamedTuple):
     cross_yes: BestLevel | None  # Cross price for YES (100 - best_no_bid)
     bid_no: BestLevel | None  # Best NO bid (highest in NO ladder)
     cross_no: BestLevel | None  # Cross price for NO (100 - best_yes_bid)
+
+
+@dataclass(frozen=True)
+class LiquidationQuote:
+    """Whole-position paper sale at displayed bids, with fees rounded per level."""
+
+    size_contracts: int
+    price_cents: float
+    exit_fee_cents: float
+    best_bid_cents: float
+    implied_ask_cents: float | None
+    bid_levels: tuple[tuple[float, int], ...]
+    observed_ts_ms: int
+
+    @property
+    def midpoint_cents(self) -> float | None:
+        if self.implied_ask_cents is None:
+            return None
+        return (self.best_bid_cents + self.implied_ask_cents) / 2
+
+    def is_fresh(self, now_ms: int, max_age_ms: int) -> bool:
+        return 0 <= now_ms - self.observed_ts_ms <= max_age_ms
+
+
+def quote_liquidation(
+    orderbook: dict[str, Any], side: str, size_contracts: int, observed_ts_ms: int
+) -> LiquidationQuote | None:
+    """Price an immediate full sale against the held contract's bid ladder."""
+    if not isinstance(orderbook, dict) or side not in ("YES", "NO") or size_contracts <= 0:
+        return None
+    yes, no, dollars = _extract_prices_from(orderbook)
+    bids = _liquidation_levels(yes if side == "YES" else no, dollars)
+    opposite_bids = _liquidation_levels(no if side == "YES" else yes, dollars)
+    if not bids:
+        return None
+    implied_ask = 100 - opposite_bids[0][0] if opposite_bids else None
+    if implied_ask is not None and bids[0][0] > implied_ask + 1e-9:
+        return None
+
+    remaining = size_contracts
+    levels: list[tuple[float, int]] = []
+    for price, available in bids:
+        size = min(available, remaining)
+        levels.append((price, size))
+        remaining -= size
+        if remaining == 0:
+            return LiquidationQuote(
+                size_contracts=size_contracts,
+                price_cents=sum(price * size for price, size in levels) / size_contracts,
+                exit_fee_cents=sum(estimate_taker_fee_cents(price, size) for price, size in levels),
+                best_bid_cents=bids[0][0],
+                implied_ask_cents=implied_ask,
+                bid_levels=tuple(levels),
+                observed_ts_ms=observed_ts_ms,
+            )
+    return None
+
+
+def _liquidation_levels(prices: list[Any], dollars: bool) -> list[tuple[float, int]]:
+    levels: dict[float, int] = {}
+    for item in prices if isinstance(prices, list) else []:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        price = _parse_price_cents(item[0], prices_are_dollars=dollars)
+        # Paper inventory is integer-sized. Count only whole contracts per level.
+        try:
+            count = Decimal(str(item[1]))
+            size = int(count) if count.is_finite() and count > 0 else 0
+        except InvalidOperation:
+            continue
+        if price is not None and 0 < price < 100 and size > 0:
+            # A repeated level in a snapshot is ambiguous. Count it only once.
+            levels[price] = min(levels.get(price, size), size)
+    return sorted(levels.items(), reverse=True)
 
 
 def _extract_prices_from(data: dict[str, Any]) -> tuple[list[Any], list[Any], bool]:
@@ -154,7 +231,7 @@ def parse_orderbook(orderbook: dict[str, Any]) -> ParsedOrderbook:
 
     Best bid on each side = highest price in that ladder.
 
-    Cross prices (what you'd pay to immediately sell):
+    Cross prices (what you'd pay to immediately buy):
     - cross_yes = "best immediate YES buy price implied by NO bids"
     - cross_no = "best immediate NO buy price implied by YES bids"
 

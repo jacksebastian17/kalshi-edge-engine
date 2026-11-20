@@ -179,7 +179,7 @@ export function OrderbookDrawer({
 
         <div className="flex-1 overflow-auto p-6 space-y-4">
           <div className="rounded border border-white/10 bg-zinc-900 p-4">
-            <p className="text-xs text-zinc-400 mb-2">Max Edge</p>
+            <p className="text-xs text-zinc-400 mb-2">Best Spread Room After Costs</p>
             <p
               className={`text-4xl font-semibold tabular-nums ${
                 maxEdge >= 0 ? 'text-emerald-300' : 'text-red-300'
@@ -189,13 +189,12 @@ export function OrderbookDrawer({
               {maxEdge.toFixed(2)}¢
             </p>
             <p className="text-xs text-zinc-400 mt-2 tabular-nums">
-              {signal?.reason_code} · LQ {signal?.top_liquidity ?? 0} · Gap{' '}
-              {signal?.imbalance_gap?.toFixed(2) ?? '—'}
+              {signal?.reason_code} · LQ {signal?.top_liquidity ?? 0}
             </p>
           </div>
 
           <div className="rounded border border-white/10 bg-zinc-900 p-4">
-            <h3 className="text-sm font-bold text-zinc-200 mb-3">Live Max Edge</h3>
+            <h3 className="text-sm font-bold text-zinc-200 mb-3">Spread Room Over Time</h3>
             <MaxEdgeChart points={chartPoints} />
           </div>
 
@@ -203,22 +202,20 @@ export function OrderbookDrawer({
             <h3 className="text-sm font-bold text-zinc-200 mb-3">Signal Metrics</h3>
             <div className="space-y-1 text-xs text-zinc-400 tabular-nums">
               <MetricRow
-                label="Net Edge YES"
+                label="YES Spread Room After Costs"
                 value={signal?.net_edge_yes}
                 valueClassName="text-emerald-300"
               />
               <MetricRow
-                label="Net Edge NO"
+                label="NO Spread Room After Costs"
                 value={signal?.net_edge_no}
                 valueClassName="text-sky-300"
               />
-              <MetricRow label="Inside Width YES" value={signal?.inside_width_yes} />
-              <MetricRow label="Inside Width NO" value={signal?.inside_width_no} />
+              <MetricRow label="Quoted Spread" value={signal?.inside_width_yes ?? signal?.inside_width_no} />
               <div className="flex justify-between">
                 <span>Top Liquidity</span>
                 <span>{signal?.top_liquidity ?? '—'}</span>
               </div>
-              <MetricRow label="Imbalance Gap" value={signal?.imbalance_gap} />
               <div className="flex justify-between">
                 <span>Universe</span>
                 <span>{formatUniverse(signal?.universe)}</span>

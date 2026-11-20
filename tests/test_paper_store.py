@@ -243,6 +243,7 @@ class TestPaperStore:
             note="entry_queue_cleared",
             mark_30s_after_fill_cents=48.0,
             pnl_30s_after_fill_cents=1.0,
+            observed_30s_ts_ms=now_ms + 100 + 30_000,
         )
         assert inserted is True
 
@@ -700,6 +701,7 @@ class TestPaperStoreV2:
                 cross_at_fill_cents=51.0 + i,
                 mark_30s_after_fill_cents=52.0 + i,
                 pnl_30s_after_fill_cents=1.5 + i,
+                observed_30s_ts_ms=now_ms + i * 1000 + 30_000,
                 note=f"test_note_{i}",
             )
 
@@ -1649,12 +1651,12 @@ class TestShortHorizonOutcomeTelemetry:
             side="NO",
             fill_price_cents=53.0,
             fill_size=2,
-            mark_price_cents=51.5,
+            mark_price_cents=56.0,
             fill_fee_cents=0.2,
         )
 
-        assert yes_pnl == pytest.approx(3.7)
-        assert no_pnl == pytest.approx(2.8)
+        assert yes_pnl == pytest.approx(-0.3)
+        assert no_pnl == pytest.approx(1.8)
 
     def test_pending_30s_updates_and_idempotent_write(self, paper_store: PaperStore) -> None:
         """Pending selector should return eligible entry fills and updates should be idempotent."""
@@ -1796,6 +1798,7 @@ class TestShortHorizonOutcomeTelemetry:
             note="entry_queue_cleared",
             mark_30s_after_fill_cents=50.8,
             pnl_30s_after_fill_cents=0.7,
+            observed_30s_ts_ms=now_ms - 50_000 + 30_000,
         )
         assert paper_store.insert_fill(
             fill_id="fill-metrics-no-1",
@@ -1808,6 +1811,7 @@ class TestShortHorizonOutcomeTelemetry:
             note="entry_price_improves",
             mark_30s_after_fill_cents=48.0,
             pnl_30s_after_fill_cents=0.9,
+            observed_30s_ts_ms=now_ms - 45_000 + 30_000,
         )
         assert paper_store.insert_fill(
             fill_id="fill-metrics-yes-2",
@@ -1820,6 +1824,7 @@ class TestShortHorizonOutcomeTelemetry:
             note="entry_queue_cleared",
             mark_30s_after_fill_cents=50.4,
             pnl_30s_after_fill_cents=-0.7,
+            observed_30s_ts_ms=now_ms - 40_000 + 30_000,
         )
 
         metrics = paper_store.get_short_horizon_outcome_metrics(window_seconds=3600)
@@ -1895,6 +1900,7 @@ class TestShortHorizonOutcomeTelemetry:
             note="entry_queue_cleared",
             mark_30s_after_fill_cents=50.6,
             pnl_30s_after_fill_cents=0.5,
+            observed_30s_ts_ms=now_ms - 50_000 + 30_000,
         )
         assert paper_store.insert_fill(
             fill_id="fill-entry-only-2",
@@ -1907,10 +1913,11 @@ class TestShortHorizonOutcomeTelemetry:
             note="exit_take_profit",
             mark_30s_after_fill_cents=49.8,
             pnl_30s_after_fill_cents=-0.2,
+            observed_30s_ts_ms=now_ms - 45_000 + 30_000,
         )
 
         metrics = paper_store.get_short_horizon_outcome_metrics(window_seconds=3600)
-        assert metrics["total_samples"] == 2
+        assert metrics["total_samples"] == 1
         assert metrics["entry_only_sample_count"] == 1
         assert "queue_cleared" in metrics["entry_only_by_fill_path"]
         assert "unknown" not in metrics["entry_only_by_fill_path"]
@@ -1972,6 +1979,7 @@ class TestShortHorizonOutcomeTelemetry:
             fill_fee_cents=0.1,
             note="entry_queue_cleared",
             pnl_30s_after_fill_cents=0.6,
+            observed_30s_ts_ms=now_ms - 60_000 + 30_000,
         )
         assert paper_store.insert_fill(
             fill_id="fill-filter-path-2",
@@ -1983,6 +1991,7 @@ class TestShortHorizonOutcomeTelemetry:
             fill_fee_cents=0.1,
             note="entry_moved_through",
             pnl_30s_after_fill_cents=-0.3,
+            observed_30s_ts_ms=now_ms - 50_000 + 30_000,
         )
         assert paper_store.insert_fill(
             fill_id="fill-filter-path-3",
@@ -1994,6 +2003,7 @@ class TestShortHorizonOutcomeTelemetry:
             fill_fee_cents=0.1,
             note="entry_queue_cleared",
             pnl_30s_after_fill_cents=0.2,
+            observed_30s_ts_ms=now_ms - 40_000 + 30_000,
         )
 
         queue_only = paper_store.get_entry_only_metrics_filtered_by_fill_path(
@@ -2044,6 +2054,7 @@ class TestShortHorizonOutcomeTelemetry:
                 fill_fee_cents=0.1,
                 note="entry_queue_cleared",
                 pnl_30s_after_fill_cents=0.1,
+                observed_30s_ts_ms=now_ms - 60_000 + idx + 30_000,
             )
 
         headline = paper_store.get_headline_metrics_filtered_by_fill_path(
@@ -2093,6 +2104,7 @@ class TestShortHorizonOutcomeTelemetry:
                 fill_fee_cents=0.1,
                 note="entry_queue_cleared",
                 pnl_30s_after_fill_cents=pnl_30s,
+                observed_30s_ts_ms=now_ms - 60_000 + idx + 30_000,
             )
 
         headline = paper_store.get_headline_metrics_filtered_by_fill_path(

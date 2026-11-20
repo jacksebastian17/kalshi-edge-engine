@@ -927,6 +927,7 @@ class TestPaperMetricsEndpoint:
                 note="entry_queue_cleared",
                 mark_30s_after_fill_cents=50.8,
                 pnl_30s_after_fill_cents=0.7,
+                observed_30s_ts_ms=now_ms - 60_000 + 30_000,
             )
             assert store.insert_fill(
                 fill_id="fill-outcome-api-no",
@@ -940,6 +941,7 @@ class TestPaperMetricsEndpoint:
                 note="entry_moved_through",
                 mark_30s_after_fill_cents=49.4,
                 pnl_30s_after_fill_cents=-0.5,
+                observed_30s_ts_ms=now_ms - 55_000 + 30_000,
             )
 
             response = client.get("/paper/metrics/outcomes?window_seconds=3600")
@@ -1002,6 +1004,7 @@ class TestPaperMetricsEndpoint:
                 horizon_seconds=5,
                 mark_after_fill_cents=50.3,
                 pnl_after_fill_cents=0.2,
+                observed_ts_ms=now_ms - 55_000,
             )
 
             response = client.get("/paper/metrics/outcomes?window_seconds=3600&horizon_seconds=5")
@@ -1073,6 +1076,7 @@ class TestPaperMetricsEndpoint:
                 fill_id="fill-entry-summary-1",
                 mark_30s_after_fill_cents=48.2,
                 pnl_30s_after_fill_cents=0.7,
+                observed_ts_ms=now_ms - 30_000,
             )
 
             response = client.get("/paper/metrics/outcomes/entry-summary?window_seconds=3600")
@@ -1210,6 +1214,7 @@ class TestPaperMetricsEndpoint:
                 fill_fee_cents=0.1,
                 note="entry_queue_cleared",
                 pnl_30s_after_fill_cents=0.3,
+                observed_30s_ts_ms=now_ms - 70_000 + 30_000,
             )
             assert store.insert_fill(
                 fill_id="fill-entry-summary-truth-b",
@@ -1222,6 +1227,7 @@ class TestPaperMetricsEndpoint:
                 fill_fee_cents=0.1,
                 note="entry_queue_cleared",
                 pnl_30s_after_fill_cents=0.1,
+                observed_30s_ts_ms=now_ms - 60_000 + 30_000,
             )
             assert store.insert_fill(
                 fill_id="fill-entry-summary-truth-c",
@@ -1234,6 +1240,7 @@ class TestPaperMetricsEndpoint:
                 fill_fee_cents=0.1,
                 note="entry_moved_through",
                 pnl_30s_after_fill_cents=-0.2,
+                observed_30s_ts_ms=now_ms - 50_000 + 30_000,
             )
 
             response = client.get("/paper/metrics/outcomes/entry-summary?window_seconds=3600")
@@ -1330,6 +1337,7 @@ class TestPaperMetricsEndpoint:
                 note="entry_queue_cleared",
                 mark_30s_after_fill_cents=50.9,
                 pnl_30s_after_fill_cents=0.8,
+                observed_30s_ts_ms=now_ms - 40_000 + 30_000,
             )
             assert store.insert_fill(
                 fill_id="fill-audit-exit",
@@ -1343,6 +1351,7 @@ class TestPaperMetricsEndpoint:
                 note="exit_take_profit",
                 mark_30s_after_fill_cents=54.1,
                 pnl_30s_after_fill_cents=-0.1,
+                observed_30s_ts_ms=now_ms - 30_000 + 30_000,
             )
 
             response = client.get("/paper/metrics/outcomes/audit?limit=50")
@@ -1455,6 +1464,7 @@ class TestPaperMetricsEndpoint:
                 note="entry_queue_cleared",
                 mark_30s_after_fill_cents=49.6,
                 pnl_30s_after_fill_cents=0.5,
+                observed_30s_ts_ms=now_ms - 150_000 + 30_000,
             )
             assert store.insert_fill(
                 fill_id="fill-audit-prev-2",
@@ -1468,6 +1478,7 @@ class TestPaperMetricsEndpoint:
                 note="entry_queue_cleared",
                 mark_30s_after_fill_cents=51.3,
                 pnl_30s_after_fill_cents=0.2,
+                observed_30s_ts_ms=now_ms - 90_000 + 30_000,
             )
 
             response = client.get("/paper/metrics/outcomes/audit?limit=10")
@@ -1606,6 +1617,7 @@ class TestPaperMetricsEndpoint:
                 fill_fee_cents=0.1,
                 note="entry_queue_cleared",
                 pnl_30s_after_fill_cents=0.3,
+                observed_30s_ts_ms=now_ms - 35_000 + 30_000,
             )
             assert store.insert_fill(
                 fill_id="fill-conc-2",
@@ -1618,6 +1630,7 @@ class TestPaperMetricsEndpoint:
                 fill_fee_cents=0.1,
                 note="entry_queue_cleared",
                 pnl_30s_after_fill_cents=-0.2,
+                observed_30s_ts_ms=now_ms - 25_000 + 30_000,
             )
             assert store.insert_fill(
                 fill_id="fill-conc-3",
@@ -1630,6 +1643,7 @@ class TestPaperMetricsEndpoint:
                 fill_fee_cents=0.1,
                 note="entry_moved_through",
                 pnl_30s_after_fill_cents=0.4,
+                observed_30s_ts_ms=now_ms - 15_000 + 30_000,
             )
             assert store.insert_fill(
                 fill_id="fill-conc-exit",
@@ -1642,6 +1656,7 @@ class TestPaperMetricsEndpoint:
                 fill_fee_cents=0.1,
                 note="exit_take_profit",
                 pnl_30s_after_fill_cents=1.0,
+                observed_30s_ts_ms=now_ms - 10_000 + 30_000,
             )
 
             response = client.get("/paper/metrics/outcomes/concentration?window_seconds=3600")

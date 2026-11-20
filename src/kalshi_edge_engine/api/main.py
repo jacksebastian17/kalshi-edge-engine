@@ -33,17 +33,9 @@ from kalshi_edge_engine.runtime.paper_exit_runtime import (
     _close_position as _runtime_close_position,
 )
 from kalshi_edge_engine.runtime.paper_exit_runtime import (
-    _fetch_mark_price_cents as _runtime_fetch_mark_price_cents,
-)
-from kalshi_edge_engine.runtime.paper_exit_runtime import (
-    _get_mark_price_for_position as _runtime_get_mark_price_for_position,
-)
-from kalshi_edge_engine.runtime.paper_exit_runtime import (
     _maybe_close_position_take_profit as _runtime_maybe_close_position_take_profit,
 )
-from kalshi_edge_engine.runtime.paper_exit_runtime import (
-    _update_fill_30s_outcomes as _runtime_update_fill_30s_outcomes,
-)
+from kalshi_edge_engine.runtime.paper_exit_runtime import _paper_maintenance_loop
 from kalshi_edge_engine.runtime.paper_runtime import _init_paper_store as _runtime_init_paper_store
 from kalshi_edge_engine.runtime.paper_runtime import (
     _process_paper_intents as _runtime_process_paper_intents,
@@ -236,8 +228,8 @@ class PaperPnLSnapshotResponse(BaseModel):
 
     ts_ms: int
     realized_pnl_cents: float
-    unrealized_pnl_cents: float
-    total_pnl_cents: float
+    unrealized_pnl_cents: float | None
+    total_pnl_cents: float | None
     open_positions_count: int
     open_orders_count: int
 
@@ -249,8 +241,8 @@ class PaperTradingSummaryResponse(BaseModel):
     total_fills: int
     total_positions: int
     realized_pnl_cents: float
-    unrealized_pnl_cents: float
-    total_pnl_cents: float
+    unrealized_pnl_cents: float | None
+    total_pnl_cents: float | None
     latest_snapshot_ts_ms: int | None
 
 
@@ -449,28 +441,6 @@ def _init_paper_store() -> None:
     _sync_legacy_from_runtime()
 
 
-def _get_mark_price_for_position(
-    ticker: str,
-    side: str,
-    snapshot: TopSignalsSnapshot | None,
-) -> float | None:
-    return _runtime_get_mark_price_for_position(ticker, side, snapshot)
-
-
-async def _fetch_mark_price_cents(
-    client: KalshiClient,
-    ticker: str,
-    side: str,
-) -> float | None:
-    return await _runtime_fetch_mark_price_cents(client, ticker, side)
-
-
-async def _update_fill_30s_outcomes(*, client: KalshiClient, now_ms: int) -> None:
-    _sync_runtime_from_legacy()
-    await _runtime_update_fill_30s_outcomes(client=client, now_ms=now_ms)
-    _sync_legacy_from_runtime()
-
-
 def _close_position(
     *,
     ticker: str,
@@ -540,6 +510,7 @@ async def _process_paper_intents(
 
 async def _nba_scanner_loop(client: KalshiClient) -> None:
     _sync_runtime_from_legacy()
+    maintenance = asyncio.create_task(_paper_maintenance_loop(client))
     try:
         await _runtime_nba_scanner_loop(
             client,
@@ -548,6 +519,9 @@ async def _nba_scanner_loop(client: KalshiClient) -> None:
             top_signals_snapshot_model=TopSignalsSnapshot,
         )
     finally:
+        maintenance.cancel()
+        await asyncio.gather(maintenance, return_exceptions=True)
+        runtime_state.paper_liquidation_marks = {}
         _sync_legacy_from_runtime()
 
 
@@ -1189,7 +1163,9 @@ async def get_paper_positions() -> dict[str, Any]:
 
     positions = _paper_store.get_positions()
     # Use authoritative compute_paper_metrics for consistency
-    metrics = _paper_store.compute_paper_metrics()
+    metrics = _paper_store.compute_paper_metrics(
+        liquidation_marks=runtime_state.paper_liquidation_marks
+    )
     return {
         "positions": positions,
         "count": metrics["open_positions_count"],
@@ -1229,7 +1205,9 @@ async def get_paper_summary() -> dict[str, Any]:
         raise HTTPException(status_code=503, detail="Paper trading not enabled")
 
     # Use authoritative compute_paper_metrics for consistency
-    metrics = _paper_store.compute_paper_metrics()
+    metrics = _paper_store.compute_paper_metrics(
+        liquidation_marks=runtime_state.paper_liquidation_marks
+    )
     snapshot = _paper_store.get_latest_pnl_snapshot()
     nba_effective = runtime_config.get_effective_paper_config("NBA")
 
@@ -1274,6 +1252,18 @@ async def get_paper_summary() -> dict[str, Any]:
         "realized_pnl_cents": metrics["realized_pnl_cents"],
         "unrealized_pnl_cents": metrics.get("unrealized_pnl_cents", 0.0),
         "total_pnl_cents": metrics["total_pnl_cents"],
+        "bid_sweep_realized_pnl_cents": metrics["bid_sweep_realized_pnl_cents"],
+        "legacy_realized_balance_cents": metrics["legacy_realized_balance_cents"],
+        "marked_unrealized_pnl_cents": metrics["marked_unrealized_pnl_cents"],
+        "unmarked_contracts": metrics["unmarked_contracts"],
+        "unmarked_cost_basis_cents": metrics["unmarked_cost_basis_cents"],
+        "oldest_mark_ts_ms": metrics["oldest_mark_ts_ms"],
+        "entry_fill_model": "inferred_from_polled_books",
+        "entry_fill_path_evidence": {
+            "queue_cleared": "displayed_size_decrease_may_include_cancels",
+            "moved_through": "higher_same_side_bid_with_heuristic_volume",
+            "price_improves": "heuristic_seller_arrival_at_hypothetical_quote",
+        },
         "intent_fill_rate": metrics.get("intent_fill_rate", 0.0),
         "raw_fills_per_intent_ratio": metrics.get("raw_fills_per_intent_ratio", 0.0),
         "intents_with_at_least_one_fill": metrics.get("intents_with_at_least_one_fill", 0),
@@ -1677,6 +1667,9 @@ async def post_paper_debug_force_fill(request: ForceFillRequest) -> dict[str, An
     if intent is None:
         raise HTTPException(status_code=404, detail="Intent not found")
 
+    if intent_id.startswith("exit_intent:"):
+        raise HTTPException(status_code=400, detail="Expected an entry intent")
+
     already_filled = _paper_store.get_filled_size_for_intent(intent_id)
     size_contracts = int(intent["size_contracts"])
     remaining_before = max(0, size_contracts - already_filled)
@@ -1711,6 +1704,8 @@ async def post_paper_debug_force_fill(request: ForceFillRequest) -> dict[str, An
         best_bid_at_fill_cents=intent.get("last_seen_best_bid"),
         cross_at_fill_cents=intent.get("cross_at_submit_cents"),
         note="debug_fill",
+        apply_to_position=True,
+        execution_source="synthetic_debug",
     )
 
     if not fill_insert_result.inserted_new_fill:
@@ -1732,49 +1727,11 @@ async def post_paper_debug_force_fill(request: ForceFillRequest) -> dict[str, An
             "status": intent.get("status", PAPER_INTENT_STATUS_OPEN),
         }
 
-    positions = _paper_store.get_positions()
-    current_pos = next(
-        (p for p in positions if p["ticker"] == intent["ticker"] and p["side"] == intent["side"]),
-        None,
-    )
-
-    if current_pos:
-        total_cost = (
-            current_pos["avg_entry_price_cents"] * current_pos["net_contracts"]
-            + float(intent["quote_price_cents"]) * actual_fill_size
-        )
-        new_contracts = current_pos["net_contracts"] + actual_fill_size
-        new_avg_price = total_cost / new_contracts if new_contracts > 0 else 0.0
-        _paper_store.upsert_position(
-            ticker=intent["ticker"],
-            side=intent["side"],
-            net_contracts=new_contracts,
-            avg_entry_price_cents=new_avg_price,
-            realized_pnl_cents=current_pos["realized_pnl_cents"],
-            first_open_ts_ms=current_pos["first_open_ts_ms"],
-        )
-    else:
-        _paper_store.upsert_position(
-            ticker=intent["ticker"],
-            side=intent["side"],
-            net_contracts=actual_fill_size,
-            avg_entry_price_cents=float(intent["quote_price_cents"]),
-            realized_pnl_cents=0.0,
-            first_open_ts_ms=int(intent["created_ts_ms"]),
-        )
-
-    _paper_store.update_intent_status(
-        intent_id,
-        PAPER_INTENT_STATUS_FILLED,
-        last_seen_best_bid=intent.get("last_seen_best_bid"),
-        queue_ahead=intent.get("queue_ahead_contracts"),
-    )
-
     return {
         "intent_id": intent_id,
         "filled_size": actual_fill_size,
         "remaining_size": remaining_after,
-        "status": PAPER_INTENT_STATUS_FILLED,
+        "status": PAPER_INTENT_STATUS_FILLED if remaining_after == 0 else PAPER_INTENT_STATUS_OPEN,
     }
 
 
@@ -1853,15 +1810,6 @@ async def lifespan_production(app: FastAPI) -> Any:
     # Shutdown
     try:
         _sync_runtime_from_legacy()
-        # Cancel paper trading simulation tasks
-        for task in _paper_simulation_tasks:
-            if not task.done():
-                task.cancel()
-
-        if _paper_simulation_tasks:
-            await asyncio.gather(*_paper_simulation_tasks, return_exceptions=True)
-            logger.info("paper_simulation_tasks_cancelled")
-
         # Cancel scanner task from app.state, not local variable, to catch tasks
         # started via POST /scanner/start
         current_task = getattr(app.state, "scanner_task", None)
@@ -1871,6 +1819,13 @@ async def lifespan_production(app: FastAPI) -> Any:
                 await current_task
             except asyncio.CancelledError:
                 logger.info("NBA scanner task cancelled on shutdown")
+
+        paper_tasks = list(_paper_simulation_tasks)
+        for task in paper_tasks:
+            task.cancel()
+        if paper_tasks:
+            await asyncio.gather(*paper_tasks, return_exceptions=True)
+            logger.info("paper_simulation_tasks_cancelled")
 
         if hasattr(app.state, "kalshi_client"):
             await app.state.kalshi_client.aclose()

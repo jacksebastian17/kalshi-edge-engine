@@ -4,6 +4,7 @@ import asyncio
 from typing import Any
 
 from kalshi_edge_engine.db.paper_store import PaperStore
+from kalshi_edge_engine.engine.orderbook import LiquidationQuote
 
 
 class _ScannerState:
@@ -53,3 +54,4 @@ last_pnl_snapshot_ts_ms = 0
 paper_ticker_cooldown: dict[str, int] = {}
 paper_intent_timestamps: list[int] = []
 paper_daily_loss_breached: bool = False
+paper_liquidation_marks: dict[tuple[str, str], LiquidationQuote] = {}

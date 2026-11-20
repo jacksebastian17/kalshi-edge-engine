@@ -113,22 +113,16 @@ export function SignalsTable({
                   Reason
                 </th>
                 <th className="px-4 py-2 text-right text-zinc-300 tabular-nums">
-                  Net Edge Y
+                  YES Spread Room After Costs
                 </th>
                 <th className="px-4 py-2 text-right text-zinc-300 tabular-nums">
-                  Net Edge N
+                  NO Spread Room After Costs
                 </th>
                 <th className="px-4 py-2 text-right text-zinc-300 tabular-nums">
-                  Width Y
-                </th>
-                <th className="px-4 py-2 text-right text-zinc-300 tabular-nums">
-                  Width N
+                  Quoted Spread
                 </th>
                 <th className="px-4 py-2 text-right text-zinc-300 tabular-nums">
                   Liquidity
-                </th>
-                <th className="px-4 py-2 text-right text-zinc-300 tabular-nums">
-                  Gap
                 </th>
               </tr>
             </thead>
@@ -163,16 +157,10 @@ export function SignalsTable({
                     {formatEdge(signal.net_edge_no)}
                   </td>
                   <td className="px-4 py-2 text-right text-zinc-300 tabular-nums">
-                    {formatEdge(signal.inside_width_yes)}
-                  </td>
-                  <td className="px-4 py-2 text-right text-zinc-300 tabular-nums">
-                    {formatEdge(signal.inside_width_no)}
+                    {formatEdge(signal.inside_width_yes ?? signal.inside_width_no)}
                   </td>
                   <td className="px-4 py-2 text-right text-zinc-300 tabular-nums">
                     {formatLiquidity(signal.top_liquidity)}
-                  </td>
-                  <td className="px-4 py-2 text-right text-zinc-300 tabular-nums">
-                    {formatEdge(signal.imbalance_gap)}
                   </td>
                 </tr>
               ))}

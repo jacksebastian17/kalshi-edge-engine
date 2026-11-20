@@ -6,18 +6,11 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from kalshi_edge_engine.engine.position_exit import decide_position_exit
 from kalshi_edge_engine.engine.signal import Signal, score_signal
 from kalshi_edge_engine.engine.universe import discover_nba_universe
 from kalshi_edge_engine.kalshi.client import KalshiClient
 from kalshi_edge_engine.runtime import config as runtime_config
 from kalshi_edge_engine.runtime import state as runtime_state
-from kalshi_edge_engine.runtime.paper_exit_runtime import (
-    _close_position,
-    _fetch_mark_price_cents,
-    _get_mark_price_for_position,
-    _update_fill_30s_outcomes,
-)
 from kalshi_edge_engine.runtime.paper_runtime import _process_paper_intents
 from kalshi_edge_engine.universes.cbb import discover_cbb_universe
 
@@ -239,118 +232,6 @@ async def _nba_scanner_loop(
                     "duration_ms": cycle_duration_ms,
                 },
             )
-
-            if (
-                runtime_config.ENABLE_PAPER_TRADING
-                and runtime_state.paper_store is not None
-                and snapshot_ts_ms - runtime_state.last_pnl_snapshot_ts_ms
-                >= runtime_config.PAPER_PNL_SNAPSHOT_INTERVAL_MS
-            ):
-                try:
-                    positions = runtime_state.paper_store.get_positions()
-
-                    for pos in positions:
-                        mark_price = _get_mark_price_for_position(
-                            ticker=pos["ticker"],
-                            side=pos["side"],
-                            snapshot=runtime_state.top_signals_snapshot,
-                        )
-                        if mark_price is None:
-                            mark_price = await _fetch_mark_price_cents(
-                                client,
-                                pos["ticker"],
-                                pos["side"],
-                            )
-                        if mark_price is None:
-                            continue
-
-                        exit_decision = decide_position_exit(
-                            side=pos["side"],
-                            avg_entry_price_cents=pos["avg_entry_price_cents"],
-                            mark_price_cents=mark_price,
-                            first_open_ts_ms=pos["first_open_ts_ms"],
-                            now_ms=snapshot_ts_ms,
-                            max_hold_seconds=runtime_config.PAPER_MAX_HOLD_SECONDS,
-                            take_profit_cents_per_contract=runtime_config.PAPER_TAKE_PROFIT_CENTS_PER_CONTRACT,
-                        )
-                        if exit_decision.should_close and exit_decision.reason is not None:
-                            _close_position(
-                                ticker=pos["ticker"],
-                                side=pos["side"],
-                                net_contracts=pos["net_contracts"],
-                                avg_entry_price_cents=pos["avg_entry_price_cents"],
-                                realized_pnl_cents=pos.get("realized_pnl_cents", 0.0),
-                                first_open_ts_ms=pos["first_open_ts_ms"],
-                                mark_price_cents=mark_price,
-                                now_ms=snapshot_ts_ms,
-                                reason=exit_decision.reason,
-                            )
-
-                    positions = runtime_state.paper_store.get_positions()
-
-                    mark_price_dict: dict[str, dict[str, float]] = {}
-                    if runtime_state.top_signals_snapshot:
-                        for signal_resp in runtime_state.top_signals_snapshot.signals:
-                            ticker = signal_resp.ticker
-                            if ticker not in mark_price_dict:
-                                mark_price_dict[ticker] = {}
-                            if signal_resp.cross_yes is not None:
-                                mark_price_dict[ticker]["YES"] = signal_resp.cross_yes
-                            if signal_resp.cross_no is not None:
-                                mark_price_dict[ticker]["NO"] = signal_resp.cross_no
-
-                    await _update_fill_30s_outcomes(client=client, now_ms=snapshot_ts_ms)
-
-                    metrics = runtime_state.paper_store.compute_paper_metrics(
-                        mark_price_dict or None
-                    )
-                    realized_pnl_cents = metrics["realized_pnl_cents"]
-                    unrealized_pnl_cents = metrics["unrealized_pnl_cents"]
-                    total_pnl_cents = metrics["total_pnl_cents"]
-                    open_positions_count = metrics["open_positions_count"]
-                    open_orders_count = metrics["open_orders_count"]
-
-                    if (
-                        runtime_config.PAPER_MAX_DAILY_LOSS_CENTS > 0
-                        and total_pnl_cents < -runtime_config.PAPER_MAX_DAILY_LOSS_CENTS
-                        and not runtime_state.paper_daily_loss_breached
-                    ):
-                        runtime_state.paper_daily_loss_breached = True
-                        logger.warning(
-                            "paper_max_daily_loss_breached",
-                            extra={
-                                "total_pnl_cents": total_pnl_cents,
-                                "max_daily_loss_cents": runtime_config.PAPER_MAX_DAILY_LOSS_CENTS,
-                                "notice": "Stopping new intent creation due to MAX_DAILY_LOSS breach",
-                            },
-                        )
-
-                    runtime_state.paper_store.insert_pnl_snapshot(
-                        ts_ms=snapshot_ts_ms,
-                        realized_pnl_cents=realized_pnl_cents,
-                        unrealized_pnl_cents=unrealized_pnl_cents,
-                        open_positions_count=open_positions_count,
-                        open_orders_count=open_orders_count,
-                    )
-
-                    runtime_state.last_pnl_snapshot_ts_ms = snapshot_ts_ms
-
-                    logger.info(
-                        "paper_pnl_snapshot_recorded",
-                        extra={
-                            "realized_pnl_cents": realized_pnl_cents,
-                            "unrealized_pnl_cents": unrealized_pnl_cents,
-                            "total_pnl_cents": total_pnl_cents,
-                            "open_positions_count": open_positions_count,
-                            "open_orders_count": open_orders_count,
-                            "daily_loss_breached": runtime_state.paper_daily_loss_breached,
-                        },
-                    )
-                except Exception as e:
-                    logger.exception(
-                        "paper_pnl_snapshot_error",
-                        extra={"error": str(e)},
-                    )
 
         except asyncio.CancelledError:
             logger.info("scanner_cancelled")

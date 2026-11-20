@@ -340,14 +340,14 @@ def test_take_profit_close_realizes_pnl_and_updates_exit_ts(
         avg_entry_price_cents=50.0,
         realized_pnl_cents=0.0,
         first_open_ts_ms=now_ms,
-        mark_price_cents=53.0,
+        mark_price_cents=55.0,
         now_ms=now_ms + 10_000,
     )
 
     assert closed is True
     assert paper_store.get_positions() == []
 
-    expected_realized = (53.0 - 50.0) * 2 - estimate_taker_fee_cents(53.0, 2)
+    expected_realized = (55.0 - 50.0) * 2 - estimate_taker_fee_cents(55.0, 2)
     actual_realized = paper_store.get_total_realized_pnl_cents()
     assert actual_realized == pytest.approx(expected_realized)
 

@@ -527,7 +527,8 @@ export default function App() {
         if (!active) return
         setPaperPnlSnapshot(snapshot)
         const snapshotTsMs = snapshot.ts_ms
-        if (snapshotTsMs != null) {
+        const totalPnlCents = snapshot.total_pnl_cents
+        if (snapshotTsMs != null && totalPnlCents != null && snapshot.unrealized_pnl_status !== 'legacy_unverified') {
           setPaperPnlHistory((prev) => {
             if (prev.length > 0 && prev[prev.length - 1].tsMs === snapshotTsMs) {
               return prev
@@ -536,7 +537,7 @@ export default function App() {
               ...prev,
               {
                 tsMs: snapshotTsMs,
-                totalPnlCents: snapshot.total_pnl_cents,
+                totalPnlCents,
               },
             ].slice(-MAX_PNL_POINTS)
           })
@@ -998,15 +999,15 @@ export default function App() {
                 </div>
                 <div className="border border-white/10 rounded p-3 bg-zinc-900/40">
                   <p className="text-zinc-500">Realized PnL</p>
-                  <p className="text-zinc-100 tabular-nums mt-1">{formatCurrencyCents(paperPnlSnapshot?.realized_pnl_cents ?? paperSummary?.realized_pnl_cents)}</p>
+                  <p className="text-zinc-100 tabular-nums mt-1">{formatCurrencyCents(paperSummary?.realized_pnl_cents)}</p>
                 </div>
                 <div className="border border-white/10 rounded p-3 bg-zinc-900/40">
                   <p className="text-zinc-500">Unrealized PnL</p>
-                  <p className="text-zinc-100 tabular-nums mt-1">{formatCurrencyCents(paperPnlSnapshot?.unrealized_pnl_cents ?? paperSummary?.unrealized_pnl_cents)}</p>
+                  <p className="text-zinc-100 tabular-nums mt-1">{formatCurrencyCents(paperSummary?.unrealized_pnl_cents)}</p>
                 </div>
                 <div className="border border-white/10 rounded p-3 bg-zinc-900/40">
                   <p className="text-zinc-500">Total PnL</p>
-                  <p className="text-zinc-100 tabular-nums mt-1">{formatCurrencyCents(paperPnlSnapshot?.total_pnl_cents ?? paperSummary?.total_pnl_cents)}</p>
+                  <p className="text-zinc-100 tabular-nums mt-1">{formatCurrencyCents(paperSummary?.total_pnl_cents)}</p>
                 </div>
                 <div className="border border-white/10 rounded p-3 bg-zinc-900/40">
                   <p className="text-zinc-500">Open Pos / Orders</p>
@@ -1015,6 +1016,14 @@ export default function App() {
                   </p>
                 </div>
               </div>
+
+              {(paperSummary?.unrealized_unmarked_positions_count ?? 0) > 0 && (
+                <p className="text-xs text-amber-300">
+                  {paperSummary?.unrealized_unmarked_positions_count} positions unmarked
+                  ({paperSummary?.unmarked_contracts} contracts, {formatCurrencyCents(paperSummary?.unmarked_cost_basis_cents)} cost).
+                  {' '}Marked positions subtotal {formatCurrencyCents(paperSummary?.marked_unrealized_pnl_cents)}.
+                </p>
+              )}
 
               <MiniPnlChart points={paperPnlHistory} />
 

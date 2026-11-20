@@ -13,13 +13,13 @@ def compute_price_delta_cents_per_contract(
     avg_entry_price_cents: float,
     mark_price_cents: float,
 ) -> float:
-    """Compute side-aware per-contract price delta in cents.
+    """Compute the price change for a long contract in its own price coordinates.
 
     Positive values indicate profitable movement.
     """
-    if side == "YES":
-        return mark_price_cents - avg_entry_price_cents
-    return avg_entry_price_cents - mark_price_cents
+    if side.upper() not in ("YES", "NO"):
+        raise ValueError(f"Invalid contract side: {side}")
+    return mark_price_cents - avg_entry_price_cents
 
 
 def should_take_profit(
@@ -87,6 +87,7 @@ def decide_position_exit(
     now_ms: int,
     max_hold_seconds: int,
     take_profit_cents_per_contract: float,
+    liquidation_fees_cents_per_contract: float = 0.0,
 ) -> PositionExitDecision:
     """Decide if position should be closed at current mark.
 
@@ -97,7 +98,7 @@ def decide_position_exit(
     if should_take_profit(
         side=side,
         avg_entry_price_cents=avg_entry_price_cents,
-        mark_price_cents=mark_price_cents,
+        mark_price_cents=mark_price_cents - liquidation_fees_cents_per_contract,
         take_profit_cents_per_contract=take_profit_cents_per_contract,
     ):
         return PositionExitDecision(should_close=True, reason="take_profit")

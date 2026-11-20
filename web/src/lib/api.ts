@@ -94,8 +94,9 @@ export interface PaperPosition {
 export interface PaperPnlSnapshot {
   ts_ms: number | null
   realized_pnl_cents: number
-  unrealized_pnl_cents: number
-  total_pnl_cents: number
+  unrealized_pnl_cents: number | null
+  total_pnl_cents: number | null
+  unrealized_pnl_status?: string
   open_positions_count: number
   open_orders_count: number
 }
@@ -106,8 +107,11 @@ export interface PaperSummaryResponse {
   total_fills: number
   total_positions: number
   realized_pnl_cents: number
-  unrealized_pnl_cents: number
-  total_pnl_cents: number
+  unrealized_pnl_cents: number | null
+  total_pnl_cents: number | null
+  marked_unrealized_pnl_cents?: number | null
+  unmarked_contracts?: number
+  unmarked_cost_basis_cents?: number
   latest_snapshot_ts_ms: number | null
   intent_fill_rate?: number
   raw_fills_per_intent_ratio?: number

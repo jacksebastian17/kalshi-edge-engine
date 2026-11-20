@@ -42,7 +42,7 @@ def test_should_take_profit_no_side_per_contract() -> None:
         should_take_profit(
             side="NO",
             avg_entry_price_cents=48.0,
-            mark_price_cents=45.5,
+            mark_price_cents=50.5,
             take_profit_cents_per_contract=2.0,
         )
         is True
@@ -51,7 +51,7 @@ def test_should_take_profit_no_side_per_contract() -> None:
         should_take_profit(
             side="NO",
             avg_entry_price_cents=48.0,
-            mark_price_cents=47.0,
+            mark_price_cents=49.0,
             take_profit_cents_per_contract=2.0,
         )
         is False
@@ -95,11 +95,11 @@ def test_compute_realized_exit_pnl_includes_fees_yes_no() -> None:
     no_realized = compute_realized_exit_pnl_cents(
         side="NO",
         avg_entry_price_cents=48.0,
-        mark_price_cents=44.0,
+        mark_price_cents=53.0,
         net_contracts=2,
         exit_fee_cents=0.75,
     )
-    assert no_realized == pytest.approx((48.0 - 44.0) * 2 - 0.75)
+    assert no_realized == pytest.approx((53.0 - 48.0) * 2 - 0.75)
 
 
 def test_decide_position_exit_priority_take_profit_then_time_stop() -> None:

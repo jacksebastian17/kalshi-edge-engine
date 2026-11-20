@@ -72,8 +72,8 @@ class Signal:
 
     ticker: str
     reason_code: str  # One of VALID_REASON_CODES
-    net_edge_yes: float | None  # inside_width_yes - fees - safety_buffer (cents)
-    net_edge_no: float | None  # inside_width_no - fees - safety_buffer (cents)
+    net_edge_yes: float | None  # YES implied ask minus intended bid, modeled fees and buffer
+    net_edge_no: float | None  # NO implied ask minus intended bid, modeled fees and buffer
     inside_width_yes: float | None  # cross_yes - bid_yes (market-making room on YES)
     inside_width_no: float | None  # cross_no - bid_no (market-making room on NO)
     bid_yes: float | None  # Best YES bid
@@ -81,7 +81,7 @@ class Signal:
     bid_no: float | None  # Best NO bid
     cross_no: float | None  # Cross price for NO (100 - best_yes_bid)
     bid_sum: float | None  # Structural sum of best bids (best_yes_bid + best_no_bid)
-    imbalance_gap: float | None  # Structural gap from par (100 - bid_sum)
+    imbalance_gap: float | None  # Compatibility alias for the quoted spread (100 - bid_sum)
     fee_yes: float | None  # Entry fee for YES side (cents)
     fee_no: float | None  # Entry fee for NO side (cents)
     fee_exit_yes: float | None  # Exit fee for YES side (cents, if round_trip=True)
@@ -122,9 +122,9 @@ def score_signal(
      Strategy:
      1. Parse orderbook to extract best bids and cross prices for YES and NO
      2. Calculate inside width on each side (cross - bid)
-     3. Compute structural metrics: bid_sum and imbalance_gap
+     3. Use the quoted spread as both the inside width and the legacy imbalance_gap
      4. Compute dynamic Kalshi fees based on bid prices for each side
-     5. Compute net edge (inside_width - total_fees - safety_buffer)
+     5. Score implied ask minus intended quote, estimated fees and safety buffer
         - If round_trip=False: total_fees = entry_fee only
         - If round_trip=True: total_fees = entry_fee + exit_fee (taker at cross price)
      6. Check eligibility:

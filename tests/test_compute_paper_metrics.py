@@ -313,8 +313,12 @@ class TestComputePaperMetrics:
 
         # Expected unrealized PnL
         # Price component: (mark - entry) * contracts = (55 - 50) * 3 = 15
-        # Fee component: -2
-        expected_unrealized = (mark_price - entry_price) * contracts - entry_fee
+        # Fees: stored entry fees and estimated fee for an immediate sale.
+        expected_unrealized = (
+            (mark_price - entry_price) * contracts
+            - entry_fee
+            - estimate_taker_fee_cents(mark_price, contracts)
+        )
         expected_realized = 10.0
         expected_total = expected_realized + expected_unrealized
 
@@ -328,10 +332,10 @@ class TestComputePaperMetrics:
             metrics["realized_pnl_cents"] + metrics["unrealized_pnl_cents"]
         )
 
-    def test_compute_metrics_without_mark_prices_returns_zero_unrealized(
+    def test_compute_metrics_without_mark_prices_exposes_missing_total(
         self, paper_store: PaperStore
     ):
-        """Test that compute_paper_metrics returns 0 unrealized when no marks provided."""
+        """Missing marks leave both unrealized and aggregate PnL unknown."""
         now_ms = int(time.time() * 1000)
         ticker = "NBA_NO_MARKS"
         side = "YES"
@@ -350,8 +354,9 @@ class TestComputePaperMetrics:
         metrics = paper_store.compute_paper_metrics()
 
         assert metrics["realized_pnl_cents"] == 25.0
-        assert metrics["unrealized_pnl_cents"] == 0.0
-        assert metrics["total_pnl_cents"] == 25.0
+        assert metrics["unrealized_pnl_cents"] is None
+        assert metrics["total_pnl_cents"] is None
+        assert metrics["unrealized_unmarked_positions_count"] == 1
 
     def test_compute_metrics_multiple_positions_both_sides(self, paper_store: PaperStore):
         """Test compute_paper_metrics with multiple positions on both YES and NO sides.
@@ -493,7 +498,7 @@ class TestComputePaperMetrics:
         )
 
         metrics = paper_store.compute_paper_metrics({ticker: {side: 55.0}})
-        expected_unrealized = ((55.0 - 50.0) * 2) - entry_fee
+        expected_unrealized = (55.0 - 50.0) * 2 - entry_fee - estimate_taker_fee_cents(55, 2)
 
         assert metrics["unrealized_pnl_cents"] == pytest.approx(expected_unrealized)
 
@@ -525,8 +530,8 @@ class TestComputePaperMetrics:
             }
         )
 
-        expected_yes = (55.0 - 50.0) * 2
-        expected_no = (60.0 - 58.0) * 3
+        expected_yes = (55.0 - 50.0) * 2 - estimate_taker_fee_cents(55, 2)
+        expected_no = (58.0 - 60.0) * 3 - estimate_taker_fee_cents(58, 3)
         assert metrics["unrealized_pnl_cents"] == pytest.approx(expected_yes + expected_no)
 
     def test_compute_metrics_unrealized_ignores_exit_take_profit_fees(
@@ -594,7 +599,9 @@ class TestComputePaperMetrics:
         )
 
         metrics = paper_store.compute_paper_metrics({ticker: {side: 53.0}})
-        assert metrics["unrealized_pnl_cents"] == pytest.approx((53.0 - 51.0) - 1.25)
+        assert metrics["unrealized_pnl_cents"] == pytest.approx(
+            (53.0 - 51.0) - 1.25 - estimate_taker_fee_cents(53, 1)
+        )
 
     def test_compute_metrics_reopened_position_excludes_old_cycle_entry_fees(
         self, paper_store: PaperStore
@@ -686,8 +693,10 @@ class TestComputePaperMetrics:
         )
 
         metrics = paper_store.compute_paper_metrics({ticker: {side: 55.0}})
-        # Price PnL = (55 - 50) * 1 = 5.0; only new-cycle fee 1.0 should apply.
-        assert metrics["unrealized_pnl_cents"] == pytest.approx(4.0)
+        # Deduct the current lifecycle entry fee and the estimated liquidation fee.
+        assert metrics["unrealized_pnl_cents"] == pytest.approx(
+            5 - 1 - estimate_taker_fee_cents(55, 1)
+        )
 
     def test_compute_metrics_entry_only_metrics_exclude_exit_intents(
         self, paper_store: PaperStore

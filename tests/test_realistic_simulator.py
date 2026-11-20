@@ -487,8 +487,8 @@ class TestRealisticOrderSimulator:
         )
 
         assert len(observed_queue) >= 2
-        assert observed_queue[0] == 8
-        assert observed_queue[1] == 2
+        assert observed_queue[0] == 10
+        assert observed_queue[1] == 4
 
     @pytest.mark.asyncio
     async def test_queue_ahead_absorbs_traded_volume_no_fill(self, mock_client: AsyncMock) -> None:

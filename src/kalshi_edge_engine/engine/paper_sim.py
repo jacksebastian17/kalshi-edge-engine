@@ -9,6 +9,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from kalshi_edge_engine.engine.position_exit import compute_price_delta_cents_per_contract
 from kalshi_edge_engine.kalshi.client import KalshiClient
 
 logger = logging.getLogger(__name__)
@@ -173,9 +174,8 @@ def compute_simulator_diagnostics(
             traded_volume = max(0, last_best_size_at_bid - best_size_at_bid)
             traded_volume_source = "observed_size_delta"
         else:
-            # Fall back to simulated volume only when no size delta available
-            traded_volume = simulated_volume_per_poll
-            traded_volume_source = "heuristic_fallback_proxy"
+            traded_volume = 0
+            traded_volume_source = "no_consecutive_quote_level_observation"
     else:
         traded_volume = 0
 
@@ -196,6 +196,7 @@ def compute_simulator_diagnostics(
         "best_size_at_bid": best_size_at_bid,
         "traded_volume_estimate": traded_volume,
         "traded_volume_source": traded_volume_source,
+        "volume_is_confirmed_trade_data": False,
         "queue_ahead_before": queue_ahead,
         "queue_ahead_after": queue_ahead_after,
         "eligibility": {
@@ -265,6 +266,7 @@ class Fill:
     best_bid_at_fill_cents: float | None = None
     cross_at_fill_cents: float | None = None
     fill_path_type: str | None = None
+    execution_source: str = "simulated_polling_inference"
 
 
 @dataclass
@@ -279,19 +281,24 @@ class Position:
     mark_price_cents: float | None = None
 
     @property
-    def unrealized_pnl_cents(self) -> float:
+    def unrealized_pnl_cents(self) -> float | None:
         """Compute unrealized PnL if mark available."""
         if self.mark_price_cents is None:
-            return 0.0
-        if self.side == "YES":
-            return (self.mark_price_cents - self.avg_entry_price_cents) * self.net_contracts
-        else:
-            return (self.avg_entry_price_cents - self.mark_price_cents) * self.net_contracts
+            return None
+        return (
+            compute_price_delta_cents_per_contract(
+                side=self.side,
+                avg_entry_price_cents=self.avg_entry_price_cents,
+                mark_price_cents=self.mark_price_cents,
+            )
+            * self.net_contracts
+        )
 
     @property
-    def total_pnl_cents(self) -> float:
+    def total_pnl_cents(self) -> float | None:
         """Total PnL (realized + unrealized)."""
-        return self.realized_pnl_cents + self.unrealized_pnl_cents
+        unrealized = self.unrealized_pnl_cents
+        return None if unrealized is None else self.realized_pnl_cents + unrealized
 
 
 class RealisticOrderSimulator:
@@ -360,6 +367,7 @@ class RealisticOrderSimulator:
         latest_diagnostics: dict[str, Any] | None = None
         queue_initialized = False
         poll_count = 0
+        fill_sequence = 0
 
         while elapsed_ms < horizon_ms and remaining_size > 0:
             try:
@@ -376,7 +384,7 @@ class RealisticOrderSimulator:
                 latest_diagnostics = diagnostics
                 poll_count += 1
 
-                best_bid = diagnostics["best_bid"]
+                best_bid = diagnostics["market_best_bid"]
                 best_size_at_bid = diagnostics["best_size_at_bid"]
                 cross_yes = diagnostics["cross_yes"]
                 cross_no = diagnostics["cross_no"]
@@ -443,8 +451,72 @@ class RealisticOrderSimulator:
                         },
                     )
 
+                fill_size = 0
+                fill_path: str | None = None
+                source: str | None = None
+                at_displayed_quote = eligibility["at_best_price"] and not price_improves
+                if eligibility["price_moved_through"]:
+                    if random.random() < self.fill_probability_price_moved:
+                        available = _estimate_moved_through_available_volume(
+                            traded_volume_estimate=traded_volume,
+                            simulated_volume_per_poll=self.simulated_volume_per_poll,
+                        )
+                        fill_size = _conservative_participation_fill_size(
+                            remaining_size=remaining_size,
+                            available_volume_estimate=available,
+                            participation_rate=self.moved_through_participation_rate,
+                            per_poll_cap_contracts=self.moved_through_fill_cap_contracts_per_poll,
+                        )
+                        fill_path = "moved_through"
+                        source = "simulated_higher_bid_heuristic"
+                elif price_improves:
+                    if random.random() < self.fill_probability_price_improves:
+                        available = _estimate_price_improving_arrival_volume(
+                            simulated_volume_per_poll=self.simulated_volume_per_poll,
+                        )
+                        fill_size = _conservative_participation_fill_size(
+                            remaining_size=remaining_size,
+                            available_volume_estimate=available,
+                            participation_rate=self.price_improve_participation_rate,
+                            per_poll_cap_contracts=self.price_improve_fill_cap_contracts_per_poll,
+                        )
+                        fill_path = "price_improves"
+                        source = "simulated_seller_arrival_heuristic"
+                elif at_displayed_quote:
+                    remaining_proxy_volume = traded_volume - queue_ahead_before_decrement
+                    if (
+                        remaining_proxy_volume > 0
+                        and random.random() < self.fill_probability_at_best
+                    ):
+                        fill_size = min(remaining_size, remaining_proxy_volume)
+                        fill_path = "queue_cleared"
+                        source = "simulated_displayed_size_decrease"
+
+                last_best_size_at_bid = best_size_at_bid if at_displayed_quote else None
+                if not at_displayed_quote:
+                    queue_initialized = False
+                    queue_ahead = 0
+                fill = None
+                if fill_size > 0 and fill_path is not None and source is not None:
+                    fill_sequence += 1
+                    fill = Fill(
+                        id=_build_fill_id(order.id, now_ms, fill_sequence),
+                        order_id=order.id,
+                        fill_ts_ms=now_ms,
+                        fill_price_cents=order.quote_price_cents,
+                        fill_size=fill_size,
+                        remaining_size=remaining_size - fill_size,
+                        queue_ahead_at_fill=0 if price_improves else queue_ahead,
+                        fill_fee_cents=order.effective_entry_fee_per_contract_cents * fill_size,
+                        best_bid_at_fill_cents=best_bid,
+                        cross_at_fill_cents=cross_yes if order.side == "YES" else cross_no,
+                        fill_path_type=fill_path,
+                        execution_source=source,
+                    )
+
+                accepted = None
                 if on_poll is not None:
-                    callback_result = on_poll(
+                    accepted = on_poll(
                         {
                             "intent_id": order.id,
                             "ticker": order.ticker,
@@ -453,188 +525,31 @@ class RealisticOrderSimulator:
                             "queue_ahead_contracts": queue_ahead,
                             "last_update_ts_ms": now_ms,
                             "diagnostics": diagnostics,
+                            "fill": fill,
                         }
                     )
-                    if asyncio.iscoroutine(callback_result):
-                        await callback_result
-
-                # Check for fill
-                if eligibility["has_best_bid"]:
-                    if eligibility["price_moved_through"]:
-                        # Price moved through us.
-                        # Old behavior filled full remaining size, which was optimistic because
-                        # moved-through doesn't guarantee all of our queue was matched.
-                        # New behavior uses a conservative volume-based proxy and per-poll cap.
-                        if random.random() < self.fill_probability_price_moved:
-                            available_volume_estimate = _estimate_moved_through_available_volume(
-                                traded_volume_estimate=traded_volume,
-                                simulated_volume_per_poll=self.simulated_volume_per_poll,
-                            )
-                            fill_size = _conservative_participation_fill_size(
-                                remaining_size=remaining_size,
-                                available_volume_estimate=available_volume_estimate,
-                                participation_rate=self.moved_through_participation_rate,
-                                per_poll_cap_contracts=self.moved_through_fill_cap_contracts_per_poll,
-                            )
-                            if fill_size <= 0:
-                                continue
-                            fill_ts_ms = now_ms
-                            # Capture cross at fill time for telemetry
-                            cross_at_fill = cross_yes if order.side == "YES" else cross_no
-                            fill = Fill(
-                                id=_build_fill_id(order.id, fill_ts_ms, len(fills) + 1),
-                                order_id=order.id,
-                                fill_ts_ms=fill_ts_ms,
-                                fill_price_cents=order.quote_price_cents,
-                                fill_size=fill_size,
-                                remaining_size=remaining_size - fill_size,
-                                queue_ahead_at_fill=queue_ahead,
-                                fill_fee_cents=order.effective_entry_fee_per_contract_cents
-                                * fill_size,
-                                best_bid_at_fill_cents=best_bid,
-                                cross_at_fill_cents=cross_at_fill,
-                                fill_path_type="moved_through",
-                            )
-                            fills.append(fill)
-                            remaining_size = fill.remaining_size
-                            logger.info(
-                                "paper_realistic_fill_price_moved",
-                                extra={
-                                    "intent_id": order.id,
-                                    "ticker": order.ticker,
-                                    "side": order.side,
-                                    "fill_path_type": "moved_through",
-                                    "fill_price": order.quote_price_cents,
-                                    "fill_size": fill_size,
-                                    "remaining_size": remaining_size,
-                                    "estimated_traded_volume": traded_volume,
-                                    "available_volume_estimate": available_volume_estimate,
-                                    "fill_sizing_rule": "heuristic_volume_capped_participation",
-                                    "remaining": remaining_size,
-                                },
-                            )
-
-                    elif eligibility["at_best_price"]:
-                        if price_improves:
-                            # Price-improving quote fill path (heuristic):
-                            # no observed queue delta exists at our synthetic improved level,
-                            # so fills are modeled as conservative seller-arrival events.
-                            if (
-                                remaining_size > 0
-                                and random.random() < self.fill_probability_price_improves
-                            ):
-                                arrival_volume_estimate = _estimate_price_improving_arrival_volume(
-                                    simulated_volume_per_poll=self.simulated_volume_per_poll,
-                                )
-                                fill_size = _conservative_participation_fill_size(
-                                    remaining_size=remaining_size,
-                                    available_volume_estimate=arrival_volume_estimate,
-                                    participation_rate=self.price_improve_participation_rate,
-                                    per_poll_cap_contracts=self.price_improve_fill_cap_contracts_per_poll,
-                                )
-                                if fill_size <= 0:
-                                    continue
-                                fill_ts_ms = now_ms
-                                # Capture cross at fill time for telemetry
-                                cross_at_fill = cross_yes if order.side == "YES" else cross_no
-                                fill = Fill(
-                                    id=_build_fill_id(order.id, fill_ts_ms, len(fills) + 1),
-                                    order_id=order.id,
-                                    fill_ts_ms=fill_ts_ms,
-                                    fill_price_cents=order.quote_price_cents,
-                                    fill_size=fill_size,
-                                    remaining_size=remaining_size - fill_size,
-                                    queue_ahead_at_fill=0,
-                                    fill_fee_cents=order.effective_entry_fee_per_contract_cents
-                                    * fill_size,
-                                    best_bid_at_fill_cents=best_bid,
-                                    cross_at_fill_cents=cross_at_fill,
-                                    fill_path_type="price_improves",
-                                )
-                                fills.append(fill)
-                                remaining_size = fill.remaining_size
-                                logger.info(
-                                    "paper_realistic_fill_price_improves_arrival",
-                                    extra={
-                                        "intent_id": order.id,
-                                        "ticker": order.ticker,
-                                        "side": order.side,
-                                        "fill_path_type": "price_improves",
-                                        "fill_price": order.quote_price_cents,
-                                        "fill_size": fill_size,
-                                        "arrival_volume_estimate": arrival_volume_estimate,
-                                        "estimated_traded_volume": traded_volume,
-                                        "fill_sizing_rule": "heuristic_seller_arrival_capped_participation",
-                                        "remaining": remaining_size,
-                                    },
-                                )
-                        else:
-                            # Non-price-improving order: queue model fill path.
-                            # Separate queue consumption from our fill eligibility:
-                            # traded_volume is first consumed by queue ahead, remaining goes to us.
-                            queue_ahead_before_fill_check = queue_ahead_before_decrement
-                            consumed_by_ahead = min(queue_ahead_before_fill_check, traded_volume)
-                            remaining_trade = traded_volume - consumed_by_ahead
-
-                            # Only fill if queue is cleared AND we have remaining trade volume
-                            if (
-                                queue_ahead_before_fill_check - consumed_by_ahead <= 0
-                                and remaining_trade > 0
-                                and remaining_size > 0
-                                and random.random() < self.fill_probability_at_best
-                            ):
-                                # We're at front of queue, fill is probabilistic
-                                fill_size = min(remaining_size, max(1, remaining_trade))
-                                fill_ts_ms = now_ms
-                                # Capture cross at fill time for telemetry
-                                cross_at_fill = cross_yes if order.side == "YES" else cross_no
-                                fill = Fill(
-                                    id=_build_fill_id(order.id, fill_ts_ms, len(fills) + 1),
-                                    order_id=order.id,
-                                    fill_ts_ms=fill_ts_ms,
-                                    fill_price_cents=order.quote_price_cents,
-                                    fill_size=fill_size,
-                                    remaining_size=remaining_size - fill_size,
-                                    queue_ahead_at_fill=queue_ahead,
-                                    fill_fee_cents=order.effective_entry_fee_per_contract_cents
-                                    * fill_size,
-                                    best_bid_at_fill_cents=best_bid,
-                                    cross_at_fill_cents=cross_at_fill,
-                                    fill_path_type="queue_cleared",
-                                )
-                                fills.append(fill)
-                                remaining_size = fill.remaining_size
-                                logger.info(
-                                    "paper_realistic_fill_queue_cleared",
-                                    extra={
-                                        "intent_id": order.id,
-                                        "ticker": order.ticker,
-                                        "side": order.side,
-                                        "fill_path_type": "queue_cleared",
-                                        "fill_price": order.quote_price_cents,
-                                        "fill_size": fill_size,
-                                        "remaining": remaining_size,
-                                        "traded_volume": traded_volume,
-                                        "queue_ahead_at_fill": queue_ahead,
-                                        "queue_ahead_before_poll": queue_ahead_before_poll,
-                                        "queue_ahead_after_poll": queue_ahead,
-                                        "remaining_trade_after_queue": remaining_trade,
-                                        "fill_sizing_rule": "observed_queue_and_volume",
-                                    },
-                                )
-
-                    elif eligibility["price_moved_away"]:
-                        # Price moved away - no fill
-                        pass
-
-                    # Update for next iteration
-                    last_best_size_at_bid = best_size_at_bid
+                    if asyncio.iscoroutine(accepted):
+                        accepted = await accepted
+                if fill is not None and accepted is not False:
+                    fills.append(fill)
+                    remaining_size = fill.remaining_size
+                    logger.info(
+                        "paper_simulated_entry_fill",
+                        extra={
+                            "fill_id": fill.id,
+                            "fill_size": fill_size,
+                            "execution_source": source,
+                        },
+                    )
 
                 if remaining_size == 0:
                     exit_reason = "filled"
                     break
 
             except Exception as e:
+                last_best_size_at_bid = None
+                queue_initialized = False
+                queue_ahead = 0
                 logger.debug(
                     "paper_realistic_fill_poll_error",
                     extra={

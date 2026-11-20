@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from kalshi_edge_engine.engine.fees import estimate_maker_fee_cents
+from kalshi_edge_engine.engine.fees import estimate_maker_fee_cents, estimate_taker_fee_cents
 from kalshi_edge_engine.engine.paper import (
     QuoteIntent,
     build_quote_intents,
@@ -340,10 +340,10 @@ class TestSimulateFill:
         assert outcome.pnl_cents == 0.0
 
     @pytest.mark.asyncio
-    async def test_mark_to_market_outcome_charges_entry_fee_only(
+    async def test_legacy_outcome_uses_bid_liquidation_and_both_fees(
         self, sample_valid_signal: Signal
     ) -> None:
-        """Round-trip flag should not add synthetic exit fee without an exit trade."""
+        """The legacy outcome is a net liquidation estimate on displayed bids."""
         intent = QuoteIntent(
             id="test-intent-6",
             ticker=sample_valid_signal.ticker,
@@ -371,4 +371,7 @@ class TestSimulateFill:
         expected_entry_fee = estimate_maker_fee_cents(
             intent.quote_price_cents, intent.size_contracts
         )
-        assert outcome.total_fees_cents == pytest.approx(expected_entry_fee)
+        expected_fees = expected_entry_fee + estimate_taker_fee_cents(51, 1)
+        assert outcome.exit_price_cents == 51
+        assert outcome.total_fees_cents == pytest.approx(expected_fees)
+        assert outcome.pnl_cents == pytest.approx(51 - 50 - expected_fees)

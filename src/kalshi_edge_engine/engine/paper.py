@@ -228,7 +228,7 @@ async def simulate_fill(
     - NO intent considered filled if best_no_bid >= quote_price
     - On fill:
         - record PaperFill
-        - compute mark price using cross price at fill
+        - price a paper liquidation against displayed bid depth
         - compute entry fee using existing fee model
         - compute unrealized mark-to-market pnl
         - record PaperOutcome (API-compatible fields)
@@ -271,37 +271,35 @@ async def simulate_fill(
                     orderbook = await client.get_orderbook(intent.ticker)
 
                     # Parse to extract best bids
-                    from kalshi_edge_engine.engine.orderbook import parse_orderbook
+                    from kalshi_edge_engine.engine.orderbook import (
+                        parse_orderbook,
+                        quote_liquidation,
+                    )
 
                     parsed = parse_orderbook(orderbook)
                     best_yes_bid = parsed.bid_yes.price if parsed.bid_yes else None
                     best_no_bid = parsed.bid_no.price if parsed.bid_no else None
-                    cross_yes = parsed.cross_yes.price if parsed.cross_yes else None
-                    cross_no = parsed.cross_no.price if parsed.cross_no else None
 
                     # Check for fill based on side
                     is_filled = False
-                    mark_price = None
                     entry_price = intent.quote_price_cents
 
                     if (
                         intent.side == "YES"
                         and best_yes_bid is not None
                         and best_yes_bid >= intent.quote_price_cents
-                    ):
-                        is_filled = True
-                        mark_price = cross_yes  # Use cross for mark-to-market
-
-                    elif (
+                    ) or (
                         intent.side == "NO"
                         and best_no_bid is not None
                         and best_no_bid >= intent.quote_price_cents
                     ):
                         is_filled = True
-                        mark_price = cross_no  # Use cross for mark-to-market
-
-                    if is_filled and mark_price is not None:
-                        fill_ts_ms = int(time.time() * 1000)
+                    fill_ts_ms = int(time.time() * 1000)
+                    liquidation = quote_liquidation(
+                        orderbook, intent.side, intent.size_contracts, fill_ts_ms
+                    )
+                    if is_filled and liquidation is not None:
+                        mark_price = liquidation.price_cents
                         time_to_fill_ms = fill_ts_ms - start_ts_ms
 
                         # Record fill
@@ -327,7 +325,7 @@ async def simulate_fill(
                         )
                         entry_fee = fee_func(entry_price, intent.size_contracts)
 
-                        total_fees = entry_fee
+                        total_fees = entry_fee + liquidation.exit_fee_cents
                         unrealized_pnl_cents = (
                             mark_price - entry_price
                         ) * intent.size_contracts - total_fees
