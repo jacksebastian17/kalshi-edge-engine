@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import shutil
 import sqlite3
 import time
 import uuid
@@ -18,6 +19,7 @@ from urllib.parse import unquote
 logger = logging.getLogger(__name__)
 APP_ID = 0x4B454D44
 MIB = 1024 * 1024
+DISK_RESERVE = 2048 * MIB
 _origin: ContextVar[tuple[str, str | None, str | None]] = ContextVar(
     "market_response_origin", default=("client", None, None)
 )
@@ -54,11 +56,23 @@ class RecordedResponse:
 
 class MarketRecorder:
     def __init__(
-        self, path: str, retention_hours: int, max_mib: int, universe_for: Callable[[str], str]
+        self,
+        path: str,
+        retention_hours: int,
+        max_mib: int,
+        universe_for: Callable[[str], str],
+        *,
+        append_only: bool = False,
     ):
         if retention_hours <= 0 or max_mib < 1:
             raise ValueError("Recorder requires positive retention and at least 1 MiB")
         self.path = path
+        self.append_only = append_only
+        self.initialized = asyncio.Event()
+        self.on_failure: Callable[[], None] | None = None
+        self.failure: str | None = None
+        self.disk_free_bytes: int | None = None
+        self.database_bytes = 0
         self.retention_hours = retention_hours
         self.max_bytes = max_mib * MIB
         self.universe_for = universe_for
@@ -81,12 +95,22 @@ class MarketRecorder:
             int(os.getenv("MARKET_RECORDER_RETENTION_HOURS", "168")),
             int(os.getenv("MARKET_RECORDER_MAX_MIB", "256")),
             universe_for,
+            append_only=os.getenv("MARKET_RECORDER_APPEND_ONLY", "").lower()
+            in ("true", "1", "yes"),
         )
 
     def status(self) -> dict[str, Any]:
         return {
             "enabled": True,
             "ready": self.ready,
+            "append_only": self.append_only,
+            "healthy": self.ready and self.failure is None and not self.errors and not self.dropped,
+            "failure_reason": self.failure,
+            "database_path": self.path,
+            "database_bytes": self.database_bytes,
+            "disk_free_bytes": self.disk_free_bytes,
+            "disk_reserve_bytes": DISK_RESERVE if self.append_only else None,
+            "last_contiguous_written_sequence": self.written if self.append_only else None,
             "session_id": self.session,
             "received": self.sequence,
             "written": self.written,
@@ -122,11 +146,15 @@ class MarketRecorder:
         self.sequence += 1
         if (
             not self.ready
+            or self.failure is not None
             or len(self.queue) >= 1024
             or self.queue_bytes + len(body) > 8 * MIB
             or len(body) > min(MIB, self.max_bytes // 16)
         ):
             self.dropped += 1
+            self._fail(
+                "Observation dropped: recorder unavailable, oversized response or full queue"
+            )
             return
         try:
             ticker = unquote(segments[1])
@@ -169,10 +197,35 @@ class MarketRecorder:
             self.dropped += 1
             self._error(exc)
 
+    def require_healthy(self) -> None:
+        if not self.ready or self.failure:
+            raise RuntimeError(self.failure or "Market recorder is not ready")
+
+    def _fail(self, reason: str) -> None:
+        if self.append_only and self.failure is None:
+            self.failure = reason
+            self.ready = False
+            logger.error("append_only_capture_incomplete: %s", reason)
+            if self.on_failure:
+                self.on_failure()
+
+    def _storage(self, *, startup: bool = False) -> None:
+        path = Path(self.path)
+        self.disk_free_bytes = shutil.disk_usage(path.parent).free
+        self.database_bytes = path.stat().st_size if path.exists() else 0
+        if self.append_only:
+            # Leave room for the paper WAL, SQLite rollback journal and other users.
+            headroom = max(0, self.max_bytes - self.database_bytes) if startup else 16 * MIB
+            if self.disk_free_bytes < DISK_RESERVE + headroom:
+                raise OSError("Insufficient disk headroom for append-only capture")
+            if self.database_bytes >= self.max_bytes:
+                raise OSError("Append-only recorder capacity exhausted")
+
     def _error(self, exc: Exception) -> None:
         self.errors += 1
         self.last_error = f"{type(exc).__name__}: {exc}"
         logger.error("market_recorder_error: %s", self.last_error)
+        self._fail(self.last_error)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=1)
@@ -188,13 +241,14 @@ class MarketRecorder:
 
     def _initialize(self) -> int:
         path = Path(self.path).resolve()
-        paper = Path("paper_trading.db").resolve()
-        if path in (
-            paper,
-            *(
-                Path(f"{paper}{suffix}")
-                for suffix in ("-shm", "-wal", "-journal", ".paper-worker.lock")
-            ),
+        ledgers = {
+            Path("paper_trading.db").resolve(),
+            Path(os.getenv("PAPER_DB_PATH", "paper_trading.db")).resolve(),
+        }
+        if any(
+            path == Path(f"{paper}{suffix}")
+            for paper in ledgers
+            for suffix in ("", "-shm", "-wal", "-journal", ".paper-worker.lock")
         ):
             raise ValueError("The recorder path is reserved for the paper ledger")
         if path.exists() and path.stat().st_size:
@@ -206,11 +260,19 @@ class MarketRecorder:
                 or int.from_bytes(header[68:72], "big") != APP_ID
             ):
                 raise ValueError("Existing file is not a market recorder database")
+        self._storage(startup=True)
         with closing(self._connect()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
             app_id = conn.execute("PRAGMA application_id").fetchone()[0]
             version = conn.execute("PRAGMA user_version").fetchone()[0]
             if app_id == APP_ID and version == 1:
+                session_table = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name='capture_sessions'"
+                ).fetchone()
+                if bool(session_table) != self.append_only:
+                    raise ValueError("Cannot change retention mode of an existing recorder")
+                if self.append_only:
+                    self._open_session(conn)
                 return int(conn.execute("SELECT COUNT(*) FROM market_events").fetchone()[0])
             if app_id or version or conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone():
                 raise ValueError(
@@ -226,9 +288,56 @@ class MarketRecorder:
             conn.execute("CREATE INDEX market_events_receipt ON market_events(received_ns)")
             conn.execute(f"PRAGMA application_id={APP_ID}")
             conn.execute("PRAGMA user_version=1")
+            if self.append_only:
+                conn.execute("""CREATE TABLE capture_sessions (
+                    id TEXT PRIMARY KEY, state TEXT NOT NULL, received INTEGER, written INTEGER,
+                    dropped INTEGER, errors INTEGER, reason TEXT)""")
+                self._open_session(conn)
             return 0
 
+    def _open_session(self, conn: sqlite3.Connection) -> None:
+        if conn.execute("SELECT 1 FROM capture_sessions WHERE state != 'clean' LIMIT 1").fetchone():
+            raise ValueError("Prior capture incomplete or still open; use a fresh run directory")
+        conn.execute("INSERT INTO capture_sessions(id,state) VALUES (?, 'open')", (self.session,))
+
+    def _finish_session(self) -> None:
+        with closing(self._connect()) as conn, conn:
+            conn.execute(
+                "UPDATE capture_sessions SET state=?, received=?, written=?, dropped=?, errors=?, reason=? WHERE id=?",
+                (
+                    "incomplete" if self.failure else "clean",
+                    self.sequence,
+                    self.written,
+                    self.dropped,
+                    self.errors,
+                    self.failure,
+                    self.session,
+                ),
+            )
+
+    @staticmethod
+    def _insert(conn: sqlite3.Connection, active: list[RecordedResponse]) -> None:
+        conn.executemany(
+            """INSERT INTO market_events
+               (schema_version, session_id, sequence, received_ns, kind, request_path,
+                base_url, read_lane, ticker, universe, source, intent_id,
+                source_time_field, source_time, body)
+               VALUES (1, :session_id, :sequence, :received_ns, :kind, :path,
+                       :base_url, :lane, :ticker, :universe, :source, :intent_id,
+                       :source_time_field, :source_time, :body)""",
+            (vars(event) for event in active),
+        )
+
     def _write(self, batch: list[RecordedResponse]) -> tuple[int, int]:
+        self._storage()
+        if self.append_only:
+            if batch:
+                with closing(self._connect()) as conn, conn:
+                    self._insert(conn, batch)
+                    pages = conn.execute("PRAGMA page_count").fetchone()[0]
+                    page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+                self.database_bytes = pages * page_size
+            return len(batch), 0
         cutoff = time.time_ns() - self.retention_hours * 3600 * 10**9
         active = [e for e in batch if e.received_ns >= cutoff]
         with closing(self._connect()) as conn:
@@ -247,16 +356,7 @@ class MarketRecorder:
                                 (evict_count,),
                             ).rowcount
                             pruned += removed
-                        conn.executemany(
-                            """INSERT INTO market_events
-                               (schema_version, session_id, sequence, received_ns, kind, request_path,
-                                base_url, read_lane, ticker, universe, source, intent_id,
-                                source_time_field, source_time, body)
-                               VALUES (1, :session_id, :sequence, :received_ns, :kind, :path,
-                                       :base_url, :lane, :ticker, :universe, :source, :intent_id,
-                                       :source_time_field, :source_time, :body)""",
-                            (vars(event) for event in active),
-                        )
+                        self._insert(conn, active)
                     return len(active), pruned
                 except sqlite3.OperationalError as exc:
                     if not active or exc.sqlite_errorcode != sqlite3.SQLITE_FULL:
@@ -280,8 +380,10 @@ class MarketRecorder:
             self.retained = await asyncio.to_thread(self._initialize)
         except Exception as exc:
             self._error(exc)
+            self.initialized.set()
             return
         self.ready = True
+        self.initialized.set()
         next_prune = 0.0
         try:
             while True:
@@ -293,16 +395,22 @@ class MarketRecorder:
                     batch.append(event)
                 self.queue_bytes -= size
                 self.in_flight = len(batch)
-                if batch or time.monotonic() >= next_prune:
+                if batch or (not self.failure and time.monotonic() >= next_prune):
                     try:
                         written, pruned = await asyncio.to_thread(self._write, batch)
                         self.written += written
                         self.pruned += pruned
                         self.retained += written - pruned
                         self.dropped += len(batch) - written
+                        if self.append_only and self.database_bytes >= self.max_bytes:
+                            self._fail("Append-only recorder capacity exhausted")
                     except Exception as exc:
                         self.dropped += len(batch)
                         self._error(exc)
+                        if self.append_only:
+                            self.dropped += len(self.queue)
+                            self.queue.clear()
+                            self.queue_bytes = 0
                     next_prune = time.monotonic() + 60
                     self.in_flight = 0
                 if self.queue:
@@ -311,5 +419,13 @@ class MarketRecorder:
                     break
                 with suppress(TimeoutError):
                     await asyncio.wait_for(self.stop.wait(), timeout=0.5)
+        except BaseException as exc:
+            self._fail(f"Recorder writer interrupted: {type(exc).__name__}")
+            raise
         finally:
             self.ready = False
+            if self.append_only:
+                try:
+                    await asyncio.to_thread(self._finish_session)
+                except Exception as exc:
+                    self._error(exc)

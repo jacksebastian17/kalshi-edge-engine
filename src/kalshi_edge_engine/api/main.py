@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from kalshi_edge_engine import overnight
 from kalshi_edge_engine.db.market_recorder import MarketRecorder, capture_origin
 from kalshi_edge_engine.db.paper_store import PaperStore
 from kalshi_edge_engine.engine.fees import LEGACY_FEE_PROFILE
@@ -289,6 +290,7 @@ _PAPER_TICKER_COOLDOWN_SECONDS = runtime_config.PAPER_TICKER_COOLDOWN_SECONDS
 _PAPER_MAX_DAILY_LOSS_CENTS = runtime_config.PAPER_MAX_DAILY_LOSS_CENTS
 
 # Paper trading state tracking
+_overnight_recorder: MarketRecorder | None = None
 _paper_store: PaperStore | None = runtime_state.paper_store
 _paper_enabled: bool = runtime_state.paper_enabled
 _paper_simulation_tasks: set[asyncio.Task[Any]] = runtime_state.paper_simulation_tasks
@@ -998,6 +1000,7 @@ async def start_scanner(request: Request) -> dict[str, Any]:
         Response indicating whether scanner was started or if it was already running.
     """
     _sync_runtime_from_legacy()
+    _require_overnight_capture()
     # Check if a valid task is already running
     current_task = getattr(request.app.state, "scanner_task", None)
     if current_task and not current_task.done():
@@ -1052,6 +1055,14 @@ async def stop_scanner(request: Request) -> dict[str, Any]:
     return {"stopped": True}
 
 
+def _require_overnight_capture() -> None:
+    if _overnight_recorder is not None:
+        try:
+            _overnight_recorder.require_healthy()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
 async def start_paper_trading() -> dict[str, Any]:
     """Start paper trading intents processing.
 
@@ -1065,6 +1076,7 @@ async def start_paper_trading() -> dict[str, Any]:
     global _paper_enabled
     _sync_runtime_from_legacy()
 
+    _require_overnight_capture()
     if not _ENABLE_PAPER_TRADING or _paper_store is None:
         logger.info("Paper trading not available (not enabled or no store)")
         return {"started": False, "reason": "not_available"}
@@ -1507,6 +1519,9 @@ async def get_paper_config() -> dict[str, Any]:
     return {
         "configured": _ENABLE_PAPER_TRADING,
         "enabled": _paper_enabled,
+        "experiment_id": _paper_store.experiment_id if _paper_store else None,
+        "paper_db_path": _paper_store.db_path if _paper_store else None,
+        "capture_failure": _overnight_recorder.failure if _overnight_recorder else None,
         "active": active,
         "min_edge_cents": _PAPER_MIN_EDGE_CENTS,
         "allow_yes_entries": _PAPER_ALLOW_YES_ENTRIES,
@@ -1714,6 +1729,8 @@ async def get_paper_debug_intent(intent_id: str, request: Request) -> dict[str, 
 
 async def post_paper_debug_force_fill(request: ForceFillRequest) -> dict[str, Any]:
     """Force-insert a synthetic fill for debug purposes."""
+    if _overnight_recorder is not None:
+        raise HTTPException(status_code=409, detail="Debug fills disabled for overnight capture")
     if not _paper_store:
         raise HTTPException(status_code=503, detail="Paper trading not enabled")
     intent_id = request.intent_id
@@ -1850,13 +1867,28 @@ async def _supervise_paper_maintenance(client: KalshiClient) -> None:
 @asynccontextmanager
 async def lifespan_production(app: FastAPI) -> Any:
     """Own the client, scanner and single database maintenance worker."""
-    global _production_lifespan_active
+    global _production_lifespan_active, _overnight_recorder, _paper_store
     if _production_lifespan_active:
         raise RuntimeError("A production application lifespan is already active in this process")
     _production_lifespan_active = True
     client: KalshiClient | None = None
     recorder: MarketRecorder | None = None
     recorder_task: asyncio.Task[None] | None = None
+    run_lock = ExitStack()
+    strict = overnight.requested()
+
+    def stop_decisions() -> None:
+        runtime_state.paper_enabled = False
+        _sync_legacy_from_runtime()
+        _scanner_state.enabled = False
+        for task in (
+            *_paper_simulation_tasks,
+            app.state.scanner_task,
+            app.state.paper_maintenance_task,
+        ):
+            if task is not None:
+                task.cancel()
+
     try:
         _sync_runtime_from_legacy()
         client = KalshiClient()
@@ -1872,19 +1904,36 @@ async def lifespan_production(app: FastAPI) -> Any:
                 )
             )
         except ValueError as exc:
+            if strict:
+                raise
             app.state.recorder_config_error = str(exc)
             logger.error("market_recorder_config_error: %s", exc)
+        if strict:
+            run = overnight.Run.configured()
+            metadata = run.metadata(recorder)
+            run_lock.enter_context(PaperStore.claim_database(str(run.ledger)))
+            run.verify(metadata)
+            assert recorder is not None
+            _overnight_recorder = recorder
+            recorder.on_failure = stop_decisions
         app.state.recorder = recorder
         if recorder is not None:
             client.recorder = recorder
             recorder_task = asyncio.create_task(recorder.run(), name="market-recorder")
+            if strict:
+                await recorder.initialized.wait()
+                recorder.require_healthy()
 
         with ExitStack() as resources:
             if _ENABLE_PAPER_TRADING:
-                _init_paper_store()
-                if _paper_store is None:
-                    raise RuntimeError("Paper trading enabled without a working database")
-                resources.enter_context(_paper_store.claim_worker())
+                if strict and recorder is not None:
+                    _paper_store = PaperStore(decision_guard=recorder.require_healthy)
+                    runtime_state.paper_store = _paper_store
+                else:
+                    _init_paper_store()
+                    if _paper_store is None:
+                        raise RuntimeError("Paper trading enabled without a working database")
+                    resources.enter_context(_paper_store.claim_worker())
                 recovered = _paper_store.recover_interrupted_intents()
                 logger.info("paper_intents_recovered", extra={"count": recovered})
                 runtime_state.paper_liquidation_marks = {}
@@ -1919,16 +1968,20 @@ async def lifespan_production(app: FastAPI) -> Any:
                 runtime_state.paper_enabled = False
                 _sync_legacy_from_runtime()
     finally:
-        if recorder is not None and recorder_task is not None:
-            recorder.stop.set()
-            await recorder_task
-        runtime_state.market_fees = None
-        runtime_state.paper_liquidation_marks = {}
         try:
+            if recorder is not None and recorder_task is not None:
+                recorder.stop.set()
+                await recorder_task
+        finally:
+            runtime_state.market_fees = None
+            runtime_state.paper_liquidation_marks = {}
+            if strict:
+                _overnight_recorder = None
+                _paper_store = runtime_state.paper_store = None
+            run_lock.close()
+            _production_lifespan_active = False
             if client is not None:
                 await client.aclose()
-        finally:
-            _production_lifespan_active = False
 
 
 @asynccontextmanager

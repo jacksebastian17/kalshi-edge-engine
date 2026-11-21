@@ -2,13 +2,14 @@
 
 import json
 import logging
+import os
 import sqlite3
 import statistics
 import sys
 import time
 import uuid
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import asdict, dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -77,22 +78,58 @@ class PaperStore:
     """SQLite-based persistence for paper trading data."""
 
     def __init__(
-        self, db_path: str = DEFAULT_DB_PATH, *, clock_ms: Callable[[], int] | None = None
+        self,
+        db_path: str | None = None,
+        *,
+        clock_ms: Callable[[], int] | None = None,
+        experiment_id: str | None = None,
+        decision_guard: Callable[[], None] | None = None,
     ) -> None:
         """Initialize the store and create schema if needed.
 
         Args:
             db_path: Path to SQLite database file.
         """
-        self.db_path = db_path
-        self.fill_funnel = FillFunnel(db_path)
+        self.db_path = (
+            db_path if db_path is not None else os.getenv("PAPER_DB_PATH", DEFAULT_DB_PATH)
+        )
+        self.experiment_id = (
+            experiment_id
+            if experiment_id is not None
+            else os.getenv("PAPER_EXPERIMENT_ID", CLEAN_EXPERIMENT_ID)
+        )
+        self.decision_guard = decision_guard
+        if not self.experiment_id.strip() or not self.db_path.strip():
+            raise ValueError("Paper experiment ID and ledger path must be nonempty")
+        path = Path(self.db_path).resolve()
+        isolated = self.experiment_id != CLEAN_EXPERIMENT_ID
+        if isolated and path == Path(DEFAULT_DB_PATH).resolve():
+            raise ValueError("A new paper cohort requires a dedicated ledger")
+        if path.exists() and path.stat().st_size:
+            with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as conn:
+                tagged = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name='paper_experiments'"
+                ).fetchone()
+                if tagged:
+                    ids = conn.execute("SELECT id FROM paper_experiments").fetchall()
+                    if ids != [(self.experiment_id,)]:
+                        raise ValueError("Existing ledger belongs to a different experiment")
+                elif isolated or os.getenv("PAPER_DB_PATH"):
+                    raise ValueError("A new cohort cannot adopt an existing ledger")
+        self.fill_funnel = FillFunnel(self.db_path)
         self._clock_ms = clock_ms if clock_ms is not None else lambda: int(time.time() * 1000)
         self._init_schema()
 
     @contextmanager
     def claim_worker(self) -> Iterator[None]:
         """Exclusively own recovery and maintenance of this database until shutdown."""
-        lock_path = Path(f"{Path(self.db_path).resolve()}.paper-worker.lock")
+        with self.claim_database(self.db_path):
+            yield
+
+    @staticmethod
+    @contextmanager
+    def claim_database(db_path: str) -> Iterator[None]:
+        lock_path = Path(f"{Path(db_path).resolve()}.paper-worker.lock")
         with lock_path.open("a+b") as lock:
             try:
                 lock.seek(0)
@@ -105,7 +142,7 @@ class PaperStore:
 
                     fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError as exc:
-                raise RuntimeError(f"Paper maintenance already owns {self.db_path}") from exc
+                raise RuntimeError(f"Paper maintenance already owns {db_path}") from exc
             yield  # Closing the handle releases the OS lock, including on process exit.
 
     def _init_schema(self) -> None:
@@ -241,14 +278,18 @@ class PaperStore:
                     )
                     """
                 )
+                if cursor.execute(
+                    "SELECT 1 FROM paper_experiments WHERE id != ? LIMIT 1", (self.experiment_id,)
+                ).fetchone():
+                    raise ValueError("Existing ledger belongs to a different experiment")
                 inserted_experiment = cursor.execute(
                     "INSERT OR IGNORE INTO paper_experiments VALUES (?, ?)",
-                    (CLEAN_EXPERIMENT_ID, self._clock_ms()),
+                    (self.experiment_id, self._clock_ms()),
                 ).rowcount
                 self.cutover_ts_ms = int(
                     cursor.execute(
                         "SELECT cutover_ts_ms FROM paper_experiments WHERE id = ?",
-                        (CLEAN_EXPERIMENT_ID,),
+                        (self.experiment_id,),
                     ).fetchone()[0]
                 )
                 cursor.execute(
@@ -516,6 +557,8 @@ class PaperStore:
 
     def record_market_observation(self, observation: MarketObservation) -> bool:
         """Apply ordered exchange evidence and cancel affected remainders together."""
+        if self.decision_guard:
+            self.decision_guard()
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             return self._apply_market_observation(conn, observation, self._clock_ms())
@@ -588,9 +631,8 @@ class PaperStore:
             )
         return True
 
-    @staticmethod
     def _invalidate_after_close(
-        conn: sqlite3.Connection, ticker: str, close_ts_ms: int, observed_ts_ms: int
+        self, conn: sqlite3.Connection, ticker: str, close_ts_ms: int, observed_ts_ms: int
     ) -> None:
         rows = conn.execute(
             """
@@ -623,7 +665,7 @@ class PaperStore:
                 SET valuation_details = json_set(valuation_details, '$.market_timing_invalidated', 1)
                 WHERE ts_ms >= ? AND json_extract(valuation_details, '$.experiment_id') = ?
                 """,
-                (close_ts_ms, CLEAN_EXPERIMENT_ID),
+                (close_ts_ms, self.experiment_id),
             )
 
     def entry_can_poll(self, intent_id: str) -> bool:
@@ -681,6 +723,8 @@ class PaperStore:
             best_bid_at_submit_cents: Best bid at submission time (optional, for telemetry).
             cross_at_submit_cents: Cross price at submission time (optional, for telemetry).
         """
+        if self.decision_guard:
+            self.decision_guard()
         effective_take_profit_cents_per_contract = (
             take_profit_cents_per_contract
             if take_profit_cents_per_contract is not None
@@ -1217,6 +1261,8 @@ class PaperStore:
         Raises:
             ValueError if arguments cannot be parsed or are invalid.
         """
+        if self.decision_guard:
+            self.decision_guard()
         # Normalize and parse arguments (outside transaction, just for parsing)
         fill_dict = self._normalize_fill_insert_args(*args, **kwargs)
         if fill_dict is None:
@@ -1439,7 +1485,7 @@ class PaperStore:
                             execution_source,
                             observed_30s_ts_ms,
                             json.dumps(fee_profile.audit()) if fee_profile is not None else None,
-                            CLEAN_EXPERIMENT_ID if clean else None,
+                            self.experiment_id if clean else None,
                             evidence_json,
                             lifecycle_id,
                         ),
@@ -1566,6 +1612,8 @@ class PaperStore:
         execution_source: str = "simulated_displayed_bid_sweep",
     ) -> bool:
         """Commit the simulated sale, realized increment and lifecycle transition together."""
+        if self.decision_guard:
+            self.decision_guard()
         ticker, side = position["ticker"], position["side"]
         size = quote.size_contracts
         if (
@@ -1610,6 +1658,8 @@ class PaperStore:
 
     def reconcile_market_settlement(self, settlement: MarketSettlement, *, now_ms: int) -> bool:
         """Book a finalized market once, including both sides and all open remainders."""
+        if self.decision_guard:
+            self.decision_guard()
         if settlement.settlement_ts_ms > now_ms or not 0 <= settlement.yes_payout_cents <= 100:
             return False
         ticker = settlement.ticker
@@ -1778,7 +1828,7 @@ class PaperStore:
                 json.dumps(quote.bid_levels) if quote else None,
                 realized_delta,
                 profile_json,
-                CLEAN_EXPERIMENT_ID if clean else None,
+                self.experiment_id if clean else None,
                 opening_intent,
             ),
         )
@@ -2019,7 +2069,7 @@ class PaperStore:
                     ORDER BY ts_ms DESC
                     LIMIT 1
                     """,
-                    (clean_only, CLEAN_EXPERIMENT_ID),
+                    (clean_only, self.experiment_id),
                 )
                 row = cursor.fetchone()
                 if row:
@@ -2524,7 +2574,7 @@ class PaperStore:
                     SELECT COALESCE(SUM(realized_pnl_delta_cents), 0)
                     FROM paper_fills WHERE experiment_id = ?
                     """,
-                    (CLEAN_EXPERIMENT_ID,),
+                    (self.experiment_id,),
                 ).fetchone()[0]
                 clean_valuation = self._value_positions(
                     conn,
@@ -2898,7 +2948,7 @@ class PaperStore:
                     "bid_sweep_realized_pnl_cents": bid_sweep_realized,
                     "settlement_realized_pnl_cents": settlement_realized,
                     "legacy_realized_balance_cents": realized_pnl_cents - audited_realized,
-                    "experiment_id": CLEAN_EXPERIMENT_ID,
+                    "experiment_id": self.experiment_id,
                     "experiment_cutover_ts_ms": self.cutover_ts_ms,
                     "clean_realized_pnl_cents": clean_realized,
                     "non_experiment_realized_pnl_cents": realized_pnl_cents - clean_realized,
