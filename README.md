@@ -300,6 +300,8 @@ The goal is to reduce that bridge later, but only after tests are migrated to pa
 
 For the historical evidence fields, passive recorder settings, replay ordering and Windows deployment procedure, see the [Phase B1 operator guide](docs/phase-b1.md).
 
+To replay an archived recording offline, reconcile the paper ledger, or reproduce the Atlanta and Toronto investigations, see the [Phase B2 replay guide and research results](docs/phase-b2.md).
+
 ### Outcome / research endpoints
 
 - `GET /paper/metrics/outcomes?horizon_seconds=5`
