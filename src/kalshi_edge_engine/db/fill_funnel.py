@@ -251,7 +251,7 @@ class FillFunnel:
         if initial and initial.get("book_observed_ts_ms") is not None:
             observed.append(initial)
         result["quote_ever_observed"] = (
-            any((e.get("displayed_quote_size") or 0) > 0 for e in observed)
+            any(float(e.get("displayed_quote_size") or 0) > 0 for e in observed)
             if any("displayed_quote_size" in e for e in observed)
             else None
         )

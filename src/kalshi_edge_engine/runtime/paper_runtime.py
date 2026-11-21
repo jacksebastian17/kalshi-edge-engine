@@ -9,7 +9,11 @@ from typing import Any
 
 from kalshi_edge_engine.db.market_recorder import capture_origin
 from kalshi_edge_engine.db.paper_store import PaperStore
-from kalshi_edge_engine.engine.orderbook import displayed_quote_size, parse_orderbook
+from kalshi_edge_engine.engine.orderbook import (
+    canonical_book,
+    displayed_quote_size,
+    parse_orderbook,
+)
 from kalshi_edge_engine.engine.paper import QuoteIntent, build_quote_intents
 from kalshi_edge_engine.engine.paper_sim import Fill, OrderRequest, RealisticOrderSimulator
 from kalshi_edge_engine.engine.signal import SIGNAL_VALID, Signal
@@ -445,7 +449,8 @@ async def _process_paper_intents(
                     capture_origin("entry_submission", universe_key, intent.id),
                 ):
                     orderbook_snapshot = await client.get_orderbook(intent.ticker)
-                parsed_ob = parse_orderbook(orderbook_snapshot)
+                depth = canonical_book(orderbook_snapshot)
+                parsed_ob = parse_orderbook(depth)
                 bid = parsed_ob.bid_yes if intent.side == "YES" else parsed_ob.bid_no
                 cross = parsed_ob.cross_yes if intent.side == "YES" else parsed_ob.cross_no
                 best_bid_at_submit_cents = bid.price if bid else None
@@ -454,7 +459,7 @@ async def _process_paper_intents(
                     book_observed_ts_ms=int(time.time() * 1000),
                     best_bid_size=bid.size if bid else None,
                     displayed_quote_size=displayed_quote_size(
-                        orderbook_snapshot, intent.side, intent.quote_price_cents
+                        depth, intent.side, intent.quote_price_cents
                     ),
                 )
             except Exception as e:

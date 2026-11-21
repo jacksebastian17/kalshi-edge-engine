@@ -270,33 +270,25 @@ async def simulate_fill(
                     # Fetch current orderbook
                     orderbook = await client.get_orderbook(intent.ticker)
 
-                    # Parse to extract best bids
                     from kalshi_edge_engine.engine.orderbook import (
-                        parse_orderbook,
+                        canonical_book,
                         quote_liquidation,
                     )
 
-                    parsed = parse_orderbook(orderbook)
-                    best_yes_bid = parsed.bid_yes.price if parsed.bid_yes else None
-                    best_no_bid = parsed.bid_no.price if parsed.bid_no else None
-
-                    # Check for fill based on side
-                    is_filled = False
+                    depth = canonical_book(orderbook)
                     entry_price = intent.quote_price_cents
-
-                    if (
-                        intent.side == "YES"
-                        and best_yes_bid is not None
-                        and best_yes_bid >= intent.quote_price_cents
-                    ) or (
-                        intent.side == "NO"
-                        and best_no_bid is not None
-                        and best_no_bid >= intent.quote_price_cents
-                    ):
-                        is_filled = True
+                    # Require enough whole capacity at or above the sampled limit.
+                    is_filled = (
+                        sum(
+                            level.capacity
+                            for level in depth.levels(intent.side)
+                            if level.price >= entry_price
+                        )
+                        >= intent.size_contracts
+                    )
                     fill_ts_ms = int(time.time() * 1000)
                     liquidation = quote_liquidation(
-                        orderbook, intent.side, intent.size_contracts, fill_ts_ms
+                        depth, intent.side, intent.size_contracts, fill_ts_ms
                     )
                     if is_filled and liquidation is not None:
                         mark_price = liquidation.price_cents

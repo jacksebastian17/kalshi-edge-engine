@@ -10,6 +10,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import IO, Any
 
+from kalshi_edge_engine.replay import Mode
 from kalshi_edge_engine.replay.archive import REPO, Selection, open_archive
 from kalshi_edge_engine.replay.execution import POLICIES
 from kalshi_edge_engine.replay.forensics import RAPID_INTENTS, investigate
@@ -41,6 +42,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--end-ns", type=int, help="Exclusive local receipt time")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument(
+        "--mode",
+        type=Mode,
+        choices=list(Mode),
+        default=Mode.B2,
+        help="b2 reproduces the B2 checkpoint; b1-queue repairs reconstruction; canonical also uses fixed-point books",
+    )
+    parser.add_argument(
+        "--require-execution-consistency",
+        action="store_true",
+        help="Require unambiguous two-sided depth, prices, quantities, whole capacity and queue liquidity to agree",
+    )
+    parser.add_argument(
         "--require-raw-consistency",
         action="store_true",
         help="Censor hypothetical entries when B1 and full positive-size ladder tops disagree",
@@ -62,6 +75,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         directory = args.archive.resolve(strict=True)
         output = args.out.resolve() if args.out else None
+        if (
+            output
+            and args.mode != Mode.B2
+            and output.is_relative_to(REPO / "research" / "phase-b2")
+        ):
+            raise ValueError("Use a new B3A output directory to preserve the B2 baseline")
         if output and (
             output.is_relative_to(directory)
             or output == REPO
@@ -103,6 +122,8 @@ def main(argv: list[str] | None = None) -> int:
                     archive,
                     selection,
                     seed=args.seed,
+                    mode=args.mode,
+                    strict=args.require_execution_consistency,
                     require_raw_consistency=args.require_raw_consistency,
                     scale=args.probability_scale,
                     models=("baseline",) if args.command == "replay" else tuple(POLICIES),
@@ -111,10 +132,10 @@ def main(argv: list[str] | None = None) -> int:
                     emit_decision=emit_decision if decisions else None,
                 )
                 if args.command == "intent":
-                    report["intent"] = investigate(archive, args.intent_id)
+                    report["intent"] = investigate(archive, args.intent_id, args.mode)
                 elif args.command == "report":
                     report["rapid_trade_audits_full_archive"] = [
-                        investigate(archive, k) for k in RAPID_INTENTS
+                        investigate(archive, k, args.mode) for k in RAPID_INTENTS
                     ]
             if output:
                 report_file = new_output(args.command + ".json")

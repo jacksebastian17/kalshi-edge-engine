@@ -23,6 +23,7 @@ paper_trading.db
 market_data_recorder.db
 market_data_recorder.db-journal
 research/phase-b2/
+research/phase-b3a/
 *.paper-worker.lock
 
 # Frontend local/build artifacts

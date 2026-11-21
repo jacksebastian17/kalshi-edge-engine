@@ -4,18 +4,19 @@ import json
 from typing import Any
 
 from kalshi_edge_engine.engine.orderbook import (
+    canonical_book,
     displayed_quote_size,
     parse_orderbook,
     quote_liquidation,
 )
-from kalshi_edge_engine.replay import MATCH_MS
+from kalshi_edge_engine.replay import MATCH_MS, Mode, b1_orderbook
 from kalshi_edge_engine.replay.archive import Archive, payload
 from kalshi_edge_engine.replay.execution import Intent, raw_best_level
 
 RAPID_INTENTS = ("5877fe52-337d-4c78-bc9b-bd9540a1727e", "b094c81f-445b-4b80-9c4f-89ac3dd64441")
 
 
-def investigate(archive: Archive, key: str) -> dict[str, Any]:
+def investigate(archive: Archive, key: str, mode: Mode = Mode.B2) -> dict[str, Any]:
     ledger = archive.ledger
     if ledger is None:
         return {
@@ -65,7 +66,7 @@ def investigate(archive: Archive, key: str) -> dict[str, Any]:
             (intent.order.ticker, (ts - 10000) * 10**6, (end + 1) * 10**6),
         ):
             try:
-                raw = payload(r)
+                raw = payload(r, mode)
             except (ValueError, TypeError, OverflowError):
                 continue
             e = {
@@ -86,14 +87,34 @@ def investigate(archive: Archive, key: str) -> dict[str, Any]:
                 )
             }
             if r["kind"] == "orderbook":
-                top = raw_best_level(raw, intent.order.side)
-                parsed = parse_orderbook(raw)
+                corrected = mode == Mode.CANONICAL
+                size_at = displayed_quote_size if corrected else b1_orderbook.displayed_quote_size
+                liquidation = quote_liquidation if corrected else b1_orderbook.quote_liquidation
+                if corrected:
+                    canonical = canonical_book(raw)
+                    level = canonical.top(intent.order.side)
+                    top: tuple[float, int | float | str] | None = (
+                        (float(level.price), level.json_quantity()) if level else None
+                    )
+                    b1 = b1_orderbook.parse_orderbook(json.loads(r["body"]))
+                    historical_bid = b1.bid_yes if intent.order.side == "YES" else b1.bid_no
+                    e.update(
+                        historical_simulator_bid_cents=historical_bid.price
+                        if historical_bid
+                        else None,
+                        reported_quantity_exact=str(level.quantity) if level else None,
+                        whole_capacity=level.capacity if level else None,
+                    )
+                    parsed = parse_orderbook(canonical)
+                else:
+                    top = raw_best_level(raw, intent.order.side)
+                    parsed = b1_orderbook.parse_orderbook(raw)
                 bid = parsed.bid_yes if intent.order.side == "YES" else parsed.bid_no
                 e.update(
                     raw_best_bid_cents=top[0] if top else None,
                     raw_best_size=top[1] if top else None,
                     simulator_best_bid_cents=bid.price if bid else None,
-                    displayed_size_at_entry=displayed_quote_size(
+                    displayed_size_at_entry=size_at(
                         raw, intent.order.side, intent.order.quote_price_cents
                     ),
                 )
@@ -104,7 +125,7 @@ def investigate(archive: Archive, key: str) -> dict[str, Any]:
                     and intent.fee
                 ):
                     exit_fill = exits[0]
-                    depth = quote_liquidation(
+                    depth = liquidation(
                         raw,
                         intent.order.side,
                         exit_fill["fill_size"],
@@ -112,7 +133,7 @@ def investigate(archive: Archive, key: str) -> dict[str, Any]:
                         fee_profile=intent.fee,
                     )
                     e.update(
-                        exit_size_at_recorded_price=displayed_quote_size(
+                        exit_size_at_recorded_price=size_at(
                             raw, intent.order.side, exit_fill["fill_price_cents"]
                         ),
                         sufficient_depth_at_recorded_vwap=bool(
@@ -237,6 +258,14 @@ def investigate(archive: Archive, key: str) -> dict[str, Any]:
             )
         ],
         "trades": trades,
+        **(
+            {
+                "observation_semantics": mode.value,
+                "trade_values": "Original B1 simulated ledger entries and exits.",
+            }
+            if mode != Mode.B2
+            else {}
+        ),
         "limitations": [
             "Ledger bid_levels records consumed size. Only a retained depth snapshot can independently check it.",
             "A matching inventory receipt is circumstantial because B1 did not persist its event ID.",

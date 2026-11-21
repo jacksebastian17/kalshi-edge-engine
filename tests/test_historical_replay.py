@@ -13,6 +13,7 @@ from kalshi_edge_engine.db.paper_store import PaperStore
 from kalshi_edge_engine.engine.fees import SERIES_FEE_VERSION, FeeProfile
 from kalshi_edge_engine.engine.paper import QuoteIntent
 from kalshi_edge_engine.kalshi.market import MarketObservation
+from kalshi_edge_engine.replay import Mode
 from kalshi_edge_engine.replay.__main__ import main
 from kalshi_edge_engine.replay.archive import Selection, open_archive, validate
 from kalshi_edge_engine.replay.execution import draw
@@ -418,3 +419,114 @@ def test_missing_ledger_and_corrupt_body_are_reported(archive_dir, tmp_path):
     assert not report["coverage"]["ledger_available"]
     assert report["coverage"]["invalid_event_ids"] == [15]
     assert not report["models"]["baseline"]["fill_details"]
+
+
+@pytest.mark.parametrize("reason, fills", [("poll_error:RuntimeError", 1), ("poll_interrupted", 0)])
+def test_queue_after_witnessed_error_or_unresolved_interruption(archive_dir, reason, fills):
+    with sqlite3.connect(archive_dir / "paper_trading.db") as conn:
+        conn.execute(
+            "INSERT INTO entry_polls(intent_id,ts_ms,poll_class,evidence) VALUES (?,?,'unprocessed',?)",
+            (KEY, T + 42, json.dumps({"no_candidate_reason": reason})),
+        )
+    original = run(archive_dir, mode=Mode.B2)
+    assert original["models"]["baseline"]["hypothetical_fills"] == 0
+    for mode in (Mode.B1_QUEUE, Mode.CANONICAL):
+        trace = []
+        r = run(archive_dir, mode=mode, strict=True, emit_decision=trace.append)
+        assert r["models"]["baseline"]["hypothetical_fills"] == fills
+        assert trace[2]["reconstructed"]["queue_state_known"] is bool(fills)
+
+
+def test_corrected_replay_order_selection_no_lookahead_and_immutable_inputs(
+    archive_dir, monkeypatch
+):
+    from kalshi_edge_engine.kalshi.client import KalshiClient
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("Unexpected live dependency")
+
+    monkeypatch.setattr(socket.socket, "connect", forbidden)
+    monkeypatch.setattr(KalshiClient, "__init__", forbidden)
+    with sqlite3.connect(archive_dir / "market_data_recorder.db") as conn:
+        conn.execute("UPDATE market_events SET received_ns=? WHERE id=5", ((T + 10) * 10**6,))
+    before = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in archive_dir.iterdir()}
+    trace = []
+    a = run(archive_dir, mode=Mode.CANONICAL, strict=True, seed=42, emit=trace.append)
+    assert a == run(archive_dir, mode=Mode.CANONICAL, strict=True, seed=42)
+    assert [r["id"] for r in trace[3:5]] == [4, 5] and trace[3]["received_ns"] == trace[4][
+        "received_ns"
+    ]
+    assert a["models"]["baseline"]["hypothetical_fills"] == 1
+    clipped = run(
+        archive_dir, mode=Mode.CANONICAL, strict=True, selection=Selection(end_ns=(T + 93) * 10**6)
+    )
+    assert clipped["models"]["baseline"]["hypothetical_fills"] == 0
+    pruned = run(archive_dir, mode=Mode.CANONICAL, selection=Selection(start_ns=(T + 50) * 10**6))
+    assert pruned["models"]["baseline"]["hypothetical_fills"] == 0
+    assert pruned["queue_transitions"]["unknown_history"] == 3
+    assert (
+        a["sha256"]
+        == before
+        == {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in archive_dir.iterdir()}
+    )
+
+
+def test_corrected_invalid_ladder_breaks_queue_chain(archive_dir):
+    with sqlite3.connect(archive_dir / "market_data_recorder.db") as conn:
+        conn.execute(
+            "UPDATE market_events SET body=? WHERE id=10",
+            (b'{"orderbook":{"yes":[[41,4]],"no":"bad"}}',),
+        )
+    r = run(archive_dir, mode=Mode.CANONICAL, strict=True)
+    assert r["coverage"]["invalid_event_ids"] == [10]
+    assert r["models"]["baseline"]["hypothetical_fills"] == 0
+
+
+def test_unquoted_legacy_quantities_survive_receipt_export(archive_dir):
+    with sqlite3.connect(archive_dir / "market_data_recorder.db") as conn:
+        conn.execute(
+            "UPDATE market_events SET body=? WHERE id=1",
+            (b'{"yes":[[40,9007199254740993.25]],"no":[[45,20]]}',),
+        )
+    events = []
+    run(archive_dir, mode=Mode.CANONICAL, emit=events.append)
+    assert events[0]["body"]["yes"][0][1] == "9007199254740993.25"
+
+
+def test_interleaved_intents_do_not_share_queue_or_submission(archive_dir):
+    with sqlite3.connect(archive_dir / "paper_trading.db") as conn:
+        conn.row_factory = sqlite3.Row
+        row = dict(conn.execute("SELECT * FROM quote_intents WHERE id=?", (KEY,)).fetchone())
+        row["id"] = "second"
+        conn.execute(
+            f"INSERT INTO quote_intents VALUES ({','.join('?' for _ in row)})", tuple(row.values())
+        )
+    with sqlite3.connect(archive_dir / "market_data_recorder.db") as conn:
+        conn.execute("UPDATE market_events SET intent_id='second' WHERE id IN (10,11)")
+    trace = []
+    result = run(archive_dir, mode=Mode.CANONICAL, strict=True, emit_decision=trace.append)
+    assert result["models"]["baseline"]["hypothetical_fills"] == 0
+    second = next(e for e in trace if e["intent_id"] == "second")
+    assert not second["reconstructed"]["queue_state_known"]
+    assert second["research_guard"] == "missing_submission_history"
+    assert trace[-1]["reconstructed"]["traded_volume_estimate"] == 1
+
+
+def test_strict_candidate_gate_checks_below_top_depth(archive_dir):
+    with sqlite3.connect(archive_dir / "market_data_recorder.db") as conn:
+        conn.execute(
+            "UPDATE market_events SET body=? WHERE id=12",
+            (b'{"orderbook":{"yes":[[41,3],[40,"2.5"]],"no":[[45,20]]}}',),
+        )
+    old_gate = run(archive_dir, mode=Mode.B1_QUEUE, require_raw_consistency=True)["models"][
+        "baseline"
+    ]
+    strict = run(archive_dir, mode=Mode.B1_QUEUE, strict=True)["models"]["baseline"]
+    assert old_gate["hypothetical_fills"] == 1
+    assert strict["hypothetical_fills"] == 0 and strict["reasons"]["liquidity_inconsistent"] == 1
+    assert (
+        run(archive_dir, mode=Mode.CANONICAL, strict=True)["models"]["baseline"][
+            "hypothetical_fills"
+        ]
+        == 1
+    )

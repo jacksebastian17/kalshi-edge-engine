@@ -11,6 +11,7 @@ Key concepts:
 - Inside width = cross - best_bid (room to quote between bid and cross)
 """
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, NamedTuple
@@ -57,251 +58,168 @@ class LiquidationQuote:
         return 0 <= now_ms - self.observed_ts_ms <= max_age_ms
 
 
+@dataclass(frozen=True, slots=True)
+class Level:
+    price: Decimal  # cents
+    quantity: Decimal  # reported contracts
+
+    @property
+    def capacity(self) -> int:
+        return int(self.quantity)
+
+    def json_quantity(self) -> int | float | str:
+        if self.quantity == self.capacity:
+            return self.capacity
+        number = float(self.quantity)
+        return number if Decimal(str(number)) == self.quantity else str(self.quantity)
+
+
+@dataclass(frozen=True, slots=True)
+class Book:
+    yes: tuple[Level, ...]
+    no: tuple[Level, ...]
+    issues: tuple[str, ...]
+
+    def levels(self, side: str) -> tuple[Level, ...]:
+        if side not in ("YES", "NO"):
+            raise ValueError("Unknown contract side")
+        return self.yes if side == "YES" else self.no
+
+    def top(self, side: str) -> Level | None:
+        levels = self.levels(side)
+        return levels[0] if levels else None
+
+    def at(self, side: str, price: Decimal) -> Level | None:
+        return next((level for level in self.levels(side) if level.price == price), None)
+
+    def ask(self, side: str) -> Decimal | None:
+        opposite = self.top("NO" if side == "YES" else "YES")
+        return 100 - opposite.price if opposite else None
+
+    def whole_bids(self, side: str) -> Iterator[tuple[Decimal, int]]:
+        """Executable capacity per price, ordered from best to worst."""
+        return ((level.price, level.capacity) for level in self.levels(side) if level.capacity)
+
+
+def _number(value: Any) -> Decimal | None:
+    if isinstance(value, bool) or not isinstance(value, (str, int, float, Decimal)):
+        return None
+    if isinstance(value, str) and (not value.isascii() or value != value.strip() or "_" in value):
+        return None
+    try:
+        n = Decimal(str(value))
+    except (ValueError, InvalidOperation):
+        return None
+    # Exact arithmetic and bounded conversion to SQLite-compatible integer sizes.
+    if not n.is_finite() or n < 0 or n > 2**63 - 1:
+        return None
+    if n != n.quantize(Decimal("0.00000001")):
+        return None
+    return n
+
+
+def canonical_book(data: dict[str, Any] | Book) -> Book:
+    if isinstance(data, Book):
+        return data
+    if not isinstance(data, dict):
+        return Book((), (), ("invalid_book",))
+    fixed = "orderbook_fp" in data
+    ladder = data.get("orderbook_fp") if fixed else data.get("orderbook", data)
+    if not isinstance(ladder, dict):
+        return Book((), (), ("invalid_book",))
+    issues: set[str] = set()
+
+    def levels(key: str) -> tuple[Level, ...]:
+        rows = ladder.get(key)
+        if not isinstance(rows, list):
+            issues.add(f"invalid_array_{key}" if key in ladder else f"missing_{key}")
+            return ()
+        by_price: dict[Decimal, Decimal] = {}
+        for row in rows:
+            if not isinstance(row, (list, tuple)) or len(row) != 2:
+                issues.add("invalid_level")
+                continue
+            price, size = _number(row[0]), _number(row[1])
+            if price is None or size is None:
+                issues.add("invalid_number")
+                continue
+            cents = price * 100 if fixed else price
+            if not 0 < cents < 100 or cents != cents.quantize(Decimal("0.01")):
+                issues.add("invalid_price")
+                continue
+            if cents in by_price:
+                issues.add("duplicate_price")
+                size = min(by_price[cents], size)
+            by_price[cents] = size
+        return tuple(
+            Level(p, by_price[p]) for p in sorted(by_price, reverse=True) if by_price[p] > 0
+        )
+
+    yes = levels("yes_dollars" if fixed else "yes")
+    no = levels("no_dollars" if fixed else "no")
+    return Book(yes, no, tuple(sorted(issues)))
+
+
+def parse_orderbook(orderbook: dict[str, Any] | Book) -> ParsedOrderbook:
+    """Compatibility view for signal and telemetry. Bids expose whole-contract capacity."""
+    book = canonical_book(orderbook)
+
+    def bid(side: str) -> BestLevel | None:
+        level = book.top(side)
+        return BestLevel(float(level.price), level.capacity) if level else None
+
+    def cross(side: str) -> BestLevel | None:
+        price = book.ask(side)
+        return BestLevel(float(price), 0) if price is not None else None
+
+    return ParsedOrderbook(bid("YES"), cross("YES"), bid("NO"), cross("NO"))
+
+
+def displayed_quote_size(
+    book: dict[str, Any] | Book, side: str, quote: float
+) -> int | float | str | None:
+    """JSON-compatible reported size. Keep an exact string when a JSON float would lose digits."""
+    level = canonical_book(book).at(side, Decimal(str(quote)))
+    if level is None:
+        return None
+    return level.json_quantity()
+
+
 def quote_liquidation(
-    orderbook: dict[str, Any],
+    orderbook: dict[str, Any] | Book,
     side: str,
     size_contracts: int,
     observed_ts_ms: int,
     *,
     fee_profile: FeeProfile = LEGACY_FEE_PROFILE,
 ) -> LiquidationQuote | None:
-    """Price an immediate full sale against the held contract's bid ladder."""
-    if not isinstance(orderbook, dict) or side not in ("YES", "NO") or size_contracts <= 0:
+    """Sweep whole capacity per distinct level while retaining the displayed top."""
+    if side not in ("YES", "NO") or type(size_contracts) is not int or size_contracts <= 0:
         return None
-    yes, no, dollars = _extract_prices_from(orderbook)
-    bids = _liquidation_levels(yes if side == "YES" else no, dollars)
-    opposite_bids = _liquidation_levels(no if side == "YES" else yes, dollars)
-    if not bids:
+    book = canonical_book(orderbook)
+    top, ask = book.top(side), book.ask(side)
+    if top is None or (ask is not None and top.price > ask):
         return None
-    implied_ask = 100 - opposite_bids[0][0] if opposite_bids else None
-    if implied_ask is not None and bids[0][0] > implied_ask + 1e-9:
-        return None
-
     remaining = size_contracts
-    levels: list[tuple[float, int]] = []
-    for price, available in bids:
-        size = min(available, remaining)
-        levels.append((price, size))
-        remaining -= size
+    taken: list[tuple[float, int]] = []
+    total = Decimal(0)
+    for price, available in book.whole_bids(side):
+        count = min(available, remaining)
+        total += price * count
+        taken.append((float(price), count))
+        remaining -= count
         if remaining == 0:
             return LiquidationQuote(
-                size_contracts=size_contracts,
-                price_cents=sum(price * size for price, size in levels) / size_contracts,
-                exit_fee_cents=sum(
-                    fee_profile.fee_cents(price, size, liquidity="taker", sale=True)
-                    for price, size in levels
-                ),
-                best_bid_cents=bids[0][0],
-                implied_ask_cents=implied_ask,
-                bid_levels=tuple(levels),
-                observed_ts_ms=observed_ts_ms,
-                fee_profile=fee_profile,
+                size_contracts,
+                float(total / size_contracts),
+                sum(fee_profile.fee_cents(p, n, liquidity="taker", sale=True) for p, n in taken),
+                float(top.price),
+                float(ask) if ask is not None else None,
+                tuple(taken),
+                observed_ts_ms,
+                fee_profile,
             )
     return None
-
-
-def _liquidation_levels(prices: list[Any], dollars: bool) -> list[tuple[float, int]]:
-    levels: dict[float, int] = {}
-    for item in prices if isinstance(prices, list) else []:
-        if not isinstance(item, (list, tuple)) or len(item) < 2:
-            continue
-        price = _parse_price_cents(item[0], prices_are_dollars=dollars)
-        # Paper inventory is integer-sized. Count only whole contracts per level.
-        try:
-            count = Decimal(str(item[1]))
-            size = int(count) if count.is_finite() and count > 0 else 0
-        except InvalidOperation:
-            continue
-        if price is not None and 0 < price < 100 and size > 0:
-            # A repeated level in a snapshot is ambiguous. Count it only once.
-            levels[price] = min(levels.get(price, size), size)
-    return sorted(levels.items(), reverse=True)
-
-
-def _extract_prices_from(data: dict[str, Any]) -> tuple[list[Any], list[Any], bool]:
-    """Extract YES and NO price ladders from orderbook data.
-
-    Handles both nested shape (orderbook["orderbook"]["yes"]) and flat (orderbook["yes"]).
-
-    Args:
-        data: Orderbook dict (either nested or flat).
-
-    Returns:
-        Tuple of (yes_prices, no_prices, prices_are_dollars).
-    """
-    # Fixed-point shape (Kalshi post-migration): orderbook_fp.yes_dollars/no_dollars
-    if "orderbook_fp" in data and isinstance(data["orderbook_fp"], dict):
-        yes_prices = data["orderbook_fp"].get("yes_dollars", [])
-        no_prices = data["orderbook_fp"].get("no_dollars", [])
-        return yes_prices, no_prices, True
-
-    # Try nested shape first
-    if "orderbook" in data and isinstance(data["orderbook"], dict):
-        yes_prices = data["orderbook"].get("yes", [])
-        no_prices = data["orderbook"].get("no", [])
-        return yes_prices, no_prices, False
-
-    # Fall back to flat shape
-    yes_prices = data.get("yes", [])
-    no_prices = data.get("no", [])
-    return yes_prices, no_prices, False
-
-
-def _parse_size_contracts(size_value: Any) -> int | None:
-    """Parse external size into internal integer contract count.
-
-    Supports fixed-point string counts like "16642.00" while preserving
-    integer-contract internal semantics.
-    """
-    if isinstance(size_value, str):
-        try:
-            decimal_size = Decimal(size_value)
-        except (InvalidOperation, ValueError):
-            return None
-
-        if decimal_size < 0:
-            return None
-
-        integral_size = decimal_size.to_integral_value()
-        if decimal_size != integral_size:
-            return None
-
-        return int(integral_size)
-
-    try:
-        parsed_size = int(size_value)
-    except (ValueError, TypeError):
-        return None
-
-    return parsed_size if parsed_size >= 0 else None
-
-
-def _parse_price_cents(price_value: Any, *, prices_are_dollars: bool) -> float | None:
-    """Parse external price into internal cent-based float representation."""
-    try:
-        if prices_are_dollars:
-            price_dollars = Decimal(str(price_value))
-            if price_dollars < 0 or price_dollars > 1:
-                return None
-            return float(price_dollars * Decimal("100"))
-
-        price_cents = float(price_value)
-        if 0.0 <= price_cents <= 100.0:
-            return price_cents
-    except (InvalidOperation, ValueError, TypeError):
-        return None
-
-    return None
-
-
-def displayed_quote_size(book: dict[str, Any], side: str, quote: float) -> float | None:
-    """Reported size at the real bid level, including levels below the best bid."""
-    yes, no, dollars = _extract_prices_from(book)
-    levels = yes if side == "YES" else no
-    for level in levels if isinstance(levels, list) else []:
-        if (
-            isinstance(level, (list, tuple))
-            and len(level) >= 2
-            and _parse_price_cents(level[0], prices_are_dollars=dollars) == quote
-        ):
-            try:
-                count = Decimal(str(level[1]))
-            except InvalidOperation:
-                continue
-            if count.is_finite() and count >= 0:
-                return float(count)
-    return None
-
-
-def _extract_best_bid(prices: list[Any], *, prices_are_dollars: bool = False) -> BestLevel | None:
-    """Extract best bid (highest price) from ladder.
-
-    Validates entries: price must be 0-100, size must be >= 0.
-    Skips invalid entries.
-
-    Args:
-        prices: List of [price, size] entries.
-
-    Returns:
-        BestLevel with highest price, or None if empty/invalid.
-    """
-    if not prices or not isinstance(prices, list):
-        return None
-
-    best_price: float | None = None
-    best_size: int | None = None
-
-    for item in prices:
-        if not isinstance(item, (list, tuple)) or len(item) < 2:
-            continue
-
-        parsed_price = _parse_price_cents(item[0], prices_are_dollars=prices_are_dollars)
-        parsed_size = _parse_size_contracts(item[1])
-
-        if parsed_price is None or parsed_size is None:
-            continue
-
-        if best_price is None or parsed_price > best_price:
-            best_price = parsed_price
-            best_size = parsed_size
-
-    if best_price is not None and best_size is not None:
-        return BestLevel(price=best_price, size=best_size)
-
-    return None
-
-
-def parse_orderbook(orderbook: dict[str, Any]) -> ParsedOrderbook:
-    """Parse Kalshi orderbook response to extract best bids and cross prices.
-
-    Kalshi provides BID ladders for YES and NO sides:
-    - "yes": [[price_cents, size], ...] — prices people willing to BUY YES
-    - "no":  [[price_cents, size], ...] — prices people willing to BUY NO
-
-    Best bid on each side = highest price in that ladder.
-
-    Cross prices (what you'd pay to immediately buy):
-    - cross_yes = "best immediate YES buy price implied by NO bids"
-    - cross_no = "best immediate NO buy price implied by YES bids"
-
-    Cross prices have size=0 (they do not represent actual liquidity).
-
-    Args:
-        orderbook: Raw orderbook dict from Kalshi API.
-                   Supports both nested shape (orderbook["orderbook"]["yes"])
-                   and flat shape (orderbook["yes"]).
-
-    Returns:
-        ParsedOrderbook with best bids and cross prices.
-        Returns None for prices if data is missing or malformed.
-    """
-    bid_yes: BestLevel | None = None
-    cross_yes: BestLevel | None = None
-    bid_no: BestLevel | None = None
-    cross_no: BestLevel | None = None
-
-    try:
-        # Extract YES and NO ladders (handles fixed-point, nested, and flat shapes)
-        yes_prices, no_prices, prices_are_dollars = _extract_prices_from(orderbook)
-
-        # Extract best bids
-        bid_yes = _extract_best_bid(yes_prices, prices_are_dollars=prices_are_dollars)
-        bid_no = _extract_best_bid(no_prices, prices_are_dollars=prices_are_dollars)
-
-        # Compute cross prices from opposite-side best bids (cross prices have size=0)
-        if bid_no and bid_no.price is not None:
-            cross_yes_price = 100.0 - bid_no.price
-            cross_yes = BestLevel(price=cross_yes_price, size=0)
-
-        if bid_yes and bid_yes.price is not None:
-            cross_no_price = 100.0 - bid_yes.price
-            cross_no = BestLevel(price=cross_no_price, size=0)
-
-    except (ValueError, TypeError, AttributeError, KeyError):
-        # If any parsing fails, return what we have (prefer partial data over crash)
-        pass
-
-    return ParsedOrderbook(bid_yes=bid_yes, cross_yes=cross_yes, bid_no=bid_no, cross_no=cross_no)
 
 
 def get_inside_width(bid: float | None, cross: float | None) -> float | None:

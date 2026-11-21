@@ -7,20 +7,19 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
+from kalshi_edge_engine.engine import orderbook
 from kalshi_edge_engine.engine.fees import LEGACY_FEE_VERSION, SERIES_FEE_VERSION, FeeProfile
-from kalshi_edge_engine.engine.orderbook import (
-    _extract_prices_from,
-    displayed_quote_size,
-    quote_liquidation,
-)
+from kalshi_edge_engine.engine.orderbook import Book, canonical_book
 from kalshi_edge_engine.engine.paper_sim import (
     OrderRequest,
     _conservative_participation_fill_size,
     _estimate_moved_through_available_volume,
     _estimate_price_improving_arrival_volume,
     compute_simulator_diagnostics,
+    displayed_queue_transition,
 )
 from kalshi_edge_engine.kalshi.market import MAX_ENTRY_OBSERVATION_AGE_MS, MarketObservation
+from kalshi_edge_engine.replay import Mode, b1_orderbook
 
 POLICIES = {
     "baseline": ("queue_cleared",),
@@ -32,7 +31,7 @@ MODEL_VERSION = "b1-conditional-entry-v1"
 
 def raw_best_level(body: dict[str, Any], side: str) -> tuple[float, float] | None:
     """Highest positive-size level, retaining fractional contract counts from the HTTP book."""
-    yes, no, dollars = _extract_prices_from(body)
+    yes, no, dollars = b1_orderbook._extract_prices_from(body)
     return max(
         (
             (float(Decimal(str(p)) * (100 if dollars else 1)), float(n))
@@ -93,35 +92,179 @@ class Intent:
         )
 
 
+def liquidity_evidence(
+    book: Book,
+    body: dict[str, Any],
+    side: str,
+    quote: float,
+    mode: Mode,
+    diagnostics: dict[str, Any],
+) -> dict[str, Any]:
+    """Compare reported depth with the chosen entry parser, before integer order sizing."""
+    price = Decimal(str(quote))
+    raw_top = book.top(side)
+    raw_at_quote = book.at(side, price)
+    ask = book.ask(side)
+    best = diagnostics["market_best_bid"]
+    cross = diagnostics["cross_for_side"]
+    raw_size = raw_top.quantity if raw_top else None
+    quote_size = raw_at_quote.quantity if raw_at_quote else None
+    opposite = book.top("NO" if side == "YES" else "YES")
+    expected_top = diagnostics["raw_top_of_book"][side.lower()]
+    modeled_capacity = expected_top["best_bid_size"]
+    b1_depth = b1_orderbook.entry_depth(body) if mode == Mode.B1_QUEUE else None
+    if b1_depth is None:
+        model_size = (
+            Decimal(diagnostics["reported_best_size"])
+            if diagnostics["reported_best_size"] is not None
+            else None
+        )
+        model_quote = (
+            Decimal(diagnostics["reported_quote_size"])
+            if diagnostics["reported_quote_size"] is not None
+            else None
+        )
+    else:
+        sizes = b1_depth[side]
+        model_size = Decimal(sizes[max(sizes)]) if sizes else None
+        model_quote = Decimal(sizes[price]) if price in sizes else None
+    depth_differences = 0
+    quantity_differences = 0
+    for name in ("YES", "NO"):
+        modeled = b1_depth[name] if b1_depth is not None else dict(book.whole_bids(name))
+        for level in book.levels(name):
+            if modeled.get(level.price, 0) != int(level.quantity):
+                depth_differences += 1
+            if b1_depth is not None and b1_depth[name].get(level.price, 0) != level.quantity:
+                quantity_differences += 1
+        if b1_depth is not None:
+            raw_prices = {level.price for level in book.levels(name)}
+            extra = sum(p not in raw_prices and n > 0 for p, n in modeled.items())
+            depth_differences += extra
+            quantity_differences += extra
+    complete = not book.issues and raw_top is not None and opposite is not None
+
+    def price_agreement(raw: Decimal | None, modeled: float | None) -> bool | None:
+        if raw is None and modeled is None:
+            return None
+        return modeled is not None and raw == Decimal(str(modeled))
+
+    return {
+        "raw_best_cents": str(raw_top.price) if raw_top else None,
+        "raw_ask_cents": str(ask) if ask is not None else None,
+        "best_price_agrees": price_agreement(raw_top.price if raw_top else None, best),
+        "implied_ask_agrees": price_agreement(ask, cross),
+        "raw_best_quantity": str(raw_size) if raw_size is not None else None,
+        "model_best_quantity": str(model_size) if model_size is not None else None,
+        "raw_quote_quantity": str(quote_size) if quote_size is not None else None,
+        "model_quote_quantity": str(model_quote) if model_quote is not None else None,
+        "displayed_size_agrees": raw_size == model_size and quote_size == model_quote
+        if raw_top
+        else None,
+        "best_capacity_contracts": raw_top.capacity if raw_top else None,
+        "model_best_capacity_contracts": modeled_capacity,
+        "best_capacity_agrees": raw_top.capacity == modeled_capacity if raw_top else None,
+        "opposite_capacity_contracts": opposite.capacity if opposite else None,
+        "depth_capacity_agrees": depth_differences == 0 if complete else None,
+        "depth_quantity_agrees": quantity_differences == 0 if complete else None,
+        "different_quantity_levels": quantity_differences,
+        "different_capacity_levels": depth_differences,
+        "complete_two_sided_depth": complete,
+        "uncrossed": bool(raw_top and ask is not None and raw_top.price <= ask),
+        "issues": book.issues,
+    }
+
+
+def strict_liquidity_rejection(evidence: dict[str, Any]) -> str | None:
+    if not evidence["complete_two_sided_depth"]:
+        return "unknown_or_ambiguous_depth"
+    if (
+        not evidence["uncrossed"]
+        or not evidence["best_price_agrees"]
+        or not evidence["implied_ask_agrees"]
+    ):
+        return "price_inconsistent"
+    if not (
+        evidence["displayed_size_agrees"]
+        and evidence["depth_quantity_agrees"]
+        and evidence["depth_capacity_agrees"]
+        and evidence["best_capacity_agrees"]
+    ):
+        return "liquidity_inconsistent"
+    if not evidence["best_capacity_contracts"] or not evidence["opposite_capacity_contracts"]:
+        return "subcontract_top"
+    if evidence["queue_liquidity_agrees"] is not True:
+        return "unknown_or_inconsistent_queue_liquidity"
+    return None
+
+
 @dataclass
 class Queue:
     ahead: int = 0
-    last_size: int | None = None
+    last_size: Decimal | int | None = None
     known: bool = False
+    missing_history: bool = False
+    previous_liquidity_agrees: bool | None = None
+    reference_queue: "Queue | None" = None
+    owner: tuple[str, str] | None = None
 
-    def observe(self, intent: Intent, body: dict[str, Any]) -> dict[str, Any]:
+    def observe(
+        self,
+        intent: Intent,
+        body: dict[str, Any],
+        mode: Mode = Mode.CANONICAL,
+        *,
+        reference: Book | None = None,
+    ) -> dict[str, Any]:
         order = intent.order
+        identity = (order.id, order.ticker)
+        if self.owner is not None and identity != self.owner:
+            raise ValueError("Queue state belongs to another intent or ticker")
+        self.owner = identity
         volume = intent.config["simulated_volume_per_poll"]
-        d = compute_simulator_diagnostics(order, body, self.ahead, self.last_size, volume)
+        canonical = (reference or canonical_book(body)) if mode != Mode.B2 else None
+        reference_poll = None
+        if mode == Mode.B1_QUEUE:
+            if self.reference_queue is None:
+                self.reference_queue = Queue(known=self.known, missing_history=self.missing_history)
+            reference_poll = self.reference_queue.observe(
+                intent, body, Mode.CANONICAL, reference=canonical
+            )
+        historical = b1_orderbook.parse_orderbook(body) if mode != Mode.CANONICAL else None
+        d = compute_simulator_diagnostics(
+            order, canonical or body, self.ahead, self.last_size, volume, historical_view=historical
+        )
         eligibility = d["eligibility"]
         at_quote = eligibility["at_best_price"] and not d["price_improves"]
         known_before = self.known
         path = None
         capacity = 0
-        before = self.ahead
+        before, after = displayed_queue_transition(
+            d, self.ahead, initialized=self.last_size is not None
+        )
+        prior = self.last_size
         if at_quote:
             kind = "at_displayed_quote"
-            if self.last_size is None:
-                before = d["best_size_at_bid"]
-            self.last_size = d["best_size_at_bid"]
-            self.ahead = max(0, before - d["traded_volume_estimate"])
+            if self.last_size is None and mode != Mode.B2 and not self.missing_history:
+                self.known = True
+                known_before = True  # the initialized pre-decrement queue is witnessed
+            self.last_size = (
+                Decimal(d["reported_best_size"])
+                if mode == Mode.CANONICAL
+                else d["best_size_at_bid"]
+            )
+            self.ahead = after
             capacity = max(0, d["traded_volume_estimate"] - before)
             if capacity > 0 and self.known:
                 path = "queue_cleared"
+            if mode != Mode.B2 and not self.known:
+                capacity = 0
+                eligibility["queue_cleared"] = None
         else:
             self.last_size = None
             self.ahead = 0
             self.known = True  # B1 resets its queue at every non-displayed-best poll.
+            self.missing_history = False
             if d["price_improves"]:
                 kind, path = "price_improving", "price_improves"
                 capacity = _conservative_participation_fill_size(
@@ -145,14 +288,77 @@ class Queue:
                 )
             else:
                 kind = "ineligible"
-        raw = raw_best_level(body, order.side)
-        opposite = raw_best_level(body, "NO" if order.side == "YES" else "YES")
-        raw_bid = raw[0] if raw else None
-        raw_cross = (100 - opposite[0]) if opposite else None
-        after = self.ahead if at_quote else d["queue_ahead_before"]
-        eligibility["queue_cleared"] = at_quote and after <= 0
+        extra: dict[str, Any] = {}
+        if canonical is not None:
+            consistency = liquidity_evidence(
+                canonical, body, order.side, order.quote_price_cents, mode, d
+            )
+            level = canonical.top(order.side)
+            ask = canonical.ask(order.side)
+            raw_bid = float(level.price) if level else None
+            raw_cross = float(ask) if ask is not None else None
+            current = (
+                consistency["displayed_size_agrees"]
+                and consistency["best_price_agrees"]
+                and consistency["best_capacity_agrees"]
+                and consistency["depth_capacity_agrees"]
+                and consistency["depth_quantity_agrees"]
+                and not canonical.issues
+            )
+            consistency["queue_liquidity_agrees"] = (
+                bool(current and self.previous_liquidity_agrees)
+                if self.known and prior is not None and at_quote
+                else None
+                if at_quote
+                else current
+            )
+            # A matching top on the last two books cannot repair divergence earlier in this queue.
+            source = reference_poll if reference_poll is not None else d
+            raw_known = (
+                reference_poll["queue_state_known"] if reference_poll is not None else self.known
+            )
+            raw_before = source["queue_ahead_before_decrement"] if raw_known else None
+            raw_after = source["queue_ahead_after_poll"] if raw_known else None
+            consistency.update(
+                raw_queue_before=raw_before,
+                raw_queue_after=raw_after,
+                model_queue_before=before if self.known else None,
+                model_queue_after=after if self.known else None,
+                raw_size_decrease=source["traded_volume_estimate"]
+                if source["traded_volume_source"] == "observed_size_delta"
+                else None,
+            )
+            if at_quote and consistency["queue_liquidity_agrees"] is True:
+                consistency["queue_liquidity_agrees"] = (
+                    raw_before == before
+                    and raw_after == after
+                    and source["traded_volume_estimate"] == d["traded_volume_estimate"]
+                    if raw_known
+                    else None
+                )
+            self.previous_liquidity_agrees = current if at_quote else None
+            extra["consistency"] = consistency
+            extra["queue_transition"] = (
+                "unknown_history"
+                if not self.known
+                else "initialize"
+                if at_quote and prior is None
+                else "decrement"
+                if at_quote and d["traded_volume_estimate"]
+                else "hold"
+                if at_quote
+                else "reset"
+                if prior is not None
+                else "off_quote"
+            )
+        else:
+            raw = raw_best_level(body, order.side)
+            opposite = raw_best_level(body, "NO" if order.side == "YES" else "YES")
+            raw_bid = raw[0] if raw else None
+            raw_cross = (100 - opposite[0]) if opposite else None
         return {
             **d,
+            **extra,
             "raw_bid_cents": raw_bid,
             "raw_cross_cents": raw_cross,
             "raw_top_matches_model": raw_bid == d["market_best_bid"]
@@ -163,7 +369,13 @@ class Queue:
             "queue_ahead_after_poll": after,
             "queue_before_known": known_before,
             "queue_state_known": self.known,
-            "displayed_quote_size": displayed_quote_size(body, order.side, order.quote_price_cents),
+            "displayed_quote_size": (
+                orderbook.displayed_quote_size(
+                    canonical or body, order.side, order.quote_price_cents
+                )
+                if mode == Mode.CANONICAL
+                else b1_orderbook.displayed_quote_size(body, order.side, order.quote_price_cents)
+            ),
             "eligible_path": path,
             "capacity": capacity,
         }
@@ -213,6 +425,8 @@ def draw(seed: int, session: str, sequence: int, intent_id: str) -> float:
 class Model:
     name: str
     require_raw_consistency: bool = False
+    mode: Mode = Mode.B2
+    strict: bool = False
     opportunities: Counter[str] = field(default_factory=Counter)
     candidates: Counter[str] = field(default_factory=Counter)
     rejected: Counter[str] = field(default_factory=Counter)
@@ -247,6 +461,8 @@ class Model:
             reason = f"fill_path_{path}_min_edge"
         if not reason and self.require_raw_consistency and not d["raw_top_matches_model"]:
             reason = "raw_top_disagrees_with_simulator"
+        if not reason and self.strict:
+            reason = strict_liquidity_rejection(d["consistency"])
         if reason or intent.fee is None:
             self.rejected[reason or "unknown_fees"] += 1
             return
@@ -273,6 +489,8 @@ class Model:
             "mark_5s": None,
         }
         self.fills.append(fill)
+        if self.mode != Mode.B2:
+            fill["consistency"] = d["consistency"]
         self.pending_marks.setdefault(order.ticker, []).append((fill, intent))
 
     def mark(self, event: dict[str, Any], body: dict[str, Any]) -> None:
@@ -283,7 +501,12 @@ class Model:
             if age > 7:
                 continue
             if age >= 5 and intent.fee:
-                quote = quote_liquidation(
+                quote_fn = (
+                    orderbook.quote_liquidation
+                    if self.mode == Mode.CANONICAL
+                    else b1_orderbook.quote_liquidation
+                )
+                quote = quote_fn(
                     body,
                     intent.order.side,
                     fill["size"],
@@ -311,7 +534,12 @@ class Model:
         for f in self.fills:
             exposure[f["ticker"]] += f["size"]
         return {
-            "version": MODEL_VERSION,
+            "version": MODEL_VERSION if self.mode == Mode.B2 else f"b3a-{self.mode.value}-v1",
+            **(
+                {"fills_by_path": Counter(f["path"] for f in self.fills)}
+                if self.mode != Mode.B2
+                else {}
+            ),
             "allowed_paths": POLICIES[self.name],
             "eligible_opportunities_by_path": self.opportunities,
             "candidates_by_path": self.candidates,

@@ -220,7 +220,12 @@ class KalshiClient:
                 if response.status_code == 429 and attempt == 0:
                     continue
                 response.raise_for_status()
-                data: dict[str, Any] = response.json()
+                # Keep the decimal spelling of unquoted ladder numbers through normalization.
+                data: dict[str, Any] = (
+                    response.json(parse_float=str)
+                    if path.endswith("/orderbook")
+                    else response.json()
+                )
                 if self.recorder is not None:
                     self.recorder.capture(
                         path,

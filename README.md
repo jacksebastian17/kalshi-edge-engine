@@ -302,6 +302,8 @@ For the historical evidence fields, passive recorder settings, replay ordering a
 
 To replay an archived recording offline, reconcile the paper ledger, or reproduce the Atlanta and Toronto investigations, see the [Phase B2 replay guide and research results](docs/phase-b2.md).
 
+The [Phase B3A parser and replay comparison](docs/phase-b3a.md) documents fixed-point depth, queue initialization, and the seed-42 results under historical and corrected execution semantics.
+
 ### Outcome / research endpoints
 
 - `GET /paper/metrics/outcomes?horizon_seconds=5`

@@ -13,6 +13,8 @@ from typing import Any
 from urllib.parse import unquote
 
 from kalshi_edge_engine.db.market_recorder import APP_ID
+from kalshi_edge_engine.engine.orderbook import canonical_book
+from kalshi_edge_engine.replay import Mode
 
 REPO = Path(__file__).resolve().parents[3]
 DB_NAMES = ("market_data_recorder.db", "paper_trading.db")
@@ -107,14 +109,18 @@ def open_archive(directory: Path) -> Iterator[Archive]:
                 raise ValueError("Archive changed during analysis")
 
 
-def payload(row: sqlite3.Row) -> dict[str, Any]:
+def payload(row: sqlite3.Row, mode: Mode = Mode.B2) -> dict[str, Any]:
     if row["schema_version"] != 1:
         raise ValueError("unknown_event_version")
 
     def reject_constant(value: str) -> None:
         raise ValueError(f"invalid JSON constant {value}")
 
-    data = json.loads(row["body"], parse_constant=reject_constant)
+    data = json.loads(
+        row["body"],
+        parse_constant=reject_constant,
+        parse_float=str if mode == Mode.CANONICAL and row["kind"] == "orderbook" else float,
+    )
     if not isinstance(data, dict):
         raise ValueError("invalid_object")
     path = row["request_path"].removeprefix("/historical").split("/")
@@ -130,6 +136,16 @@ def payload(row: sqlite3.Row) -> dict[str, Any]:
         if len(path) != 3 or not isinstance(market, dict) or market.get("ticker") != row["ticker"]:
             raise ValueError("invalid_market")
     elif row["kind"] == "orderbook":
+        if mode == Mode.CANONICAL:
+            normalized = canonical_book(data)
+            malformed = [issue for issue in normalized.issues if issue.startswith("invalid_")]
+            if (
+                path[3:] != ["orderbook"]
+                or malformed
+                or sum(s.startswith("missing_") for s in normalized.issues) == 2
+            ):
+                raise ValueError(f"invalid_book: {normalized.issues}")
+            return data
         fixed = "orderbook_fp" in data
         ladder = data.get("orderbook_fp", data.get("orderbook", data))
         keys = ("yes_dollars", "no_dollars") if fixed else ("yes", "no")
@@ -156,7 +172,7 @@ def payload(row: sqlite3.Row) -> dict[str, Any]:
     return data
 
 
-def validate(archive: Archive, selection: Selection) -> dict[str, Any]:
+def validate(archive: Archive, selection: Selection, *, mode: Mode = Mode.B2) -> dict[str, Any]:
     sessions: dict[str, Any] = {}
     segments: list[dict[str, Any]] = []
     issues: list[dict[str, Any]] = []
@@ -193,7 +209,7 @@ def validate(archive: Archive, selection: Selection) -> dict[str, Any]:
         elif row["id"] > 1:
             reasons.append(("missing_initial_stored_ids", [1, row["id"] - 1]))
         try:
-            payload(row)
+            payload(row, mode)
         except (ValueError, TypeError, OverflowError) as exc:
             invalid_ids.append(row["id"])
             reasons.append(("invalid_payload", str(exc)))

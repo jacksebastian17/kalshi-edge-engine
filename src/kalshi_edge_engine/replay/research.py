@@ -7,10 +7,10 @@ from collections.abc import Callable
 from dataclasses import asdict
 from typing import Any
 
-from kalshi_edge_engine.engine.orderbook import parse_orderbook
+from kalshi_edge_engine.engine.orderbook import canonical_book, parse_orderbook
 from kalshi_edge_engine.engine.signal import compute_intended_inside_quote_price_cents
 from kalshi_edge_engine.kalshi.market import MarketObservation, read_market_observation
-from kalshi_edge_engine.replay import ENGINE_VERSION, MATCH_MS
+from kalshi_edge_engine.replay import ENGINE_VERSION, MATCH_MS, Mode, b1_orderbook
 from kalshi_edge_engine.replay.archive import Archive, Selection, validate
 from kalshi_edge_engine.replay.execution import POLICIES, Intent, Model, Queue, draw, guard
 
@@ -367,8 +367,10 @@ def _compare_submission(
     submit_agreements: Counter[str],
     issues: list[dict[str, Any]],
     unavailable: Counter[str],
+    mode: Mode,
 ) -> None:
-    parsed = parse_orderbook(body)
+    parse = parse_orderbook if mode == Mode.CANONICAL else b1_orderbook.parse_orderbook
+    parsed = parse(body)
     bid, ask = (
         (parsed.bid_yes, parsed.cross_yes)
         if intent.order.side == "YES"
@@ -384,7 +386,7 @@ def _compare_submission(
         and submission.get("signal_ts_ms") is not None
         and 0 <= submission["signal_ts_ms"] - src[0] // 10**6 <= MATCH_MS
     ):
-        signal = parse_orderbook(src[1])
+        signal = parse(src[1])
         sb, sa = (
             (signal.bid_yes, signal.cross_yes)
             if intent.order.side == "YES"
@@ -424,16 +426,25 @@ def analyze(
     models: tuple[str, ...] = tuple(POLICIES),
     inspect_only: bool = False,
     require_raw_consistency: bool = False,
+    mode: Mode = Mode.B2,
+    strict: bool = False,
     emit: Callable[[dict[str, Any]], None] | None = None,
     emit_decision: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     if not 0 <= scale <= 10 or any(name not in POLICIES for name in models):
         raise ValueError("Unknown model or probability scale outside [0,10]")
-    coverage = validate(archive, selection)
+    if strict and mode == Mode.B2:
+        raise ValueError("The execution-consistency gate requires canonical or b1-queue semantics")
+    coverage = validate(archive, selection, mode=mode)
     report: dict[str, Any] = {
         "dataset_id": archive.identifier,
         "sha256": archive.hashes,
-        "engine_version": ENGINE_VERSION,
+        "engine_version": ENGINE_VERSION if mode == Mode.B2 else "b3a-receipt-replay-v1",
+        **(
+            {"semantics": mode.value, "strict_execution_consistency": strict}
+            if mode != Mode.B2
+            else {}
+        ),
         "selection": asdict(selection),
         "seed": seed,
         "probability_scale": scale,
@@ -441,6 +452,24 @@ def analyze(
         "coverage": coverage,
     }
     intents, polls = _load_history(archive, selection, coverage)
+    if mode != Mode.B2:
+        report["parser_version"] = "fixed-point-v1" if mode == Mode.CANONICAL else "historical-b1"
+        report["queue_version"] = "witnessed-initialization-v1"
+        report["execution_consistency_gate"] = {
+            "version": "entry-depth-v1",
+            "enabled": strict,
+            "requires": [
+                "complete_unambiguous_two_sided_book",
+                "uncrossed_prices",
+                "best_and_implied_ask_agree",
+                "top_and_quote_quantity_agree",
+                "reported_quantity_at_each_price_agrees",
+                "whole_capacity_at_each_price_agrees",
+                "whole_contract_on_both_tops",
+                "queue_relevant_liquidity_agrees",
+            ],
+            "reference": "Canonical interpretation of the same receipt. Agreement is internal consistency, not independent evidence of execution.",
+        }
     if inspect_only:
         return report
     report["effective_configurations"] = {}
@@ -454,7 +483,7 @@ def analyze(
     report["effective_configurations"] = {
         v: json.loads(k) for k, v in report["effective_configurations"].items()
     }
-    experiments = [Model(k, require_raw_consistency) for k in models]
+    experiments = [Model(k, require_raw_consistency, mode, strict) for k in models]
     observed: dict[str, list[dict[str, Any]]] = defaultdict(list)
     pending: dict[str, dict[str, Any]] = {}
     queues: dict[str, Queue] = {}
@@ -471,6 +500,19 @@ def analyze(
         k: sorted(p["ts_ms"] for p in group if p["poll_class"] == "unprocessed")
         for k, group in polls.items()
     }
+    witnessed_resets = {
+        k: {
+            p["ts_ms"]
+            for p in group
+            if p["poll_class"] == "unprocessed"
+            and str(json.loads(p["evidence"] or "{}").get("no_candidate_reason", "")).startswith(
+                "poll_error:"
+            )
+        }
+        for k, group in polls.items()
+    }
+    transitions: Counter[str] = Counter()
+    consistency_counts: dict[str, Counter[str]] = defaultdict(Counter)
     last_book_ms: dict[str, int] = {}
     boundaries = {s["first_id"] for s in coverage["segments"]}
     invalid = set(coverage["invalid_event_ids"])
@@ -530,9 +572,20 @@ def analyze(
         if not selection.includes(row) or row["id"] in invalid:
             continue
         e = dict(row)
-        body = json.loads(e.pop("body"))
+        raw_body = e.pop("body")
+        body = (
+            json.loads(raw_body, parse_float=str)
+            if mode == Mode.CANONICAL and e["kind"] == "orderbook"
+            else json.loads(raw_body)
+        )
         if emit:
-            emit({**e, "body": body})
+            # Preserve the spelling of unquoted decimal tokens in B3A book exports.
+            exported = (
+                json.loads(raw_body, parse_float=str)
+                if mode != Mode.B2 and e["kind"] == "orderbook"
+                else body
+            )
+            emit({**e, "body": exported})
         key, ticker = e["intent_id"], e["ticker"]
         ms = e["received_ns"] // 10**6
         intent = intents.get(key)
@@ -554,22 +607,48 @@ def analyze(
                     submit_agreements,
                     issues,
                     unavailable,
+                    mode,
                 )
             if not intent or e["source"] != "entry_simulator":
                 continue
             if key in pending:
                 abandon(key)
                 anchored.discard(key)
+                if mode != Mode.B2:
+                    queues.pop(key, None)
             if not intent.has_execution_config or ms < intent.order.created_ts_ms:
                 unavailable["missing_config_or_pre_creation_book"] += 1
                 continue
-            queue = queues.setdefault(key, Queue(known=key in anchored))
-            if bisect_left(resets[key], ms) > bisect_right(resets[key], last_book_ms.get(key, -1)):
-                queue = queues[key] = (
-                    Queue()
-                )  # Discard uncertain state across unprocessed decisions.
+            queue = queues.setdefault(
+                key, Queue(known=key in anchored, missing_history=key not in anchored)
+            )
+            reset_end = bisect_left(resets[key], ms)
+            if reset_end > bisect_right(resets[key], last_book_ms.get(key, -1)):
+                witnessed = resets[key][reset_end - 1] in witnessed_resets[key]
+                queue = queues[key] = Queue(missing_history=not witnessed)
             last_book_ms[key] = ms
-            d = queue.observe(intent, body)
+            reference = (
+                canonical_book(json.loads(raw_body, parse_float=str))
+                if mode == Mode.B1_QUEUE
+                else None
+            )
+            d = queue.observe(intent, body, mode, reference=reference)
+            if mode != Mode.B2:
+                transitions[d["queue_transition"]] += 1
+                for dimension in (
+                    "best_price_agrees",
+                    "implied_ask_agrees",
+                    "displayed_size_agrees",
+                    "best_capacity_agrees",
+                    "depth_capacity_agrees",
+                    "depth_quantity_agrees",
+                    "queue_liquidity_agrees",
+                    "complete_two_sided_depth",
+                ):
+                    value = d["consistency"][dimension]
+                    consistency_counts[dimension][
+                        "unknown" if value is None else "yes" if value else "no"
+                    ] += 1
             book = {
                 "id": e["id"],
                 "event": e,
@@ -583,6 +662,14 @@ def analyze(
         else:
             previous = latest_market.get(ticker)
             validating = pending.get(key) if e["source"] == "entry_simulator" else None
+            if (
+                mode != Mode.B2
+                and intent
+                and e["source"] == "entry_simulator"
+                and validating is None
+            ):
+                # A validation without its book breaks the chain of consecutive size deltas.
+                queues[key] = Queue(missing_history=True)
             # The book bounds the validation request start from below. Using this lower
             # bound makes the freshness check conservative when request start is unavailable.
             market = read_market_observation(
@@ -635,6 +722,9 @@ def analyze(
     report["submission_agreements"] = submit_agreements
     report["unavailable"] = unavailable
     report["models"] = {m.name: m.report() for m in experiments}
+    if mode != Mode.B2:
+        report["queue_transitions"] = transitions
+        report["consistency_poll_counts"] = consistency_counts
     report["interpretation"] = [
         "Each model conditions on the original admitted intents and observed polling schedule. Portfolio feedback and new signals are outside this comparison.",
         "A new SHA-256 keyed draw is shared across policies for each observation. B1 random draws are unknown.",

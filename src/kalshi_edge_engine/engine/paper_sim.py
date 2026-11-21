@@ -7,9 +7,16 @@ import random
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from decimal import ROUND_CEILING, Decimal
 from typing import Any
 
-from kalshi_edge_engine.engine.orderbook import displayed_quote_size
+from kalshi_edge_engine.engine.orderbook import (
+    Book,
+    ParsedOrderbook,
+    canonical_book,
+    displayed_quote_size,
+    parse_orderbook,
+)
 from kalshi_edge_engine.engine.position_exit import compute_price_delta_cents_per_contract
 from kalshi_edge_engine.kalshi.client import KalshiClient
 
@@ -79,9 +86,10 @@ def _estimate_price_improving_arrival_volume(
 
 def extract_top_of_book_snapshot(orderbook: dict[str, Any]) -> dict[str, Any]:
     """Extract top-of-book bids from normalized orderbook for YES/NO sides."""
-    from kalshi_edge_engine.engine.orderbook import parse_orderbook
+    return _top_snapshot(parse_orderbook(orderbook))
 
-    parsed = parse_orderbook(orderbook)
+
+def _top_snapshot(parsed: ParsedOrderbook) -> dict[str, Any]:
     yes_price = parsed.bid_yes.price if parsed.bid_yes else None
     yes_size = parsed.bid_yes.size if parsed.bid_yes else None
     no_price = parsed.bid_no.price if parsed.bid_no else None
@@ -95,16 +103,18 @@ def extract_top_of_book_snapshot(orderbook: dict[str, Any]) -> dict[str, Any]:
 
 def compute_simulator_diagnostics(
     order: "OrderRequest",
-    orderbook: dict[str, Any],
+    orderbook: dict[str, Any] | Book,
     queue_ahead: int,
-    last_best_size_at_bid: int | None,
+    last_best_size_at_bid: int | Decimal | None,
     simulated_volume_per_poll: int,
+    *,
+    historical_view: ParsedOrderbook | None = None,
 ) -> dict[str, Any]:
     """Compute side-aware simulator diagnostics from one orderbook snapshot."""
-    from kalshi_edge_engine.engine.orderbook import parse_orderbook
-
-    parsed = parse_orderbook(orderbook)
-    raw_top = extract_top_of_book_snapshot(orderbook)
+    book = canonical_book(orderbook) if historical_view is None else None
+    parsed = parse_orderbook(book) if book is not None else historical_view
+    assert parsed is not None
+    raw_top = _top_snapshot(parsed)
 
     best_yes_bid = parsed.bid_yes.price if parsed.bid_yes else None
     best_no_bid = parsed.bid_no.price if parsed.bid_no else None
@@ -114,12 +124,11 @@ def compute_simulator_diagnostics(
     market_best_bid = best_yes_bid if order.side == "YES" else best_no_bid
     cross_for_side = cross_yes if order.side == "YES" else cross_no
 
-    price_improves = (
-        market_best_bid is not None
-        and cross_for_side is not None
-        and order.quote_price_cents > market_best_bid
-        and order.quote_price_cents < cross_for_side
-    )
+    level = book.top(order.side) if book is not None else None
+    bid = level.price if level else market_best_bid
+    ask = book.ask(order.side) if book is not None else cross_for_side
+    limit = Decimal(str(order.quote_price_cents)) if book is not None else order.quote_price_cents
+    price_improves = bid is not None and ask is not None and bid < limit < ask
     effective_best_bid = order.quote_price_cents if price_improves else market_best_bid
 
     best_size_at_bid: int | None = None
@@ -132,14 +141,15 @@ def compute_simulator_diagnostics(
     elif order.side == "NO" and parsed.bid_no:
         best_size_at_bid = parsed.bid_no.size
 
+    reported = level.quantity if level else best_size_at_bid
+    at_limit = (
+        book.at(order.side, Decimal(str(order.quote_price_cents))) if book is not None else None
+    )
+
     # Compute price movement ONLY from effective_best_bid
-    at_best_price = effective_best_bid is not None and effective_best_bid == order.quote_price_cents
-    price_moved_through = (
-        effective_best_bid is not None and effective_best_bid > order.quote_price_cents
-    )
-    price_moved_away = (
-        effective_best_bid is not None and effective_best_bid < order.quote_price_cents
-    )
+    at_best_price = price_improves or bid == limit
+    price_moved_through = bid is not None and bid > limit
+    price_moved_away = bid is not None and bid < limit and not price_improves
     has_best_bid = effective_best_bid is not None
 
     # Invariant: If at_best_price is true, the other two must be false
@@ -170,9 +180,9 @@ def compute_simulator_diagnostics(
             # We use simulated_volume_per_poll as a proxy for arrival rate.
             traded_volume = simulated_volume_per_poll
             traded_volume_source = "heuristic_seller_arrival_proxy"
-        elif last_best_size_at_bid is not None and best_size_at_bid is not None:
+        elif last_best_size_at_bid is not None and reported is not None:
             # Use size delta if available (from real book level)
-            traded_volume = max(0, last_best_size_at_bid - best_size_at_bid)
+            traded_volume = int(max(0, last_best_size_at_bid - reported))
             traded_volume_source = "observed_size_delta"
         else:
             traded_volume = 0
@@ -184,6 +194,19 @@ def compute_simulator_diagnostics(
 
     return {
         "chosen_side": order.side,
+        **(
+            {
+                "reported_best_size": str(reported) if reported is not None else None,
+                "reported_quote_size": str(at_limit.quantity) if at_limit else None,
+                "initial_queue_ahead": int(
+                    Decimal(reported).to_integral_value(rounding=ROUND_CEILING)
+                )
+                if reported is not None
+                else None,
+            }
+            if book is not None
+            else {}
+        ),
         "raw_top_of_book": raw_top,
         "best_yes_bid": best_yes_bid,
         "best_no_bid": best_no_bid,
@@ -208,6 +231,25 @@ def compute_simulator_diagnostics(
             "queue_cleared": at_best_price and not price_improves and queue_ahead <= 0,
         },
     }
+
+
+def displayed_queue_transition(
+    d: dict[str, Any], ahead: int, *, initialized: bool
+) -> tuple[int, int]:
+    """Apply one witnessed poll. The caller resets stored state after an off-quote poll."""
+    displayed = d["eligibility"]["at_best_price"] and not d["price_improves"]
+    before = ahead
+    if displayed and not initialized:
+        before = d.get("initial_queue_ahead", d["best_size_at_bid"])
+    after = max(0, before - d["traded_volume_estimate"]) if displayed else ahead
+    d.update(
+        queue_ahead_before_poll=ahead,
+        queue_ahead_before_decrement=before,
+        queue_ahead_after=after,
+        queue_ahead_after_poll=after,
+    )
+    d["eligibility"]["queue_cleared"] = displayed and after <= 0
+    return before, after
 
 
 @dataclass
@@ -368,7 +410,6 @@ class RealisticOrderSimulator:
         last_seen_best_bid: float | None = None
         last_update_ts_ms = start_ts_ms
         latest_diagnostics: dict[str, Any] | None = None
-        queue_initialized = False
         poll_count = 0
         fill_sequence = 0
 
@@ -380,7 +421,7 @@ class RealisticOrderSimulator:
                     break
                 # Fetch current orderbook
                 awaiting_decision = True
-                orderbook = await client.get_orderbook(order.ticker)
+                orderbook = canonical_book(await client.get_orderbook(order.ticker))
                 if order.may_poll is not None and not order.may_poll():
                     if order.on_unprocessed_poll:
                         order.on_unprocessed_poll("entry_inactive_after_read")
@@ -398,32 +439,13 @@ class RealisticOrderSimulator:
                 poll_count += 1
 
                 best_bid = diagnostics["market_best_bid"]
-                best_size_at_bid = diagnostics["best_size_at_bid"]
                 cross_yes = diagnostics["cross_yes"]
                 cross_no = diagnostics["cross_no"]
                 eligibility = diagnostics["eligibility"]
                 price_improves = diagnostics["price_improves"]
                 traded_volume = diagnostics["traded_volume_estimate"]
-                queue_ahead_before_poll = queue_ahead
-                queue_ahead_before_decrement = queue_ahead
-
-                # Queue model: only update when at best price AND order not price-improving
-                # Queue decreases when we have traded volume at our price level
-                if eligibility["at_best_price"] and not price_improves:
-                    # Initialize queue on first time seeing this price level
-                    if not queue_initialized and best_size_at_bid is not None:
-                        queue_ahead = best_size_at_bid
-                        queue_initialized = True
-                    queue_ahead_before_decrement = queue_ahead
-                    # Queue decreases with traded volume
-                    queue_ahead = max(0, queue_ahead - traded_volume)
-
-                diagnostics["queue_ahead_after"] = queue_ahead
-                diagnostics["queue_ahead_before_poll"] = queue_ahead_before_poll
-                diagnostics["queue_ahead_before_decrement"] = queue_ahead_before_decrement
-                diagnostics["queue_ahead_after_poll"] = queue_ahead
-                diagnostics["eligibility"]["queue_cleared"] = (
-                    eligibility["at_best_price"] and not price_improves and queue_ahead <= 0
+                queue_ahead_before_decrement, queue_ahead = displayed_queue_transition(
+                    diagnostics, queue_ahead, initialized=last_best_size_at_bid is not None
                 )
 
                 now_ms = int(time.time() * 1000)
@@ -505,9 +527,10 @@ class RealisticOrderSimulator:
                         fill_path = "queue_cleared"
                         source = "simulated_displayed_size_decrease"
 
-                last_best_size_at_bid = best_size_at_bid if at_displayed_quote else None
+                last_best_size_at_bid = (
+                    Decimal(diagnostics["reported_best_size"]) if at_displayed_quote else None
+                )
                 if not at_displayed_quote:
-                    queue_initialized = False
                     queue_ahead = 0
                 fill = None
                 if fill_size > 0 and fill_path is not None and source is not None:
@@ -588,7 +611,6 @@ class RealisticOrderSimulator:
                 if awaiting_decision and order.on_unprocessed_poll:
                     order.on_unprocessed_poll(f"poll_error:{type(e).__name__}")
                 last_best_size_at_bid = None
-                queue_initialized = False
                 queue_ahead = 0
                 logger.debug(
                     "paper_realistic_fill_poll_error",
