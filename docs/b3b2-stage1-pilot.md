@@ -4,51 +4,55 @@ Use this pilot to test authenticated access, reconstruction and continuity over 
 
 ## Windows operation
 
-1. **Preflight in window 1.** Use a fresh run name. The optional dependency is included in the development install. Preflight reads the existing credential configuration, discovers open markets in the NBA game series, ranks active markets by reported 24-hour volume with ticker as the tie-breaker, and checks the chosen market details. Review the printed names, status and closing times. Discovery failure leaves a diagnostic in the requested directory. A new attempt uses a fresh name.
+Use the project's installed pilot environment. Keep one PowerShell window open for the job and its run variables. Each preflight below creates a fresh name in the isolated research root.
 
-   ```powershell
-   Set-Location 'C:\Users\jacks\kalshi-edge-engine'
-   .\.venv\Scripts\python.exe -m pip install -e '.[pilot]'
-   $run = 'b3b2-nba-pilot-01'
-   .\.venv\Scripts\python.exe -m tools.microstructure preflight --run $run --count 2
-   ```
+**1. Preflight.** Review the two open NBA game tickers, current status and close times. For an explicit set, replace `--count 2` with `--tickers` followed by two to four active NBA game tickers. If market validation fails, the command records the failure in that run directory.
 
-   For an explicit selection, replace `--count 2` with `--tickers` followed by two to four exact ticker arguments. Every requested ticker must appear in the open `KXNBAGAME` listing and pass a separate active-state and close-time check. Capture rechecks that same set on each connection. If a selected market has closed, prepare a new run with an explicitly reviewed selection.
+```powershell
+Set-Location 'C:\Users\jacks\kalshi-edge-engine'
+$repo = (Get-Location).Path
+$py = Join-Path $repo '.venv\Scripts\python.exe'
+$run = 'b3b2-stage11-' + [guid]::NewGuid().ToString('N')
+& $py -m tools.microstructure preflight --run $run --count 2
+if ($LASTEXITCODE -ne 0) { throw 'Preflight failed' }
+```
 
-2. **Start capture in window 1.** Keep the window open. This example stops automatically after 12 minutes. The CLI accepts 10 through 15 minutes.
+**2. Start the 12-minute capture** after reviewing the selection. Capture rechecks the same markets on every connection. It journals a read-only Windows Time status query before connecting and after collection, including a diagnostic if the query is unavailable.
 
-   ```powershell
-   .\.venv\Scripts\python.exe -m tools.microstructure capture --run $run --minutes 12
-   ```
+```powershell
+$pilotJob = Start-Job -ArgumentList $repo,$py,$run -ScriptBlock {
+    param($dir,$python,$name)
+    Set-Location -LiteralPath $dir
+    & $python -m tools.microstructure capture --run $name --minutes 12
+    if ($LASTEXITCODE -ne 0) { throw 'Capture ended with a fault' }
+}
+```
 
-3. **Inspect health in window 2.** Check both acknowledged channels, the initialized books, per-market deltas and trades, growing durable byte/record counts and the latest fault. An acknowledgement alone establishes subscription access. A quiet market can have zero observed trades.
+**3. Inspect live health.** Check both acknowledgements, initialized books, per-market counts, durable bytes and the latest fault.
 
-   ```powershell
-   Set-Location 'C:\Users\jacks\kalshi-edge-engine'
-   $run = 'b3b2-nba-pilot-01'
-   .\.venv\Scripts\python.exe -m tools.microstructure status --run $run
-   ```
+```powershell
+& $py -m tools.microstructure status --run $run
+```
 
-4. **Stop gracefully if needed.** In window 2, issue the following command while capture is running, or press Ctrl+C once in window 1. Wait for the capture command to finish. A terminal status of `sealed` indicates that the writer closed and wrote its seal. An abrupt process exit leaves the run unsealed.
+**4. Gracefully stop early if needed** while the status is `recording`. For the full 12-minute pilot, let the duration expire and continue to step 5.
 
-   ```powershell
-   .\.venv\Scripts\python.exe -m tools.microstructure stop --run $run
-   ```
+```powershell
+& $py -m tools.microstructure stop --run $run
+```
 
-5. **Create the verified backup** from either window. The command verifies the source, copies into a fresh partial directory, flushes each file, verifies the copy and publishes it as `backup`. Repeating the command verifies an existing copy. It refuses an unsealed capture.
+**5. Wait for closure and create the verified backup.** The writer seals at shutdown. Backup checks the seal and final checkpoint, copies the files, and verifies their hashes.
 
-   ```powershell
-   .\.venv\Scripts\python.exe -m tools.microstructure backup --run $run
-   ```
+```powershell
+Receive-Job -Job $pilotJob -Wait -ErrorAction Stop
+& $py -m tools.microstructure backup --run $run
+if ($LASTEXITCODE -ne 0) { throw 'Backup verification failed' }
+```
 
-6. **Produce the offline coverage report.** This command reads the backup and replays the raw journal without loading credentials or contacting the exchange. Compare its file hashes independently with PowerShell. For diagnosis of a stopped, unsealed run, `report --run $run --unsealed-prefix` reads the original journal and flags a torn final line.
+**6. Report offline.** The report reads the sealed backup. For an interrupted run, `report --run $run --unsealed-prefix` reads the original durable prefix and identifies a torn final line.
 
-   ```powershell
-   .\.venv\Scripts\python.exe -m tools.microstructure report --run $run
-   $backup = Join-Path $env:USERPROFILE "kalshi-microstructure-pilots\$run\backup"
-   Get-Content -LiteralPath (Join-Path $backup 'backup-hashes.json')
-   Get-ChildItem -LiteralPath $backup -File | Get-FileHash -Algorithm SHA256
-   ```
+```powershell
+& $py -m tools.microstructure report --run $run
+```
 
 ## Evidence contract
 
@@ -60,7 +64,7 @@ The first production pilot ran on November 21, 2026 (Pacific), using run `b3b2-s
 | `KXNBAGAME-26NOV22OKCMIA-OKC` | 1 | 122 | 14 | 72 |
 | **Total** | **2** | **299** | **23** | **168** |
 
-Depth subscription 1 covered sequences 1–301. Trade subscription 2 covered 1–23. Replay found zero sequence gaps, reconnects, malformed frames or conflicting duplicates. All 23 public prints had a unique exact coincidence under the rule below. **145 decreases remained unmatched.** Those removals have no identified cause. Raw journal SHA-256 was `2e0fd00c8b3cfd8f8ca7e36544478709908b0044add56fb55a3dc878e1eeb211`. Two independent offline report executions produced identical Windows stdout, SHA-256 `dc2eb1300aac21e814ff8b3a860d337127c8c79d0495a50f574961c17a492f11`. Backup hashes were identical before and after replay.
+Depth subscription 1 covered sequences 1–301. Trade subscription 2 covered 1–23. Replay found zero sequence gaps, reconnects, malformed frames or conflicting duplicates. All 23 public prints had a unique exact coincidence under the rule below. **145 decreases remained unmatched.** Those removals have no identified cause. Raw journal SHA-256 was `2e0fd00c8b3cfd8f8ca7e36544478709908b0044add56fb55a3dc878e1eeb211`. Two executions of the original Stage 1 inspector produced identical Windows stdout, SHA-256 `dc2eb1300aac21e814ff8b3a860d337127c8c79d0495a50f574961c17a492f11`. Backup hashes were identical before and after replay.
 
 **Decision.** This sample establishes read-only feed access and sufficient field coverage to proceed with prospective collection. Of 324 send-to-receive wall-clock differences, 323 were negative, with a median of −438.9 ms. Measure and verify clock alignment before using local arrival times for latency or cross-clock causal ordering. Order priority and hypothetical fills remain unidentified.
 
@@ -82,4 +86,8 @@ The report lists requested markets, acknowledgements, snapshots, deltas, unique 
 
 An **unmatched decrease** is a valid negative depth update without a unique public-print coincidence under the pilot's narrow check. The comparison requires an uninterrupted common segment, the same ticker, resting side, price, exact fixed-point quantity and exchange millisecond, and an explicitly non-block trade. More than one candidate on either side leaves the decrease unmatched. Differences in timestamps, batching, partial fills, missing data and cancellations can all contribute. Even an exact coincidence supplies no causal trade-to-delta identifier.
 
-The pilot declares the feeds suitable for the next validation stage only after a sealed ten-minute session with continuous captured segments, a snapshot, delta and non-block trade for every selected market, and usable clock, timing and trade-classification fields. Reported latency and raw volume guide the next collection design. A quiet or interrupted interval yields insufficient evidence. Public order priority, cancellation attribution and paper-fill calibration remain research questions.
+Read the six entries under `coverage_classifications` independently. They grade connection and subscription acknowledgements, verified durable receipts, snapshot-based depth continuity, trade continuity, relative clock alignment, and print/depth attribution. The legacy `coverage` field summarizes observed feed coverage. `short_collection_only` scopes the suitability decision to another measurement run. Timing and attribution have their own limits even when every subscription sequence is contiguous.
+
+For real-time depth, the first delta after a snapshot must have a higher clock for that market. Subsequent deltas can repeat or skip clocks. A same-market regression interrupts the reconstruction until a replacement snapshot. A lower baseline after a disconnect is recorded separately. Maintenance can reset clocks. These two subscriptions carry no authoritative maintenance interval. Inspect `market_clock_boundaries`, snapshot record numbers and each subscription's observed sequence range. Records before a fault remain auditable. A reconnect starts fresh subscriptions and book baselines. [Kalshi real-time rules](https://docs.kalshi.com/websockets/orderbook-updates)
+
+The timing section reports signed wall-clock differences, p95 by nearest rank, two-minute windows on the local monotonic timeline, clock-query observations and wall-versus-monotonic elapsed time. Source record numbers in `exact_coincidence_evidence` index the original journal from one. Untimed candidates, unknown classification or conflicting identities can prevent a coincidence from qualifying. `capture_build_provenance` reports the fingerprint supplied by that capture's manifest. [Stage 1.1 timestamp investigation and 23-row audit](b3b2-stage1-1-forensics.md)

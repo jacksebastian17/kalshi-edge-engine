@@ -22,6 +22,7 @@ from kalshi_edge_engine.kalshi.market import read_market_observation
 
 from .feed import CHANNELS
 from .journal import FORMAT, MANIFEST, STOP, RecorderError, Writer, exclusive, manifest
+from .timing import windows_clock_status
 
 WS_PATH = "/trade-api/ws/v2"
 WS_URL = "wss://external-api-ws.kalshi.com" + WS_PATH
@@ -235,7 +236,9 @@ async def capture(path: Path, seconds: float) -> str:
     writer = Writer(path)
     reason = None
     try:
+        start_status = windows_clock_status()
         writer.record("started", {"duration_seconds": seconds})
+        writer.record("clock_status", {"phase": "before_connection", **start_status})
         writer.flush(force=True)
         async with client() as api:
             reason = await collect(
@@ -254,5 +257,14 @@ async def capture(path: Path, seconds: float) -> str:
             )
         raise
     finally:
+        try:
+            if reason is not None:
+                writer.record("collection_ended", reason)
+                writer.record(
+                    "clock_status", {"phase": "after_collection", **windows_clock_status()}
+                )
+        except BaseException:
+            writer.close(None)
+            raise
         writer.close(reason)
     return reason

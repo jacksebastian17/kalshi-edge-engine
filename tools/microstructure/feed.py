@@ -2,12 +2,14 @@
 
 import hashlib
 import json
-import statistics
 from collections import Counter
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from kalshi_edge_engine.engine.orderbook import canonical_book
+
+from .coincidences import Bucket, Coincidences
+from .timing import Timing
 
 DEPTH = "orderbook_delta"
 TRADE = "trade"
@@ -47,13 +49,15 @@ class Feed:
         self.last: dict[int, int] = {}
         self.seen: dict[tuple[int, int], bytes] = {}
         self.books: dict[str, dict[str, dict[Decimal, Decimal]]] = {}
-        self.trades: dict[str, bytes] = {}
+        self.trades: set[str] = set()
+        self.observed_trade_ids: dict[str, bytes] = {}
         self.trade_contiguous = False
-        self.decreases: Counter[tuple] = Counter()
-        self.prints: Counter[tuple] = Counter()
-        self.send_lag: list[float] = []
-        self.first_connect_ns: int | None = None
-        self.last_wall_ns = 0
+        self.evidence = Coincidences()
+        self.timing = Timing()
+        self.record = 0
+        self.snapshot_record: dict[str, int] = {}
+        self.market_clock: dict[str, tuple[int, int]] = {}
+        self.clock_boundaries: list[dict] = []
         self.acks: Counter[str] = Counter()
         self.segments: list[dict[str, Any]] = []
 
@@ -73,6 +77,7 @@ class Feed:
         sid: Any = None,
         seq: Any = None,
         expected: int | None = None,
+        market: str | None = None,
     ) -> None:
         self.count[reason] += 1
         self.problems.append(
@@ -84,45 +89,106 @@ class Feed:
                 "sid": sid,
                 "seq": seq,
                 "expected": expected,
+                "record": self.record,
+                "market": market,
             }
         )
         self.epoch += 1
-        if channel != TRADE:
+        if market is not None and channel == DEPTH:
+            self.books.pop(market, None)
+        elif channel != TRADE:
             self.books.clear()
         if channel != DEPTH:
             self.trade_contiguous = False
 
-    def event(self, kind: str, value: Any, ns: int) -> bool:
+    def event(self, kind: str, value: Any, ns: int, mono: int | None = None) -> bool:
         """True requests a fresh connection. Each connection gets two fresh subscriptions."""
-        self.last_wall_ns = ns
+        if kind == "raw":
+            return self.message(value, ns, mono)
+        self.record += 1
+        self.timing.receipt(ns, mono)
         if kind == "connected":
+            if self.segments and self.segments[-1]["ended_ns"] is None:
+                self.segments[-1].update(ended_ns=ns, ended_record=self.record)
             self.disconnect()
             self.connection += 1
             self.segments.append(
                 {
                     "connection": self.connection,
                     "opened_ns": ns,
+                    "opened_record": self.record,
+                    "opened_mono_ns": mono,
                     "acks": {},
+                    "ack_records": {},
                     "snapshot_ns": {},
+                    "snapshot_records": [],
+                    "first_sequence_by_sid": {},
                     "last_sequence_by_sid": {},
+                    "first_trade_by_market": {},
                     "ended_ns": None,
                 }
             )
-            if self.first_connect_ns is None:
-                self.first_connect_ns = ns
         elif kind == "fault":
             self.problem(value["reason"], value.get("channel"), ns)
             self.problems[-1]["detail"] = value
             if self.segments and self.segments[-1]["ended_ns"] is None:
                 self.segments[-1]["ended_ns"] = ns
+                self.segments[-1]["ended_record"] = self.record
             self.disconnect()
-        elif kind == "closed" and self.segments and self.segments[-1]["ended_ns"] is None:
+        elif (
+            kind in ("collection_ended", "closed")
+            and self.segments
+            and self.segments[-1]["ended_ns"] is None
+        ):
             self.segments[-1]["ended_ns"] = ns
-        elif kind == "raw":
-            return self.message(value, ns)
+            self.segments[-1]["ended_record"] = self.record
+        elif kind == "clock_status":
+            self.timing.diagnostics.append(value)
         return False
 
-    def message(self, raw: bytes, ns: int) -> bool:
+    def observe_clock(
+        self, ticker: str, clock: int, snapshot: bool, ns: int, sid: int, seq: int | None
+    ) -> bool:
+        stats = self.by_market[ticker]
+        prior = self.market_clock.get(ticker)
+        self.market_clock[ticker] = clock, self.record
+        if prior is None:
+            return True
+        previous, record = prior
+        continuous = ticker in self.books
+        if clock < previous:
+            stats["clock_regressions"] += 1
+            self.clock_boundaries.append(
+                {
+                    "market": ticker,
+                    "connection": self.connection,
+                    "previous_record": record,
+                    "record": self.record,
+                    "previous_clock": previous,
+                    "clock": clock,
+                    "classification": "unexplained_regression"
+                    if continuous
+                    else "lower_after_interruption",
+                    "maintenance_evidence": "unavailable",
+                }
+            )
+            if continuous:
+                self.problem("market_clock_regression", DEPTH, ns, sid, seq, market=ticker)
+                # A replacement snapshot itself supplies a fresh baseline.
+                return snapshot
+        elif continuous and not snapshot:
+            if clock == previous and record == self.snapshot_record[ticker]:
+                self.problem("delta_at_snapshot_clock", DEPTH, ns, sid, seq, market=ticker)
+                return False
+            if clock == previous:
+                stats["repeated_delta_clocks"] += 1
+            elif clock > previous + 1:
+                stats["skipped_clock_transitions"] += 1
+        return True
+
+    def message(self, raw: bytes, ns: int, mono: int | None = None) -> bool:
+        self.record += 1
+        self.timing.receipt(ns, mono)
         self.count["messages"] += 1
         channel: str | None = None
         sid = seq = None
@@ -148,7 +214,9 @@ class Feed:
             if kind == "subscribed":
                 sid, channel = msg["sid"], msg["channel"]
                 if (
-                    type(sid) is not int
+                    not self.segments
+                    or self.segments[-1]["ended_ns"] is not None
+                    or type(sid) is not int
                     or sid < 1
                     or channel not in CHANNELS
                     or packet.get("id") != CHANNELS.index(channel) + 1
@@ -159,6 +227,7 @@ class Feed:
                 self.sids[sid] = channel
                 self.acks[channel] += 1
                 self.segments[-1]["acks"][channel] = sid
+                self.segments[-1]["ack_records"][channel] = self.record
                 if channel == TRADE:
                     self.trade_contiguous = True
                 return False
@@ -174,6 +243,15 @@ class Feed:
                 raise ValueError("ticker outside subscription")
             stats = self.by_market[ticker]
             stats[kind + "_received"] += 1
+            self.timing.observe(kind, packet, ns, mono)
+            if channel == TRADE and isinstance(msg.get("trade_id"), str):
+                # Even an unusable or gapped receipt can contradict an earlier trade identity.
+                identity = msg["trade_id"]
+                signature = hashlib.sha256(
+                    json.dumps(msg, sort_keys=True, default=str).encode()
+                ).digest()
+                if self.observed_trade_ids.setdefault(identity, signature) != signature:
+                    self.evidence.conflicting_ids.add(identity)
             if type(seq) is not int or seq < 1:
                 # Preserve trades and access evidence on deployments without a trade sequence.
                 if channel != TRADE or seq is not None:
@@ -190,22 +268,32 @@ class Feed:
                     if fingerprint == prior:
                         self.count["duplicate_messages"] += 1
                         return False
+                    self.evidence.conflicting_connections.add(self.connection)
+                    if channel == TRADE and isinstance(msg.get("trade_id"), str):
+                        self.evidence.conflicting_ids.add(msg["trade_id"])
                     self.problem("conflicting_sequence", channel, ns, sid, seq)
                     return True
                 self.seen[sid, seq] = fingerprint
                 last = self.last.get(sid)
                 self.last[sid] = seq
+                self.segments[-1]["first_sequence_by_sid"].setdefault(str(sid), seq)
                 self.segments[-1]["last_sequence_by_sid"][str(sid)] = seq
                 if last is not None and seq != last + 1:
                     self.problem("sequence_gaps", channel, ns, sid, seq, last + 1)
                     return True
-            sent = packet.get("sending_ts_ms")
-            if type(sent) is int:
-                self.send_lag.append((ns - sent * 1_000_000) / 1e6)
-            elif sent is not None:
-                raise ValueError("invalid sending timestamp")
-            if any(k in msg and type(msg[k]) is not int for k in ("clock", "ts_ms")):
-                raise ValueError("invalid exchange clock or timestamp")
+            event_ms = msg.get("ts_ms")
+            if "ts_ms" in msg and (type(event_ms) is not int or not 0 <= event_ms <= 2**63 - 1):
+                stats["malformed_event_timestamp"] += 1
+                event_ms = None
+            ref = {"record": self.record, "sid": sid, "seq": seq}
+            if channel == DEPTH:
+                clock = msg.get("clock")
+                if type(clock) is not int or not 0 <= clock <= 2**63 - 1:
+                    raise ValueError("missing or invalid market clock")
+                if not self.observe_clock(
+                    ticker, clock, kind == "orderbook_snapshot", ns, sid, seq
+                ):
+                    return True
             for field in (
                 ("clock",)
                 if kind == "orderbook_snapshot"
@@ -227,7 +315,11 @@ class Feed:
                     s: {x.price: x.quantity for x in book.levels(s.upper())} for s in ("yes", "no")
                 }
                 stats["snapshots"] += 1
+                self.snapshot_record[ticker] = self.record
                 self.segments[-1]["snapshot_ns"][ticker] = ns
+                self.segments[-1]["snapshot_records"].append(
+                    {"ticker": ticker, **ref, "clock": clock}
+                )
             elif kind == DEPTH:
                 if ticker not in self.books:
                     raise ValueError("delta before snapshot")
@@ -245,54 +337,100 @@ class Feed:
                 else:
                     ladder.pop(price, None)
                 stats["deltas"] += 1
+                if ticker not in self.segments[-1]["first_trade_by_market"]:
+                    stats["deltas_before_first_trade"] += 1
+                if not self.trade_contiguous:
+                    stats["deltas_without_trade_continuity"] += 1
                 if change < 0:
                     stats["decreases"] += 1
-                    if self.trade_contiguous and type(msg.get("ts_ms")) is int:
-                        self.decreases[self.epoch, ticker, side, price, -change, msg["ts_ms"]] += 1
+                    if self.trade_contiguous and event_ms is not None:
+                        key = Bucket(
+                            self.connection,
+                            self.epoch,
+                            self.snapshot_record[ticker],
+                            ticker,
+                            event_ms,
+                            side,
+                            price,
+                        )
+                        self.evidence.groups[key].decreases.append(
+                            (-change, {**ref, "clock": clock})
+                        )
+                    elif self.trade_contiguous:
+                        self.evidence.untimed.add((self.connection, self.epoch, ticker))
             else:
-                trade_id, taker = msg["trade_id"], msg["taker_side"]
-                if (
-                    "is_block_trade" in msg
-                    and type(msg["is_block_trade"]) is not bool
-                    or msg.get("taker_outcome_side", taker) != taker
-                    or msg.get("taker_book_side", "bid" if taker == "yes" else "ask")
-                    != ("bid" if taker == "yes" else "ask")
-                ):
-                    raise ValueError("invalid trade classification")
+                trade_id, taker = msg["trade_id"], msg.get("taker_side")
+                direction_known = (
+                    taker in ("yes", "no")
+                    and msg.get("taker_outcome_side") == taker
+                    and msg.get("taker_book_side") == ("bid" if taker == "yes" else "ask")
+                )
+                block = msg.get("is_block_trade")
                 quantity = fixed(msg["count_fp"], 8)
-                if (
-                    not isinstance(trade_id, str)
-                    or not trade_id
-                    or taker not in ("yes", "no")
-                    or quantity <= 0
-                ):
+                if not isinstance(trade_id, str) or not trade_id or quantity <= 0:
                     raise ValueError("invalid public trade")
                 prices = {s: fixed(msg[s + "_price_dollars"], 4) * 100 for s in ("yes", "no")}
                 if min(prices.values()) < 0 or sum(prices.values()) != 100:
                     raise ValueError("invalid trade prices")
-                signature = hashlib.sha256(
-                    json.dumps(msg, sort_keys=True, default=str).encode()
-                ).digest()
+                if trade_id in self.evidence.conflicting_ids:
+                    if event_ms is not None:
+                        self.evidence.uncertain_prints.add((self.connection, ticker, event_ms))
+                    self.problem("conflicting_trade_id", TRADE, ns, sid, seq)
+                    return True
                 if trade_id in self.trades:
-                    if self.trades[trade_id] != signature:
-                        self.problem("conflicting_trade_id", TRADE, ns, sid, seq)
-                        return True
                     stats["duplicate_trade_ids"] += 1
                     return False
-                self.trades[trade_id] = signature
+                self.trades.add(trade_id)
                 stats["unique_trades"] += 1
-                if msg.get("is_block_trade") is False:
+                self.segments[-1]["first_trade_by_market"].setdefault(
+                    ticker, {**ref, "mono_ns": mono}
+                )
+                if block is False:
                     stats["on_book_trades"] += 1
+                elif block is True:
+                    stats["block_trades"] += 1
+                else:
+                    stats["unknown_block_status"] += 1
+                if not direction_known:
+                    stats["unclassified_trade_direction"] += 1
+                if event_ms is None and block is not True:
+                    self.evidence.untimed.add((self.connection, self.epoch, ticker))
+                if (
+                    (not direction_known or type(block) is not bool)
+                    and block is not True
+                    and event_ms is not None
+                ):
+                    self.evidence.uncertain_prints.add((self.connection, ticker, event_ms))
                 if (
                     self.trade_contiguous
                     and ticker in self.books
-                    and msg.get("is_block_trade") is False
-                    and type(msg.get("ts_ms")) is int
+                    and block is False
+                    and direction_known
+                    and event_ms is not None
                 ):
                     resting = "no" if taker == "yes" else "yes"
-                    self.prints[
-                        self.epoch, ticker, resting, prices[resting], quantity, msg["ts_ms"]
-                    ] += 1
+                    key = Bucket(
+                        self.connection,
+                        self.epoch,
+                        self.snapshot_record[ticker],
+                        ticker,
+                        event_ms,
+                        resting,
+                        prices[resting],
+                    )
+                    self.evidence.groups[key].prints.append(
+                        (
+                            quantity,
+                            trade_id,
+                            {
+                                **ref,
+                                "taker_side": taker,
+                                "taker_outcome_side": msg["taker_outcome_side"],
+                                "taker_book_side": msg["taker_book_side"],
+                                "is_block_trade": block,
+                            },
+                        )
+                    )
             return False
         except (
             KeyError,
@@ -319,8 +457,74 @@ class Feed:
             "latest_problem": self.problems[-1] if self.problems else None,
         }
 
+    def classifications(self, sealed: bool, matches: int) -> dict:
+        def grade(status: str, reason: str) -> dict:
+            return {"status": status, "reason": reason}
+
+        def continuity(channel: str) -> dict:
+            faults = sorted({p["reason"] for p in self.problems if p["channel"] in (channel, None)})
+            if faults or self.connection > 1:
+                return grade("interrupted", ", ".join(faults) or "Connection boundary in capture")
+            missing = []
+            for ticker, stats in self.by_market.items():
+                if channel == DEPTH:
+                    observed = stats["snapshots"] and stats["deltas"]
+                else:
+                    observed = stats["unique_trades"]
+                if not observed:
+                    missing.append(ticker)
+            if missing:
+                return grade(
+                    "indeterminate", "Insufficient channel activity for " + ", ".join(missing)
+                )
+            if channel == TRADE and any(
+                c["deltas_without_trade_continuity"] for c in self.by_market.values()
+            ):
+                return grade(
+                    "partial_overlap",
+                    "Depth updates arrived outside acknowledged continuous trade coverage",
+                )
+            return grade(
+                "observed_contiguous",
+                "Adjacent observed sequences within this subscription, with "
+                + (
+                    "valid snapshot and deltas per market"
+                    if channel == DEPTH
+                    else "distinct prints per market. Silent intervals have no independent delivery check"
+                ),
+            )
+
+        available = bool(self.segments) and all(
+            set(s["acks"]) == set(CHANNELS) for s in self.segments
+        )
+        return {
+            "subscription_availability": grade(
+                "acknowledged" if available else "incomplete",
+                "Both channels acknowledged on each connection"
+                if available
+                else "Missing connection or channel acknowledgement",
+            ),
+            "durable_raw_capture": grade(
+                "verified" if sealed else "unsealed_prefix",
+                "Journal hash, record count, close and final checkpoint verified"
+                if sealed
+                else "No verified final seal",
+            ),
+            "orderbook_continuity": continuity(DEPTH),
+            "trade_feed_integrity": continuity(TRADE),
+            "clock_alignment_and_latency": grade(
+                "indeterminate",
+                "No independent contemporaneous bound on the relative host and exchange clock offset",
+            ),
+            "trade_depth_attribution": grade(
+                "exact_coincidences_only" if matches else "indeterminate",
+                f"{matches} unique one-to-one field coincidences. Public messages supply no common execution identifier",
+            ),
+        }
+
     def report(self, sealed: bool, elapsed_seconds: float) -> dict:
-        matches = sum(n == 1 and self.prints[key] == 1 for key, n in self.decreases.items())
+        table, ambiguous = self.evidence.report()
+        matches = len(table)
         decreases = sum(c["decreases"] for c in self.by_market.values())
         reasons = []
         if not sealed:
@@ -334,7 +538,16 @@ class Feed:
                 reasons.append(f"{ticker}: insufficient observations on one or both channels")
             if any(k.startswith("missing_") for k in c):
                 reasons.append(f"{ticker}: missing timing, clock or trade classification fields")
-        lag = sorted(self.send_lag)
+            if (
+                c["malformed_event_timestamp"]
+                or c["unknown_block_status"]
+                or c["unclassified_trade_direction"]
+            ):
+                reasons.append(f"{ticker}: unusable exchange time or print classification")
+        classes = self.classifications(sealed, matches)
+        if classes["trade_feed_integrity"]["status"] != "observed_contiguous":
+            reasons.append(classes["trade_feed_integrity"]["reason"])
+        timing = self.timing.report()
         return {
             **self.health(),
             "snapshots_received": sum(
@@ -348,23 +561,25 @@ class Feed:
             "elapsed_seconds": elapsed_seconds,
             "clean_seal_verified": sealed,
             "coverage": "incomplete" if reasons else "observed_contiguous",
-            "feed_suitability": "insufficient_evidence"
-            if reasons
-            else "suitable_for_next_pilot_stage",
+            "feed_suitability": "insufficient_evidence" if reasons else "short_collection_only",
+            "coverage_classifications": classes,
+            "clock_alignment_status": "indeterminate",
+            "one_way_latency_status": "indeterminate",
+            "cross_clock_causal_order_status": "indeterminate",
             "reasons": reasons,
             "segment_faults": self.problems,
             "segments": self.segments,
+            "market_clock_boundaries": self.clock_boundaries,
+            "last_observed_market_clock": {
+                t: {"clock": c, "record": r} for t, (c, r) in self.market_clock.items()
+            },
             "valid_book_decreases": decreases,
             "unique_exact_public_print_coincidences": matches,
             "unmatched_decreases": decreases - matches,
-            "server_send_to_local_receive_ms": {
-                "samples": len(lag),
-                "negative_samples": sum(v < 0 for v in lag),
-                "interpretation": "clock_alignment_required"
-                if lag and lag[0] < 0
-                else "uncalibrated_wall_clock_difference",
-                "min": min(lag, default=None),
-                "median": statistics.median(lag) if lag else None,
-                "max": max(lag, default=None),
-            },
+            "unmatched_non_block_prints": sum(c["on_book_trades"] for c in self.by_market.values())
+            - matches,
+            "ambiguous_candidate_groups": ambiguous,
+            "conflicting_trade_ids": sorted(self.evidence.conflicting_ids),
+            "exact_coincidence_evidence": table,
+            "server_send_to_local_receive_ms": timing,
         }

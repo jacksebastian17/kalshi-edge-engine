@@ -92,7 +92,7 @@ class Writer:
         except OSError as exc:
             raise RecorderError("Unable to append received event") from exc
         self.count += 1
-        return self.feed.event(kind, value, ns)
+        return self.feed.event(kind, value, ns, mono)
 
     def flush(self, force: bool = False) -> None:
         now = time.monotonic_ns()
@@ -163,7 +163,7 @@ def inspect(path: Path, *, require_seal: bool = True) -> dict:
         raise ValueError("Invalid manifest seal")
     feed = Feed(meta["markets"])
     count = 0
-    first = last = started = None
+    first = last = started = collection_end = None
     last_kind = last_value = None
     partial = False
     h = hashlib.sha256()
@@ -174,15 +174,26 @@ def inspect(path: Path, *, require_seal: bool = True) -> dict:
                 partial = True
                 break
             n, ns, mono, kind, val = json.loads(line)
-            if n != count + 1 or (last is not None and mono < last) or last_kind == "closed":
+            if type(ns) is not int or type(mono) is not int:
+                raise ValueError("Invalid journal receipt timestamp")
+            if (
+                type(n) is not int
+                or n != count + 1
+                or (last is not None and mono < last)
+                or last_kind == "closed"
+            ):
                 raise ValueError("Invalid journal order")
             count = n
             if kind == "started" and n == 1:
                 started = mono
             if kind == "connected" and first is None:
                 first = mono
+            if kind == "collection_ended":
+                collection_end = mono
             last, last_kind, last_value = mono, kind, val
-            feed.event(kind, base64.b64decode(val, validate=True) if kind == "raw" else val, ns)
+            feed.event(
+                kind, base64.b64decode(val, validate=True) if kind == "raw" else val, ns, mono
+            )
     if seal is not None and (
         seal["records"] != count
         or seal["messages_sha256"] != h.hexdigest()
@@ -190,7 +201,8 @@ def inspect(path: Path, *, require_seal: bool = True) -> dict:
         or seal["reason"] != last_value
     ):
         raise ValueError("Journal seal mismatch")
-    elapsed = (last - first) / 1e9 if first is not None and last is not None else 0.0
+    end = collection_end if collection_end is not None else last
+    elapsed = (end - first) / 1e9 if first is not None and end is not None else 0.0
     if path.name == "backup" or (path / BACKUP_HASHES).exists():
         expected = json.loads((path / BACKUP_HASHES).read_bytes())
         if expected != {n: digest(path / n) for n in (MANIFEST, LOG, SEAL, HEALTH)}:
@@ -202,13 +214,15 @@ def inspect(path: Path, *, require_seal: bool = True) -> dict:
         or checkpoint["durable_bytes"] != (path / LOG).stat().st_size
     ):
         raise ValueError("Final recorder checkpoint differs from seal")
-    session_seconds = (
-        (last - started) / 1e9 if last is not None and started is not None else elapsed
-    )
+    session_seconds = (end - started) / 1e9 if end is not None and started is not None else elapsed
     return {
         **feed.report(sealed, session_seconds),
         "connected_window_seconds": elapsed,
         "session": meta["session"],
+        "capture_build_provenance": {
+            "status": "recorded" if meta.get("build") else "missing_capture_build_fingerprint",
+            "manifest_build": meta.get("build"),
+        },
         "durable_records": count,
         "partial_final_record": partial,
         "seal": seal,
