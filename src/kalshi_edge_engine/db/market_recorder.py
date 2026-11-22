@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
+from kalshi_edge_engine.evidence import Receipt
+
 logger = logging.getLogger(__name__)
 APP_ID = 0x4B454D44
 MIB = 1024 * 1024
@@ -134,16 +136,35 @@ class MarketRecorder:
         data: dict[str, Any],
         body: bytes,
         base_url: str,
-    ) -> None:
+    ) -> Receipt | None:
         """Copy immutable HTTP body references on the event loop. No I/O or API calls."""
         segments = path.removeprefix("/historical").strip("/").split("/")
         if len(segments) == 2 and segments[0] == "markets":
             kind = "market"
         elif len(segments) == 3 and segments[0] == "markets" and segments[2] == "orderbook":
             kind = "orderbook"
+        elif len(segments) == 2 and segments[0] in ("events", "series"):
+            kind = "event" if segments[0] == "events" else "series"
         else:
-            return
+            return None
         self.sequence += 1
+        ticker = unquote(segments[1])
+        source, universe, intent_id = _origin.get()
+        owner = universe or "UNKNOWN"
+
+        def reference(state: str) -> Receipt:
+            return Receipt(
+                self.session,
+                self.sequence,
+                received_ns,
+                ticker,
+                kind,
+                source,
+                owner,
+                intent_id,
+                state,
+            )
+
         if (
             not self.ready
             or self.failure is not None
@@ -152,15 +173,15 @@ class MarketRecorder:
             or len(body) > min(MIB, self.max_bytes // 16)
         ):
             self.dropped += 1
-            self._fail(
+            self.invalidate(
                 "Observation dropped: recorder unavailable, oversized response or full queue"
             )
-            return
+            return reference("dropped")
         try:
-            ticker = unquote(segments[1])
+            owner = universe or self.universe_for(ticker)
             nested_key = (
-                "market"
-                if kind == "market"
+                kind
+                if kind != "orderbook"
                 else ("orderbook_fp" if "orderbook_fp" in data else "orderbook")
             )
             source_field = source_time = None
@@ -173,7 +194,6 @@ class MarketRecorder:
                         break
                 if source_field:
                     break
-            source, universe, intent_id = _origin.get()
             self.queue.append(
                 RecordedResponse(
                     session_id=self.session,
@@ -184,7 +204,7 @@ class MarketRecorder:
                     base_url=base_url,
                     lane=lane,
                     ticker=ticker,
-                    universe=universe or self.universe_for(ticker),
+                    universe=owner,
                     source=source,
                     intent_id=intent_id,
                     source_time_field=source_field,
@@ -193,15 +213,17 @@ class MarketRecorder:
                 )
             )
             self.queue_bytes += len(body)
+            return reference("queued")
         except Exception as exc:
             self.dropped += 1
             self._error(exc)
+            return reference("dropped")
 
     def require_healthy(self) -> None:
         if not self.ready or self.failure:
             raise RuntimeError(self.failure or "Market recorder is not ready")
 
-    def _fail(self, reason: str) -> None:
+    def invalidate(self, reason: str) -> None:
         if self.append_only and self.failure is None:
             self.failure = reason
             self.ready = False
@@ -225,7 +247,7 @@ class MarketRecorder:
         self.errors += 1
         self.last_error = f"{type(exc).__name__}: {exc}"
         logger.error("market_recorder_error: %s", self.last_error)
-        self._fail(self.last_error)
+        self.invalidate(self.last_error)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=1)
@@ -285,6 +307,10 @@ class MarketRecorder:
                 ticker TEXT NOT NULL, universe TEXT NOT NULL, source TEXT NOT NULL, intent_id TEXT,
                 source_time_field TEXT, source_time TEXT, body BLOB NOT NULL
             )""")
+            uniqueness = "UNIQUE " if self.append_only else ""
+            conn.execute(
+                f"CREATE {uniqueness}INDEX market_events_identity ON market_events(session_id, sequence)"
+            )
             conn.execute("CREATE INDEX market_events_receipt ON market_events(received_ns)")
             conn.execute(f"PRAGMA application_id={APP_ID}")
             conn.execute("PRAGMA user_version=1")
@@ -403,7 +429,7 @@ class MarketRecorder:
                         self.retained += written - pruned
                         self.dropped += len(batch) - written
                         if self.append_only and self.database_bytes >= self.max_bytes:
-                            self._fail("Append-only recorder capacity exhausted")
+                            self.invalidate("Append-only recorder capacity exhausted")
                     except Exception as exc:
                         self.dropped += len(batch)
                         self._error(exc)
@@ -420,7 +446,7 @@ class MarketRecorder:
                 with suppress(TimeoutError):
                     await asyncio.wait_for(self.stop.wait(), timeout=0.5)
         except BaseException as exc:
-            self._fail(f"Recorder writer interrupted: {type(exc).__name__}")
+            self.invalidate(f"Recorder writer interrupted: {type(exc).__name__}")
             raise
         finally:
             self.ready = False

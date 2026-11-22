@@ -270,6 +270,9 @@ async def test_guarded_simulator_rechecks_market_before_candidate(
         path = "price_improves" if status == "disabled_inside" else "moved_through"
         assert aggregate["polls_by_rejection_reason"] == {f"fill_path_{path}_disabled": 1}
         assert history["polls"][0]["candidate"]["fill_path_type"] == path
+        assert history["polls"][0]["evidence"]["probability_passed"] is True
+        assert history["polls"][0]["policy_accepted"] is False
+        assert history["polls"][0]["ledger_result"] == "no_fill"
         assert terminal == "timeout"
         assert history["quote_ever_observed"] is False
         assert store.get_positions() == []

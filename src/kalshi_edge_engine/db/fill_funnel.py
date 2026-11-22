@@ -4,6 +4,7 @@ import json
 import logging
 import sqlite3
 import time
+from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -37,17 +38,29 @@ def create_poll_table(cursor: sqlite3.Cursor) -> None:
     cursor.execute("CREATE INDEX IF NOT EXISTS entry_polls_intent ON entry_polls(intent_id)")
 
 
+def _queued_inputs(refs: Any, kinds: set[str]) -> bool:
+    return (
+        isinstance(refs, list)
+        and len(refs) == len(kinds)
+        and all(isinstance(ref, dict) and ref.get("capture_state") == "queued" for ref in refs)
+        and {ref.get("kind") for ref in refs} == kinds
+    )
+
+
 class FillFunnel:
     def __init__(self, db_path: str):
         self.db_path = db_path
         self.read_uri = Path(db_path).resolve().as_uri() + "?mode=ro"
         self.write_errors = 0
         self._gaps: set[str] = set()
+        self.on_write_failure: Callable[[str], None] | None = None
 
     def _write_error(self, intent_id: str) -> None:
         self.write_errors += 1
         self._gaps.add(intent_id)
         logger.exception("entry_poll_history_incomplete", extra={"intent_id": intent_id})
+        if self.on_write_failure:
+            self.on_write_failure(f"Decision journal write failed for {intent_id}")
 
     def flush_gaps(self) -> None:
         if not self._gaps:
@@ -97,6 +110,7 @@ class FillFunnel:
         accepted: bool = False,
         rejection: str | None = None,
         observation: MarketObservation | None = None,
+        validation: dict[str, Any] | None = None,
     ) -> None:
         if poll_id is None:
             return
@@ -108,9 +122,16 @@ class FillFunnel:
                     (
                         accepted,
                         rejection,
-                        json.dumps({"market_at_validation": asdict(observation)})
-                        if observation
-                        else "{}",
+                        json.dumps(
+                            {
+                                **(
+                                    {"market_at_validation": asdict(observation)}
+                                    if observation
+                                    else {}
+                                ),
+                                **({"validation": validation} if validation is not None else {}),
+                            }
+                        ),
                         poll_id,
                     ),
                 )
@@ -139,6 +160,11 @@ class FillFunnel:
             )
             incomplete = conn.execute("""SELECT COUNT(*) FROM quote_intents
                 WHERE json_extract(submission_evidence, '$.incomplete_poll_history') = 1""").fetchone()[
+                0
+            ]
+            linked_books = conn.execute("""SELECT COUNT(*) FROM entry_polls WHERE
+                json_extract(evidence, '$.schema_version') = 2 AND
+                json_extract(evidence, '$.book_receipts[0].capture_state') = 'queued'""").fetchone()[
                 0
             ]
             classes = dict(conn.execute("SELECT poll_class, COUNT(*) FROM entry_polls GROUP BY 1"))
@@ -184,6 +210,7 @@ class FillFunnel:
             "intents_with_marked_history_gaps": incomplete,
             "intents_with_quote_observed": seen,
             "polls": sum(classes.values()),
+            "polls_with_queued_book_reference": linked_books,
             "polls_by_class": classes,
             "polls_by_rejection_reason": reasons,
             "polls_by_no_candidate_reason": no_candidate,
@@ -215,9 +242,28 @@ class FillFunnel:
                 dict(fill)
                 for fill in conn.execute(
                     """SELECT id, fill_ts_ms, fill_price_cents, fill_size, fill_fee_cents,
-                              execution_source, note, market_timing_invalidated
+                              execution_source, note, market_timing_invalidated, outcome_fee_audit,
+                              observed_5s_ts_ms, observed_15s_ts_ms, observed_30s_ts_ms, observed_60s_ts_ms,
+                              mark_5s_after_fill_cents, pnl_5s_after_fill_cents,
+                              mark_15s_after_fill_cents, pnl_15s_after_fill_cents,
+                              mark_30s_after_fill_cents, pnl_30s_after_fill_cents,
+                              mark_60s_after_fill_cents, pnl_60s_after_fill_cents
                        FROM paper_fills WHERE intent_id = ? AND COALESCE(note, '') NOT LIKE 'exit%'
                        ORDER BY fill_ts_ms, id""",
+                    (intent_id,),
+                )
+            ]
+            for fill in result["persisted_fills"]:
+                fill["outcome_fee_audit"] = json.loads(fill["outcome_fee_audit"] or "{}")
+            result["lifecycle_exits"] = [
+                {**dict(exit_row), "evidence": json.loads(exit_row["evidence"] or "null")}
+                for exit_row in conn.execute(
+                    """SELECT f.id,f.intent_id,f.fill_ts_ms,f.fill_price_cents,f.fill_size,
+                              f.execution_source,f.note,f.realized_pnl_delta_cents,i.submission_evidence AS evidence
+                       FROM paper_fills f JOIN quote_intents i ON i.id=f.intent_id
+                       WHERE i.id LIKE 'exit_intent:%' AND f.position_lifecycle_id IN
+                           (SELECT position_lifecycle_id FROM paper_fills WHERE intent_id=?)
+                       ORDER BY f.fill_ts_ms,f.id""",
                     (intent_id,),
                 )
             ]
@@ -238,6 +284,31 @@ class FillFunnel:
                     if poll["candidate_id"] and poll["rejection_reason"]
                     else None
                 )
+                item["ledger_result"] = (
+                    "persisted"
+                    if item["persisted_fill_id"]
+                    else (
+                        "no_fill"
+                        if not item["candidate_id"] or item["rejection_reason"]
+                        else "unresolved"
+                    )
+                )
+                ev = item["evidence"]
+                if ev.get("schema_version") != 2:
+                    item["receipt_resolution"] = "legacy_unlinked"
+                else:
+                    required = [ev.get("book_receipts")]
+                    if (result["submission_evidence"] or {}).get("validation_required"):
+                        required.append((ev.get("validation") or {}).get("receipts"))
+                    pending = all(
+                        group and all(ref.get("capture_state") == "queued" for ref in group)
+                        for group in required
+                    )
+                    item["receipt_resolution"] = (
+                        "requires_recorder_snapshot"
+                        if pending and not ev.get("interrupted")
+                        else "incomplete"
+                    )
                 polls.append(item)
         initial = result["submission_evidence"]
         result["historical_poll_coverage"] = (
@@ -247,6 +318,24 @@ class FillFunnel:
             result["historical_poll_coverage"] = "incomplete"
         result["poll_count"] = len(polls) if initial is not None else None
         result["polls"] = polls
+        result["receipt_resolution"] = "legacy_unlinked"
+        if initial and initial.get("schema_version") == 2:
+            signal_kinds = {"orderbook"}
+            if (result["fee_profile"] or {}).get("series_ticker"):
+                signal_kinds.update(("market", "event", "series"))
+            queued = (
+                _queued_inputs(initial.get("signal_receipts"), signal_kinds)
+                and _queued_inputs(initial.get("book_receipts"), {"orderbook"})
+                and (
+                    not initial.get("validation_required")
+                    or _queued_inputs(initial.get("market_receipts"), {"market"})
+                )
+            )
+            result["receipt_resolution"] = (
+                "requires_recorder_snapshot"
+                if queued and not initial.get("incomplete_poll_history")
+                else "incomplete"
+            )
         observed = [p["evidence"] for p in polls]
         if initial and initial.get("book_observed_ts_ms") is not None:
             observed.append(initial)

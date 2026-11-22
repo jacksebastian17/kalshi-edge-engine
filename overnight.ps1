@@ -2,14 +2,14 @@
 param(
     [Parameter(Mandatory)][ValidateSet('Preflight','Backend','Enable','Status','Backup')]
     [string]$Action,
-    [string]$RunDirectory = (Join-Path $env:USERPROFILE 'kalshi-paper-runs\b3a-2026-11-21')
+    [string]$RunDirectory = (Join-Path $env:USERPROFILE 'kalshi-paper-runs\b3b1-2026-11-21')
 )
 $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $PSScriptRoot
 $run = [IO.Path]::GetFullPath($RunDirectory)
 $env:PAPER_DB_PATH = Join-Path $run 'paper_trading.db'
 $env:MARKET_RECORDER_DB = Join-Path $run 'market_data_recorder.db'
-$env:PAPER_EXPERIMENT_ID = 'canonical_fixed_point_b3a_v1'
+$env:PAPER_EXPERIMENT_ID = 'decision_linked_b3b1_v1'
 $env:ENABLE_MARKET_DATA_RECORDER = 'true'
 $env:MARKET_RECORDER_APPEND_ONLY = 'true'
 $env:MARKET_RECORDER_MAX_MIB = '4096'

@@ -1,5 +1,7 @@
 # Phase B1 execution diagnostics and passive recording
 
+Historical B1 capture and diagnostics used a rolling recorder and the original book interpretation. For fresh experiments, follow the [B3B1 Windows runbook](phase-b3b1.md#overnight-run-on-windows).
+
 ## Reading the fill funnel
 
 The instrumented cohort starts with entries inserted by B1. Each entry keeps its side-specific submission book, displayed sizes, modeled fees, effective execution settings and subsequent simulator polls. A missing submission book has an error field. The per-intent endpoint returns stored history and ledger fills. The older debug endpoint evaluates a **current** book and labels its response accordingly.

@@ -6,6 +6,7 @@ import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from kalshi_edge_engine.db.market_recorder import capture_origin
 from kalshi_edge_engine.db.paper_store import (
     MARK_MAX_AGE_MS,
     OUTCOME_MAX_DELAY_MS,
@@ -15,6 +16,7 @@ from kalshi_edge_engine.db.paper_store import (
 from kalshi_edge_engine.engine.fees import LEGACY_FEE_PROFILE, FeeProfile, estimate_taker_fee_cents
 from kalshi_edge_engine.engine.orderbook import LiquidationQuote, quote_liquidation
 from kalshi_edge_engine.engine.position_exit import decide_position_exit, should_take_profit
+from kalshi_edge_engine.evidence import EVIDENCE_VERSION, Receipt, receipt_scope, references
 from kalshi_edge_engine.kalshi.client import KalshiClient
 from kalshi_edge_engine.kalshi.market import read_market_observation, read_settlement
 from kalshi_edge_engine.kalshi.read_budget import ReadBudget, read_priority
@@ -25,15 +27,19 @@ logger = logging.getLogger(__name__)
 SETTLEMENT_POLL_SECONDS = 15
 
 
-async def _position_fee_profiles(tickers: set[str]) -> dict[str, FeeProfile | None]:
+async def _position_fee_profiles(
+    tickers: set[str],
+) -> dict[str, tuple[FeeProfile | None, tuple[Receipt, ...]]]:
     resolver = runtime_state.market_fees
     if resolver is None:
-        return dict.fromkeys(tickers)
+        return dict.fromkeys(tickers, (None, ()))
     limit = asyncio.Semaphore(5)
 
-    async def resolve(ticker: str) -> FeeProfile | None:
+    async def resolve(ticker: str) -> tuple[FeeProfile | None, tuple[Receipt, ...]]:
         async with limit:
-            return await resolver.resolve(ticker)
+            with receipt_scope() as refs:
+                profile = await resolver.resolve(ticker)
+            return profile, tuple(refs)
 
     ordered = sorted(tickers)
     profiles = await asyncio.gather(*(resolve(ticker) for ticker in ordered))
@@ -44,20 +50,26 @@ async def _reconcile_markets(
     store: PaperStore,
     client: KalshiClient,
     tickers: set[str],
-    checks: dict[str, tuple[float, dict[str, Any] | None]],
+    checks: dict[str, tuple[float, dict[str, Any] | None, tuple[Receipt, ...]]],
 ) -> set[str]:
     """Poll held markets independently of depth and keep known nontrading markets off the bid path."""
     limit = asyncio.Semaphore(5)
 
     async def refresh(ticker: str) -> None:
-        deadline, previous = checks.get(ticker, (0, None))
+        deadline, previous, checked_refs = checks.get(ticker, (0, None, ()))
         if time.monotonic() < deadline:
             return
         market: dict[str, Any] | None = previous
         async with limit:
             try:
                 requested_ms = int(time.time() * 1000)
-                fetched = await client.get_market(ticker)
+                with (
+                    capture_origin(
+                        "inventory", runtime_state.scanner_state.ticker_universe_map.get(ticker)
+                    ),
+                    receipt_scope() as refs,
+                ):
+                    fetched = await client.get_market(ticker)
                 if isinstance(fetched, dict) and fetched.get("ticker") == ticker:
                     observation = read_market_observation(
                         fetched,
@@ -67,17 +79,18 @@ async def _reconcile_markets(
                     )
                     if observation is None or store.record_market_observation(observation):
                         market = fetched
+                        checked_refs = tuple(refs)
             except Exception:
                 logger.debug(
                     "paper_market_status_unavailable", extra={"ticker": ticker}, exc_info=True
                 )
-        checks[ticker] = (time.monotonic() + SETTLEMENT_POLL_SECONDS, market)
+        checks[ticker] = (time.monotonic() + SETTLEMENT_POLL_SECONDS, market, checked_refs)
 
     for stale_ticker in checks.keys() - tickers:
         del checks[stale_ticker]
     await asyncio.gather(*(refresh(ticker) for ticker in sorted(tickers)))
     blocked = {ticker for ticker in tickers if store.market_blocks_trading(ticker)}
-    for ticker, (_, market) in checks.items():
+    for ticker, (_, market, checked_refs) in checks.items():
         if not market:
             continue
         if market.get("status") in (
@@ -93,7 +106,13 @@ async def _reconcile_markets(
             blocked.add(ticker)
         settlement = read_settlement(market)
         if settlement is not None and store.reconcile_market_settlement(
-            settlement, now_ms=int(time.time() * 1000)
+            settlement,
+            now_ms=int(time.time() * 1000),
+            evidence={
+                "schema_version": EVIDENCE_VERSION,
+                "decision_ns": time.time_ns(),
+                "market_receipts": references(checked_refs),
+            },
         ):
             logger.info(
                 "paper_market_settled", extra={"ticker": ticker, "result": settlement.result}
@@ -102,26 +121,32 @@ async def _reconcile_markets(
 
 
 async def _fetch_books(
-    client: KalshiClient, tickers: set[str]
-) -> dict[str, tuple[dict[str, Any], int]]:
+    client: KalshiClient, tickers: set[str], source: str = "inventory"
+) -> dict[str, tuple[dict[str, Any], int, tuple[Receipt, ...]]]:
     """Fetch each needed ticker once, with a bounded number of concurrent GETs."""
     semaphore = asyncio.Semaphore(5)
 
-    async def fetch(ticker: str) -> tuple[str, dict[str, Any], int] | None:
+    async def fetch(ticker: str) -> tuple[str, dict[str, Any], int, tuple[Receipt, ...]] | None:
         async with semaphore:
             try:
                 async with asyncio.timeout(MARK_MAX_AGE_MS / 1000):
                     started = time.monotonic()
-                    orderbook = await client.get_orderbook(ticker)
+                    with (
+                        capture_origin(
+                            source, runtime_state.scanner_state.ticker_universe_map.get(ticker)
+                        ),
+                        receipt_scope() as refs,
+                    ):
+                        orderbook = await client.get_orderbook(ticker)
                     if (time.monotonic() - started) * 1000 > MARK_MAX_AGE_MS:
                         return None
-                    return ticker, orderbook, int(time.time() * 1000)
+                    return ticker, orderbook, int(time.time() * 1000), tuple(refs)
             except Exception:
                 logger.debug("paper_orderbook_unavailable", extra={"ticker": ticker}, exc_info=True)
                 return None
 
     results = await asyncio.gather(*(fetch(ticker) for ticker in sorted(tickers)))
-    return {row[0]: (row[1], row[2]) for row in results if row is not None}
+    return {row[0]: (row[1], row[2], row[3]) for row in results if row is not None}
 
 
 async def _observe_due_outcomes(store: PaperStore, client: KalshiClient, now_ms: int) -> None:
@@ -149,11 +174,11 @@ async def _observe_due_outcomes(store: PaperStore, client: KalshiClient, now_ms:
     async def observe(ticker: str, rows: list[tuple[int, dict[str, Any]]]) -> None:
         async with limit:
             # Sample the book before waiting for fee metadata. Persist each ticker as it finishes.
-            books = await _fetch_books(client, {ticker})
+            books = await _fetch_books(client, {ticker}, "outcome")
             if ticker not in books:
                 return
-            book, observed_ts_ms = books[ticker]
-            profile = (await _position_fee_profiles({ticker}))[ticker]
+            book, observed_ts_ms, refs = books[ticker]
+            profile, fee_refs = (await _position_fee_profiles({ticker}))[ticker]
             for horizon, row in rows:
                 if profile is None and row["experiment_id"]:
                     continue
@@ -181,6 +206,12 @@ async def _observe_due_outcomes(store: PaperStore, client: KalshiClient, now_ms:
                     pnl_after_fill_cents=pnl,
                     observed_ts_ms=observed_ts_ms,
                     liquidation=quote,
+                    evidence={
+                        "schema_version": EVIDENCE_VERSION,
+                        "book_receipts": references(refs),
+                        "fee_receipts": references(fee_refs),
+                        "decision_ns": time.time_ns(),
+                    },
                 )
 
     await asyncio.gather(*(observe(ticker, rows) for ticker, rows in by_ticker.items()))
@@ -190,17 +221,20 @@ async def _refresh_positions(
     store: PaperStore,
     client: KalshiClient,
     *,
-    market_checks: dict[str, tuple[float, dict[str, Any] | None]] | None = None,
+    market_checks: dict[str, tuple[float, dict[str, Any] | None, tuple[Receipt, ...]]]
+    | None = None,
 ) -> dict[tuple[str, str], LiquidationQuote]:
     positions = store.get_positions()
     tickers = {pos["ticker"] for pos in positions}
+    if market_checks is None:
+        market_checks = {}
     blocked = await _reconcile_markets(
         store,
         client,
         tickers
         | store.get_open_intent_tickers()
         | store.get_recent_guarded_fill_tickers(int(time.time() * 1000) - 90_000),
-        market_checks if market_checks is not None else {},
+        market_checks,
     )
     profiles = await _position_fee_profiles(tickers - blocked)
     books = await _fetch_books(client, tickers - blocked)
@@ -210,8 +244,8 @@ async def _refresh_positions(
         ticker, side, size = pos["ticker"], pos["side"], pos["net_contracts"]
         if ticker not in books:
             continue
-        book, observed_ts_ms = books[ticker]
-        profile = profiles[ticker]
+        book, observed_ts_ms, refs = books[ticker]
+        profile, fee_refs = profiles[ticker]
         if profile is None and pos["clean_lifecycle"]:
             continue
         quote = quote_liquidation(
@@ -243,7 +277,23 @@ async def _refresh_positions(
             liquidation_fees_cents_per_contract=(entry_fees + quote.exit_fee_cents) / size,
         )
         if decision.reason and store.close_position(
-            pos, quote, now_ms=now_ms, reason=decision.reason
+            pos,
+            quote,
+            now_ms=now_ms,
+            reason=decision.reason,
+            evidence={
+                "schema_version": EVIDENCE_VERSION,
+                "decision_ns": time.time_ns(),
+                "book_receipts": references(refs),
+                "fee_receipts": references(fee_refs),
+                "market_receipts": references(market_checks[ticker][2]),
+                "max_hold_seconds": runtime_config.PAPER_MAX_HOLD_SECONDS
+                if max_hold is None
+                else max_hold,
+                "take_profit_cents_per_contract": runtime_config.PAPER_TAKE_PROFIT_CENTS_PER_CONTRACT
+                if take_profit is None
+                else take_profit,
+            },
         ):
             logger.info(
                 "paper_position_closed",
@@ -280,7 +330,7 @@ async def _outcome_maintenance_loop(client: KalshiClient) -> None:
 
 
 async def _position_maintenance_loop(client: KalshiClient) -> None:
-    market_checks: dict[str, tuple[float, dict[str, Any] | None]] = {}
+    market_checks: dict[str, tuple[float, dict[str, Any] | None, tuple[Receipt, ...]]] = {}
     while True:
         store = runtime_state.paper_store
         if runtime_config.ENABLE_PAPER_TRADING and store is not None:

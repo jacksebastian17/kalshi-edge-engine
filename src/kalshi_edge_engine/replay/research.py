@@ -586,6 +586,8 @@ def analyze(
                 else body
             )
             emit({**e, "body": exported})
+        if e["kind"] in ("event", "series"):
+            continue
         key, ticker = e["intent_id"], e["ticker"]
         ms = e["received_ns"] // 10**6
         intent = intents.get(key)

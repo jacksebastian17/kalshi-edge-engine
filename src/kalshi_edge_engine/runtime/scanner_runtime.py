@@ -6,9 +6,11 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+from kalshi_edge_engine.db.market_recorder import capture_origin
 from kalshi_edge_engine.engine.fees import LEGACY_FEE_PROFILE
 from kalshi_edge_engine.engine.signal import Signal, score_signal
 from kalshi_edge_engine.engine.universe import discover_nba_universe
+from kalshi_edge_engine.evidence import receipt_scope
 from kalshi_edge_engine.kalshi.client import KalshiClient, KalshiReadBudgetError
 from kalshi_edge_engine.kalshi.read_budget import ReadBudget
 from kalshi_edge_engine.runtime import config as runtime_config
@@ -52,6 +54,21 @@ async def _discover_enabled_universe_markets(
             merged_set.add(ticker)
 
     return sorted(merged_set), ticker_universe_map, discovered_universe_counts, enabled_universes
+
+
+async def _score_market(api_client: KalshiClient, ticker: str, universe_key: str) -> Signal:
+    with capture_origin("scanner", universe_key), receipt_scope() as refs:
+        resolver = runtime_state.market_fees
+        fee_profile = (
+            await resolver.resolve(ticker, for_entry=True)
+            if resolver is not None
+            else LEGACY_FEE_PROFILE
+        )
+        orderbook = await api_client.get_orderbook(ticker)
+        signal = score_signal(ticker, orderbook, universe=universe_key, fee_profile=fee_profile)
+    signal.receipts = tuple(refs)
+    signal.scored_ns = time.time_ns()
+    return signal
 
 
 async def _nba_scanner_loop(
@@ -164,24 +181,11 @@ async def _nba_scanner_loop(
                 """Fetch a signal and distinguish budget pressure from ticker-specific errors."""
                 async with sem:
                     try:
-                        resolver = runtime_state.market_fees
-                        fee_profile = (
-                            await resolver.resolve(ticker, for_entry=True)
-                            if resolver is not None
-                            else LEGACY_FEE_PROFILE
-                        )
-                        orderbook = await api_client.get_orderbook(ticker)
                         universe_key = runtime_state.scanner_state.ticker_universe_map.get(
-                            ticker,
-                            "UNKNOWN",
+                            ticker, "UNKNOWN"
                         )
-                        return (
-                            ticker,
-                            score_signal(
-                                ticker, orderbook, universe=universe_key, fee_profile=fee_profile
-                            ),
-                            False,
-                        )
+                        signal = await _score_market(api_client, ticker, universe_key)
+                        return ticker, signal, False
                     except KalshiReadBudgetError:
                         return ticker, None, True
                     except Exception as e:

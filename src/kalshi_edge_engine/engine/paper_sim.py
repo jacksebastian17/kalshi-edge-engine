@@ -18,6 +18,7 @@ from kalshi_edge_engine.engine.orderbook import (
     parse_orderbook,
 )
 from kalshi_edge_engine.engine.position_exit import compute_price_delta_cents_per_contract
+from kalshi_edge_engine.evidence import EVIDENCE_VERSION, MODEL, Receipt, receipt_scope, references
 from kalshi_edge_engine.kalshi.client import KalshiClient
 
 logger = logging.getLogger(__name__)
@@ -278,6 +279,7 @@ class OrderRequest:
     entry_fee_per_contract_cents: float | None = None
     may_poll: Callable[[], bool] | None = None
     on_unprocessed_poll: Callable[[str], None] | None = None
+    on_unprocessed_evidence: Callable[[dict[str, Any]], None] | None = None
 
     def __post_init__(self) -> None:
         """Normalize take-profit semantics to per-contract cents."""
@@ -413,7 +415,33 @@ class RealisticOrderSimulator:
         poll_count = 0
         fill_sequence = 0
 
+        previous_refs: tuple[Receipt, ...] = ()
+
+        def incomplete(reason: str, refs: list[Receipt], evidence: dict[str, Any]) -> None:
+            if order.on_unprocessed_evidence:
+                order.on_unprocessed_evidence(
+                    {
+                        "evaluated_path": None,
+                        "draw_eligible": False,
+                        "random_draw": None,
+                        "probability_passed": None,
+                        "effective_probability": None,
+                        **evidence,
+                        "schema_version": EVIDENCE_VERSION,
+                        "model": MODEL,
+                        "book_receipts": references(refs),
+                        "decision_ns": time.time_ns(),
+                        "no_candidate_reason": reason,
+                        "interrupted": True,
+                        "no_draw_reason": evidence.get("no_draw_reason", reason),
+                    }
+                )
+            elif order.on_unprocessed_poll:
+                order.on_unprocessed_poll(reason)
+
         while elapsed_ms < horizon_ms and remaining_size > 0:
+            refs: list[Receipt] = []
+            diagnostics: dict[str, Any] = {}
             awaiting_decision = False
             try:
                 if order.may_poll is not None and not order.may_poll():
@@ -421,10 +449,10 @@ class RealisticOrderSimulator:
                     break
                 # Fetch current orderbook
                 awaiting_decision = True
-                orderbook = canonical_book(await client.get_orderbook(order.ticker))
+                with receipt_scope() as refs:
+                    orderbook = canonical_book(await client.get_orderbook(order.ticker))
                 if order.may_poll is not None and not order.may_poll():
-                    if order.on_unprocessed_poll:
-                        order.on_unprocessed_poll("entry_inactive_after_read")
+                    incomplete("entry_inactive_after_read", refs, diagnostics)
                     exit_reason = "entry_canceled"
                     break
 
@@ -490,8 +518,42 @@ class RealisticOrderSimulator:
                 fill_path: str | None = None
                 source: str | None = None
                 at_displayed_quote = eligibility["at_best_price"] and not price_improves
+                path: str | None = None
+                probability: float | None = None
+                beyond = (
+                    max(0, traded_volume - queue_ahead_before_decrement)
+                    if at_displayed_quote
+                    else None
+                )
                 if eligibility["price_moved_through"]:
-                    if random.random() < self.fill_probability_price_moved:
+                    path, probability = "moved_through", self.fill_probability_price_moved
+                elif price_improves:
+                    path, probability = "price_improves", self.fill_probability_price_improves
+                elif at_displayed_quote:
+                    path, probability = "queue_cleared", self.fill_probability_at_best
+                eligible = probability is not None and (path != "queue_cleared" or bool(beyond))
+                draw = random.random() if eligible else None
+                passed = (
+                    draw < probability if draw is not None and probability is not None else None
+                )
+                diagnostics.update(
+                    schema_version=EVIDENCE_VERSION,
+                    model=MODEL,
+                    book_receipts=references(refs),
+                    previous_book_receipts=references(previous_refs),
+                    decision_ns=time.time_ns(),
+                    evaluated_path=path,
+                    draw_eligible=eligible,
+                    effective_probability=probability,
+                    random_draw=draw,
+                    probability_passed=passed,
+                    volume_beyond_queue=beyond,
+                    no_draw_reason=None
+                    if eligible
+                    else ("insufficient_volume_beyond_queue" if path else "price_ineligible"),
+                )
+                if eligibility["price_moved_through"]:
+                    if passed:
                         available = _estimate_moved_through_available_volume(
                             traded_volume_estimate=traded_volume,
                             simulated_volume_per_poll=self.simulated_volume_per_poll,
@@ -505,7 +567,7 @@ class RealisticOrderSimulator:
                         fill_path = "moved_through"
                         source = "simulated_higher_bid_heuristic"
                 elif price_improves:
-                    if random.random() < self.fill_probability_price_improves:
+                    if passed:
                         available = _estimate_price_improving_arrival_volume(
                             simulated_volume_per_poll=self.simulated_volume_per_poll,
                         )
@@ -519,14 +581,21 @@ class RealisticOrderSimulator:
                         source = "simulated_seller_arrival_heuristic"
                 elif at_displayed_quote:
                     remaining_proxy_volume = traded_volume - queue_ahead_before_decrement
-                    if (
-                        remaining_proxy_volume > 0
-                        and random.random() < self.fill_probability_at_best
-                    ):
+                    if passed:
                         fill_size = min(remaining_size, remaining_proxy_volume)
                         fill_path = "queue_cleared"
                         source = "simulated_displayed_size_decrease"
 
+                diagnostics["available_volume_estimate"] = (
+                    available if passed and path in ("moved_through", "price_improves") else beyond
+                )
+                diagnostics["execution_volume_source"] = {
+                    "moved_through": "higher_bid_heuristic",
+                    "price_improves": "seller_arrival_heuristic",
+                    "queue_cleared": "displayed_size_decrease",
+                }.get(path or "")
+                diagnostics["proposed_fill_size"] = fill_size
+                previous_refs = tuple(refs) if at_displayed_quote else ()
                 last_best_size_at_bid = (
                     Decimal(diagnostics["reported_best_size"]) if at_displayed_quote else None
                 )
@@ -563,6 +632,10 @@ class RealisticOrderSimulator:
                     diagnostics["poll_class"] = poll_class
                     diagnostics["displayed_quote_size"] = displayed_quote_size(
                         orderbook, order.side, order.quote_price_cents
+                    )
+                    level_at_quote = orderbook.at(order.side, Decimal(str(order.quote_price_cents)))
+                    diagnostics["whole_quote_capacity"] = (
+                        level_at_quote.capacity if level_at_quote else 0
                     )
                     if fill is None:
                         if at_displayed_quote and traded_volume <= queue_ahead_before_decrement:
@@ -604,12 +677,13 @@ class RealisticOrderSimulator:
                     break
 
             except asyncio.CancelledError:
-                if awaiting_decision and order.on_unprocessed_poll:
-                    order.on_unprocessed_poll("poll_interrupted")
+                if awaiting_decision:
+                    incomplete("poll_interrupted", refs, diagnostics)
                 raise
             except Exception as e:
-                if awaiting_decision and order.on_unprocessed_poll:
-                    order.on_unprocessed_poll(f"poll_error:{type(e).__name__}")
+                if awaiting_decision:
+                    incomplete(f"poll_error:{type(e).__name__}", refs, diagnostics)
+                previous_refs = ()
                 last_best_size_at_bid = None
                 queue_ahead = 0
                 logger.debug(

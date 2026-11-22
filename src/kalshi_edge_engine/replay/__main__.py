@@ -12,6 +12,7 @@ from typing import IO, Any
 
 from kalshi_edge_engine.replay import Mode
 from kalshi_edge_engine.replay.archive import REPO, Selection, open_archive
+from kalshi_edge_engine.replay.evidence import evidence_audit
 from kalshi_edge_engine.replay.execution import POLICIES
 from kalshi_edge_engine.replay.forensics import RAPID_INTENTS, investigate
 from kalshi_edge_engine.replay.research import analyze
@@ -20,7 +21,8 @@ from kalshi_edge_engine.replay.research import analyze
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Deterministic offline B1 capture research")
     parser.add_argument(
-        "command", choices=("inspect", "validate", "replay", "compare", "intent", "report")
+        "command",
+        choices=("inspect", "validate", "replay", "compare", "intent", "report", "evidence"),
     )
     parser.add_argument(
         "--archive",
@@ -61,6 +63,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--probability-scale", type=float, default=1.0)
     parser.add_argument("--intent-id")
     args = parser.parse_args(argv)
+    if args.command == "evidence" and (
+        args.ticker
+        or args.session
+        or args.start_ns is not None
+        or args.end_ns is not None
+        or args.events
+    ):
+        parser.error("Evidence audit verifies the entire paired snapshot")
     if (args.command == "intent") != bool(args.intent_id):
         parser.error("Use intent with --intent-id")
     if args.command == "intent" and (
@@ -118,18 +128,22 @@ def main(argv: list[str] | None = None) -> int:
                 decisions.write(json.dumps(event, sort_keys=True, allow_nan=False) + "\n")
 
             with open_archive(directory) as archive:
-                report = analyze(
-                    archive,
-                    selection,
-                    seed=args.seed,
-                    mode=args.mode,
-                    strict=args.require_execution_consistency,
-                    require_raw_consistency=args.require_raw_consistency,
-                    scale=args.probability_scale,
-                    models=("baseline",) if args.command == "replay" else tuple(POLICIES),
-                    inspect_only=args.command in ("inspect", "validate", "intent"),
-                    emit=emit if stream else None,
-                    emit_decision=emit_decision if decisions else None,
+                report = (
+                    evidence_audit(archive)
+                    if args.command == "evidence"
+                    else analyze(
+                        archive,
+                        selection,
+                        seed=args.seed,
+                        mode=args.mode,
+                        strict=args.require_execution_consistency,
+                        require_raw_consistency=args.require_raw_consistency,
+                        scale=args.probability_scale,
+                        models=("baseline",) if args.command == "replay" else tuple(POLICIES),
+                        inspect_only=args.command in ("inspect", "validate", "intent"),
+                        emit=emit if stream else None,
+                        emit_decision=emit_decision if decisions else None,
+                    )
                 )
                 if args.command == "intent":
                     report["intent"] = investigate(archive, args.intent_id, args.mode)
@@ -146,6 +160,9 @@ def main(argv: list[str] | None = None) -> int:
                 for file, tmp, target in pending:
                     file.close()
                     os.replace(tmp, target)
+                if args.command == "evidence":
+                    print(f"Evidence audit: {output / 'evidence.json'}")
+                    return 0
                 c = report["coverage"]
                 print(
                     f"{args.command}: {c['coverage']}, {c['selected_events']} selected of {c['total_events']} retained receipts. {output / (args.command + '.json')}"

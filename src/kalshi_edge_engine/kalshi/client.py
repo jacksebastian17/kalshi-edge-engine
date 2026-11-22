@@ -13,6 +13,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from kalshi_edge_engine.db.market_recorder import MarketRecorder
+from kalshi_edge_engine.evidence import publish
 from kalshi_edge_engine.kalshi.read_budget import ReadBudget, ReadBudgetTimeout, current_read_lane
 
 logger = logging.getLogger(__name__)
@@ -227,7 +228,7 @@ class KalshiClient:
                     else response.json()
                 )
                 if self.recorder is not None:
-                    self.recorder.capture(
+                    receipt = self.recorder.capture(
                         path,
                         current_read_lane(),
                         received_ns,
@@ -235,6 +236,8 @@ class KalshiClient:
                         response.content,
                         self.base_url,
                     )
+                    if receipt is not None:
+                        publish((receipt,))
                 return data
         except ReadBudgetTimeout as exc:
             raise KalshiReadBudgetError(str(exc)) from exc

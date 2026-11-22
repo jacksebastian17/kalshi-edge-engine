@@ -1928,6 +1928,7 @@ async def lifespan_production(app: FastAPI) -> Any:
             if _ENABLE_PAPER_TRADING:
                 if strict and recorder is not None:
                     _paper_store = PaperStore(decision_guard=recorder.require_healthy)
+                    _paper_store.fill_funnel.on_write_failure = recorder.invalidate
                     runtime_state.paper_store = _paper_store
                 else:
                     _init_paper_store()

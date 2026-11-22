@@ -1,5 +1,7 @@
 # Phase B2 offline historical replay
 
+The commands below reproduce the B2 historical analysis and its retrospective alignment. For fresh experiments, follow the [B3B1 Windows runbook](phase-b3b1.md#overnight-run-on-windows).
+
 The November 20 archive explains Toronto's rapid paper gain. The raw book already showed a 40¢ bid when the entry simulator treated 35¢ as best. Atlanta's raw books had been evicted before the snapshot. Across the retained capture, all 7,709 uniquely aligned polls reproduced B1's price classification. That agreement measures fidelity to the simulator. Toronto shows why it cannot establish execution quality.
 
 ## Run from Windows PowerShell

@@ -1,6 +1,34 @@
-# B3A overnight paper capture
+# Overnight paper capture
 
-Tonight's cohort is `canonical_fixed_point_b3a_v1`. Its directory is `C:\Users\jacks\kalshi-paper-runs\b3a-2026-11-21`. The ledger is `paper_trading.db` and the recorder is `market_data_recorder.db`. The saved `experiment.json` identifies the code revision and source digest, both paths, recorder budget and effective paper policy. The ledger stores the cohort cutover. Clean restarts preserve the cutover and recover interrupted intents.
+## Current B3B1 launch
+
+Use a fresh directory for the first preflight. Keep window 1 open for the single-worker backend.
+
+```powershell
+Set-Location 'C:\Users\jacks\kalshi-edge-engine'
+$run = Join-Path $env:USERPROFILE 'kalshi-paper-runs\b3b1-run01'
+if (Test-Path -LiteralPath $run) { throw 'Choose a fresh directory' }
+powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File .\overnight.ps1 Preflight -RunDirectory $run
+if ($LASTEXITCODE) { throw 'Preflight failed' }
+powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File .\overnight.ps1 Backend -RunDirectory $run
+```
+
+In window 2, enable collection after backend startup and verify receipt counts and health.
+
+```powershell
+Set-Location 'C:\Users\jacks\kalshi-edge-engine'
+$run = Join-Path $env:USERPROFILE 'kalshi-paper-runs\b3b1-run01'
+powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File .\overnight.ps1 Enable -RunDirectory $run
+powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File .\overnight.ps1 Status -RunDirectory $run
+```
+
+After a graceful Ctrl+C in window 1 and completed shutdown, use the Backup command and offline evidence audit in the [B3B1 runbook](phase-b3b1.md#overnight-run-on-windows).
+
+## Historical B3A launch
+
+Historical procedure for checkout `d6873bf` and its B3A launcher. Run these historical commands only with that checkout and its matching manifest. Current `main` selects a separate B3B1 cohort. For fresh experiments, follow the [B3B1 Windows runbook](phase-b3b1.md#overnight-run-on-windows).
+
+The B3A cohort is `canonical_fixed_point_b3a_v1`. Its directory is `C:\Users\jacks\kalshi-paper-runs\b3a-2026-11-21`. The ledger is `paper_trading.db` and the recorder is `market_data_recorder.db`. The saved `experiment.json` identifies the code revision and source digest, both paths, recorder budget and effective paper policy. The ledger stores the cohort cutover. Clean restarts preserve the cutover and recover interrupted intents.
 
 ## Run on Windows
 

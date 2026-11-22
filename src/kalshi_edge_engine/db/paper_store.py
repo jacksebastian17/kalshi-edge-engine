@@ -1610,6 +1610,7 @@ class PaperStore:
         now_ms: int,
         reason: str,
         execution_source: str = "simulated_displayed_bid_sweep",
+        evidence: dict[str, Any] | None = None,
     ) -> bool:
         """Commit the simulated sale, realized increment and lifecycle transition together."""
         if self.decision_guard:
@@ -1647,6 +1648,7 @@ class PaperStore:
                 now_ms=now_ms,
                 reason=reason,
                 execution_source=execution_source,
+                evidence=evidence,
                 quote=quote,
                 clean=bool(
                     row[7]
@@ -1656,7 +1658,9 @@ class PaperStore:
             )
         return True
 
-    def reconcile_market_settlement(self, settlement: MarketSettlement, *, now_ms: int) -> bool:
+    def reconcile_market_settlement(
+        self, settlement: MarketSettlement, *, now_ms: int, evidence: dict[str, Any] | None = None
+    ) -> bool:
         """Book a finalized market once, including both sides and all open remainders."""
         if self.decision_guard:
             self.decision_guard()
@@ -1731,6 +1735,7 @@ class PaperStore:
                     now_ms=now_ms,
                     reason="settlement",
                     execution_source="kalshi_market_settlement",
+                    evidence=evidence,
                     clean=bool(position[7] and late_entry is None),
                 )
             conn.execute(
@@ -1753,6 +1758,7 @@ class PaperStore:
         reason: str,
         execution_source: str,
         clean: bool,
+        evidence: dict[str, Any] | None = None,
         quote: LiquidationQuote | None = None,
     ) -> None:
         side, size, entry_price, first_open_ts, entry_fees, opening_intent, _, _ = row
@@ -1788,8 +1794,8 @@ class PaperStore:
             """
             INSERT INTO quote_intents
                 (id, ticker, side, universe, quote_price_cents, size_contracts, created_ts_ms,
-                 status, net_edge, inside_width, fee_mode, round_trip, last_update_ts_ms, fee_profile)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'FILLED', 0, 0, ?, 0, ?, ?)
+                 status, net_edge, inside_width, fee_mode, round_trip, last_update_ts_ms, fee_profile, submission_evidence)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'FILLED', 0, 0, ?, 0, ?, ?, ?)
             """,
             (
                 intent_id,
@@ -1802,6 +1808,7 @@ class PaperStore:
                 "taker" if quote else "settlement",
                 now_ms,
                 profile_json,
+                json.dumps(evidence) if evidence is not None else None,
             ),
         )
         conn.execute(
@@ -3386,6 +3393,7 @@ class PaperStore:
         pnl_after_fill_cents: float,
         observed_ts_ms: int | None = None,
         liquidation: LiquidationQuote | None = None,
+        evidence: dict[str, Any] | None = None,
     ) -> bool:
         """Persist follow-up mark and short-horizon PnL for a fill/horizon."""
         mark_col = self._mark_column_for_horizon(horizon_seconds)
@@ -3394,6 +3402,7 @@ class PaperStore:
         fee_audit = (
             json.dumps(
                 {
+                    **({"evidence": evidence} if evidence is not None else {}),
                     "profile": liquidation.fee_profile.audit(),
                     "exit_fee_cents": liquidation.exit_fee_cents,
                 }

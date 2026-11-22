@@ -2,6 +2,8 @@
 
 Real-time Kalshi sports-market scanner and paper-trading research engine.
 
+**For a new research run**, use the version-pinned B3B1 preflight with a fresh paired ledger and append-only recorder outside the checkout. Inspect an intent through `GET /paper/diagnostics/intents/{intent_id}`, shut down gracefully, take a SQLite backup, then run the offline evidence audit. The audit resolves decisions to exact raw responses. [B3B1 evidence and Windows runbook](docs/phase-b3b1.md)
+
 This project is intentionally **paper-only** right now:
 
 - Uses Kalshi market data endpoints (`GET`)
@@ -61,23 +63,7 @@ The project has now demonstrated that the paper stack can:
 - persist fills and exits,
 - and produce realized PnL and multi-horizon outcome telemetry.
 
-Recent multi-hour NBA paper runs have established a few important research findings:
-
-- the runtime, persistence, and accounting pipeline now appears to work end-to-end,
-- positive realized paper PnL has been observed across real multi-hour runs,
-- much of the earlier positive paper behavior was driven by the `moved_through` fill path,
-- `moved_through` therefore remains a useful research path but a lower-trust execution path,
-- when `moved_through` was disabled, the system still produced a true `queue_cleared` entry → exit → realized-PnL lifecycle,
-- but queue-cleared-only throughput became sparse enough that confidence remains low.
-
-That means the current evidence supports the following interpretation:
-
-- **runtime/accounting infrastructure: increasingly credible**
-- **signal discovery: promising**
-- **queue-cleared evidence: higher trust but still too sparse**
-- **moved-through evidence: useful but lower trust**
-- **execution realism: still under active validation**
-- **live-trading readiness: not yet established**
+Earlier NBA sessions booked positive simulated P&L, including +2.92¢ on Toronto. B2 traced that trade to inconsistent entry and exit parsing. B3A's fixed-point reconstruction sees the existing 40¢ bid and removes the apparent 35¢ queue-cleared opportunity. B3B1 links new decisions and actual simulation draws to recorded inputs. Execution probability and signal performance still require independent measurement. [B3A findings](docs/phase-b3a.md)
 
 ---
 
@@ -165,6 +151,8 @@ That means the current evidence supports the following interpretation:
 ---
 
 ## Architecture (high level)
+
+The GET-only client sends exact HTTP bodies to `db/market_recorder.py`. Request-scoped receipt references follow each input through fee caching, signal scoring and the canonical fixed-point book in `engine/orderbook.py`. The paper runtime writes submission evidence, poll decisions, fills and markouts into its own SQLite ledger. The `replay` package supports historical B2, corrected queue and canonical modes. Its separate `evidence` command checks recorded B3B1 decisions. `overnight.py` verifies the source and policy manifest and seals backup pairs.
 
 ```text
 Kalshi API (GET only)
@@ -278,6 +266,7 @@ The goal is to reduce that bridge later, but only after tests are migrated to pa
 
 ### Scanner lifecycle
 
+- `GET /kalshi/read-budget`
 - `GET /scanner/status`
 - `POST /scanner/start`
 - `POST /scanner/stop`
@@ -523,7 +512,9 @@ python -m venv .venv
 pip install -e ".[dev]"
 ```
 
-### 2) Backend
+### 2) Development backend
+
+Use a disposable ledger and recorder for development. The isolated research launcher runs a single worker and verifies its manifest. The reload command below is for development.
 
 ```powershell
 uvicorn kalshi_edge_engine.api.main:app --reload

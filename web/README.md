@@ -1,12 +1,12 @@
 # Kalshi Edge Dashboard
 
-Frontend for the Kalshi Edge Engine.
+Frontend for the Kalshi Edge Engine. During an isolated experiment, point the dashboard at the single backend started by the overnight launcher. The paper diagnostics API exposes receipt references, and the offline verifier resolves them after backup. [Research procedure](../docs/phase-b3b1.md)
 
 ## Development
 
 ```bash
 cd web
-npm install
+npm ci
 npm run dev
 ```
 

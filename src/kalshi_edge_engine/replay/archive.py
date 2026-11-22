@@ -124,6 +124,19 @@ def payload(row: sqlite3.Row, mode: Mode = Mode.B2) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("invalid_object")
     path = row["request_path"].removeprefix("/historical").split("/")
+    if row["kind"] in ("event", "series"):
+        kind = row["kind"]
+        route, field = ("events", "event_ticker") if kind == "event" else ("series", "ticker")
+        record = data.get(kind)
+        if (
+            len(path) != 3
+            or path[1] != route
+            or unquote(path[2]) != row["ticker"]
+            or not isinstance(record, dict)
+            or record.get(field) != row["ticker"]
+        ):
+            raise ValueError("invalid_fee_metadata")
+        return data
     if (
         not row["ticker"]
         or path[:2] != ["", "markets"]
@@ -238,12 +251,15 @@ def validate(archive: Archive, selection: Selection, *, mode: Mode = Mode.B2) ->
             selected += 1
             sources[row["source"]] += 1
             universes[row["universe"]] += 1
-            ticker_kinds.setdefault(row["ticker"], set())
-            seg["ticker_kinds"].setdefault(row["ticker"], set())
+            market_input = row["kind"] in ("market", "orderbook")
+            if market_input:
+                ticker_kinds.setdefault(row["ticker"], set())
+                seg["ticker_kinds"].setdefault(row["ticker"], set())
             if not invalid_ids or invalid_ids[-1] != row["id"]:
                 seg["kinds"][row["kind"]] += 1
-                seg["ticker_kinds"][row["ticker"]].add(row["kind"])
-                ticker_kinds[row["ticker"]].add(row["kind"])
+                if market_input:
+                    seg["ticker_kinds"][row["ticker"]].add(row["kind"])
+                    ticker_kinds[row["ticker"]].add(row["kind"])
         counts[row["kind"]] += 1
         s["events"] += 1
         s["last_sequence"] = seq

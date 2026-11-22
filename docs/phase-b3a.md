@@ -1,5 +1,7 @@
 # Phase B3A — Canonical orderbooks and execution consistency
 
+These instructions reproduce the B3A parser comparison. B3B1 adds direct decision provenance. For fresh experiments, follow the [B3B1 Windows runbook](phase-b3b1.md#overnight-run-on-windows).
+
 Toronto's raw entry book contained a 40¢ YES bid throughout the apparent 35¢ to 40¢ paper gain. Canonical parsing puts the historical 35¢ order below that bid. It removes Toronto's queue-cleared entry from the corrected reconstruction. The original paper ledger still records the trade. On this capture, the queue correction alone changed no seed-42 outcomes.
 
 ## One interpretation of displayed depth

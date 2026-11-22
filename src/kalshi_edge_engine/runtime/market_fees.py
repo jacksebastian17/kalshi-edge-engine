@@ -8,6 +8,7 @@ from typing import Any
 from weakref import WeakValueDictionary
 
 from kalshi_edge_engine.engine.fees import FeeProfile, series_fee_profile
+from kalshi_edge_engine.evidence import Receipt, publish, receipt_scope
 from kalshi_edge_engine.kalshi.client import KalshiClient
 from kalshi_edge_engine.kalshi.market import (
     MarketObservation,
@@ -16,7 +17,7 @@ from kalshi_edge_engine.kalshi.market import (
 )
 
 logger = logging.getLogger(__name__)
-ObservedMetadata = tuple[dict[str, Any], int]
+ObservedMetadata = tuple[dict[str, Any], int, tuple[Receipt, ...]]
 
 
 class MarketFees:
@@ -38,13 +39,18 @@ class MarketFees:
             now = time.monotonic()
             cached = self._cache.get(key)
             if cached is not None and now < cached[0]:
+                if cached[1] is not None:
+                    publish(cached[1][2])
                 return cached[1]
             if len(self._cache) >= 1024:
                 self._cache = {key: value for key, value in self._cache.items() if value[0] > now}
                 if len(self._cache) >= 1024:
                     self._cache.pop(next(iter(self._cache)))
             try:
-                record = (await fetch(ticker), int(time.time() * 1000))
+                with receipt_scope() as refs:
+                    payload = await fetch(ticker)
+                record = (payload, int(time.time() * 1000), tuple(refs))
+                publish(refs)
             except Exception:
                 logger.debug(
                     "paper_fee_metadata_unavailable", extra={"kind": kind, "ticker": ticker}
@@ -69,7 +75,7 @@ class MarketFees:
         market_record = await self._record("market", ticker, self.client.get_market)
         if market_record is None:
             return None
-        market, market_ts = market_record
+        market, market_ts, _ = market_record
         event_ticker = market.get("event_ticker")
         if not isinstance(event_ticker, str) or not event_ticker:
             return None
@@ -86,12 +92,12 @@ class MarketFees:
         event_record = await self._record("event", event_ticker, self.client.get_event)
         if event_record is None:
             return None
-        event, event_ts = event_record
+        event, event_ts, _ = event_record
         series_ticker = event.get("series_ticker")
         if not isinstance(series_ticker, str) or not series_ticker:
             return None
         series_record = await self._record("series", series_ticker, self.client.get_series_details)
         if series_record is None:
             return None
-        series, series_ts = series_record
+        series, series_ts, _ = series_record
         return series_fee_profile(series, event, observed_ts_ms=min(market_ts, event_ts, series_ts))

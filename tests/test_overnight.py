@@ -234,7 +234,11 @@ async def test_preflight_refuses_prior_data_or_low_space(configured, monkeypatch
     assert not list(configured.glob("*.db"))
 
 
-async def test_real_lifespan_interlock_restart_and_offline_backup(configured, monkeypatch, capsys):
+@pytest.mark.parametrize("cohort", [overnight.EXPERIMENT, overnight.LINKED_EXPERIMENT])
+async def test_real_lifespan_interlock_restart_and_offline_backup(
+    configured, monkeypatch, capsys, cohort
+):
+    monkeypatch.setenv("PAPER_EXPERIMENT_ID", cohort)
     monkeypatch.setattr(main, "KalshiClient", AsyncMock)
     monkeypatch.setattr(main, "_ENABLE_PAPER_TRADING", True)
     monkeypatch.setattr(main, "_paper_enabled", False)
@@ -284,6 +288,14 @@ async def test_real_lifespan_interlock_restart_and_offline_backup(configured, mo
             "SELECT state FROM capture_sessions ORDER BY rowid DESC LIMIT 1"
         ).fetchone() == ("incomplete",)
     assert not list(dest.glob("*-wal"))
-    assert (
-        json.loads((dest / overnight.MANIFEST).read_text())["experiment_id"] == overnight.EXPERIMENT
-    )
+    assert json.loads((dest / overnight.MANIFEST).read_text())["experiment_id"] == cohort
+
+
+async def test_linked_restart_rejects_configuration_drift(configured, monkeypatch):
+    monkeypatch.setenv("PAPER_EXPERIMENT_ID", overnight.LINKED_EXPERIMENT)
+    await overnight.preflight()
+    original = (configured / overnight.MANIFEST).read_bytes()
+    monkeypatch.setenv("MARKET_RECORDER_MAX_MIB", "8192")
+    with pytest.raises(ValueError, match="differs from saved"):
+        await overnight.preflight()
+    assert (configured / overnight.MANIFEST).read_bytes() == original

@@ -1,4 +1,4 @@
-"""Offline preparation and backup of an isolated B3A paper run."""
+"""Offline preparation and backup of versioned isolated paper experiments."""
 
 import argparse
 import asyncio
@@ -23,13 +23,20 @@ from kalshi_edge_engine.kalshi.client import KalshiClient
 from kalshi_edge_engine.runtime import config
 
 EXPERIMENT = "canonical_fixed_point_b3a_v1"
-BASE = "3ac1a78fdd531af6553f2be16f446c6a14c89e28"
+LINKED_EXPERIMENT = "decision_linked_b3b1_v1"
+BASE = "d6873bf6ae8c1deff0a617eccb24d054622e178d"
+# Hash of the reviewed source tree with this one self-referential value normalized.
+LINKED_SOURCE = "6d1ebb204924cf813dceed3d0417499e2bf25cbcf05804aca57de2500a1408ae"
+PROFILES = {
+    EXPERIMENT: "152b307a81ed83f99faa86142b78d7bd24835fee8682ec30fc644f7d55ad2172",
+    LINKED_EXPERIMENT: LINKED_SOURCE,
+}
 ROOT = Path(__file__).resolve().parents[2]
 MANIFEST = "experiment.json"
 
 
 def requested() -> bool:
-    return os.getenv("PAPER_EXPERIMENT_ID") == EXPERIMENT or os.getenv(
+    return os.getenv("PAPER_EXPERIMENT_ID") in PROFILES or os.getenv(
         "MARKET_RECORDER_APPEND_ONLY", "false"
     ).lower() not in {"false", "0", "no", ""}
 
@@ -40,23 +47,31 @@ def git(*args: str) -> str:
 
 def revision() -> dict[str, str]:
     if Path.cwd().resolve() != ROOT or Path(git("rev-parse", "--show-toplevel")).resolve() != ROOT:
-        raise ValueError("Run from the repository containing the imported B3A source")
+        raise ValueError("Run from the repository containing the imported experiment source")
     if git("branch", "--show-current") != "main":
-        raise ValueError("Overnight capture requires the B3A checkout on main")
+        raise ValueError("Overnight capture requires the experiment checkout on main")
     git("merge-base", "--is-ancestor", BASE, "HEAD")
-    git(
-        "diff",
-        "--quiet",
-        BASE,
+    if git(
+        "status",
+        "--porcelain",
+        "--untracked-files=all",
         "--",
-        "src/kalshi_edge_engine/engine",
-        "src/kalshi_edge_engine/kalshi",
-        "src/kalshi_edge_engine/runtime",
-    )
+        ":(glob)src/kalshi_edge_engine/**/*.py",
+    ):
+        raise ValueError("Experiment runtime source must match the recorded commit")
     digest = hashlib.sha256()
-    for path in sorted((ROOT / "src/kalshi_edge_engine").rglob("*.py")):
-        digest.update(path.relative_to(ROOT).as_posix().encode() + b"\0")
-        digest.update(path.read_bytes().replace(b"\r\n", b"\n") + b"\0")
+    pinned = hashlib.sha256()
+    for path in sorted((ROOT / "src/kalshi_edge_engine").rglob("*.py"), key=lambda p: p.as_posix()):
+        name = path.relative_to(ROOT).as_posix().encode() + b"\0"
+        body = path.read_bytes().replace(b"\r\n", b"\n")
+        digest.update(name + body + b"\0")
+        if path == Path(__file__).resolve():
+            body = body.replace(LINKED_SOURCE.encode(), b"0" * 64, 1)
+        pinned.update(name + body + b"\0")
+    if pinned.hexdigest() != PROFILES.get(os.environ.get("PAPER_EXPERIMENT_ID", "")):
+        raise ValueError(
+            "Source differs from the pinned experiment version; use the matching checkout and cohort"
+        )
     return {"commit": git("rev-parse", "HEAD"), "source_sha256": digest.hexdigest()}
 
 
@@ -112,8 +127,8 @@ class Run:
 
     @classmethod
     def configured(cls) -> "Run":
-        if os.getenv("PAPER_EXPERIMENT_ID") != EXPERIMENT:
-            raise ValueError(f"Expected dedicated paper experiment {EXPERIMENT}")
+        if os.getenv("PAPER_EXPERIMENT_ID") not in PROFILES:
+            raise ValueError("Expected a registered dedicated paper experiment")
         paths = []
         for env, name in (
             ("PAPER_DB_PATH", "paper_trading.db"),
@@ -141,9 +156,15 @@ class Run:
                 or (file.is_file() and file.stat().st_nlink != 1)
             ):
                 raise ValueError(f"Linked files are unsafe in the run directory: {file.name}")
-        if not (run.directory / MANIFEST).exists() and any(
-            p.name != run.ledger.name + ".paper-worker.lock" for p in run.directory.iterdir()
-        ):
+        if (run.directory / MANIFEST).exists():
+            saved = run.saved()
+            if (
+                saved.get("experiment_id") != os.environ["PAPER_EXPERIMENT_ID"]
+                or saved.get("paper_db") != str(run.ledger)
+                or saved.get("recorder_db") != str(run.recorder)
+            ):
+                raise ValueError("Directory belongs to another experiment or offline backup")
+        elif any(p.name != run.ledger.name + ".paper-worker.lock" for p in run.directory.iterdir()):
             raise ValueError("New experiment requires an empty directory; existing files refused")
         return run
 
@@ -158,7 +179,7 @@ class Run:
             raise ValueError("Overnight recorder requires at least 4096 MiB")
         return {
             **revision(),
-            "experiment_id": EXPERIMENT,
+            "experiment_id": os.environ["PAPER_EXPERIMENT_ID"],
             "paper_db": str(self.ledger),
             "recorder_db": str(self.recorder),
             "append_only": True,
@@ -173,7 +194,9 @@ class Run:
         if not self.ledger.is_file() or not self.recorder.is_file():
             raise ValueError("Prepared run is missing a database")
         with closing(readonly(self.ledger)) as db:
-            if db.execute("SELECT id FROM paper_experiments").fetchall() != [(EXPERIMENT,)]:
+            if db.execute("SELECT id FROM paper_experiments").fetchall() != [
+                (metadata["experiment_id"],)
+            ]:
                 raise ValueError("Ledger experiment identity mismatch")
 
     def saved(self) -> dict[str, Any]:
@@ -204,7 +227,7 @@ async def preflight() -> dict[str, Any]:
         try:
             await recorder.initialized.wait()
             recorder.require_healthy()
-            store = PaperStore(str(run.ledger), experiment_id=EXPERIMENT)
+            store = PaperStore(str(run.ledger), experiment_id=metadata["experiment_id"])
             counts = {"intents": store.count_intents_total(), "fills": store.count_fills_total()}
             if not manifest.exists() and any(counts.values()):
                 raise ValueError("New ledger contains existing activity")
@@ -218,7 +241,7 @@ async def preflight() -> dict[str, Any]:
                 json.dump(metadata, stream, indent=2, sort_keys=True)
         return {
             "preflight": "PASS",
-            "experiment_id": EXPERIMENT,
+            "experiment_id": os.environ["PAPER_EXPERIMENT_ID"],
             "ledger": str(run.ledger),
             "recorder": str(run.recorder),
             **counts,
@@ -234,6 +257,8 @@ def backup() -> Path:
     run = Run.configured()
     with PaperStore.claim_database(str(run.ledger)):
         saved = run.saved()
+        if saved.get("experiment_id") != os.environ["PAPER_EXPERIMENT_ID"]:
+            raise ValueError("Backup cohort differs from saved experiment")
         if saved.get("paper_db") != str(run.ledger) or saved.get("recorder_db") != str(
             run.recorder
         ):

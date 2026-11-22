@@ -79,6 +79,8 @@ The backend is now roughly split into:
 * `runtime/paper_exit_runtime.py` → mark/exit/fill telemetry helpers
 * `engine/*` → core logic (signal, simulator, fees, orderbook, universe, exits)
 * `db/paper_store.py` → SQLite persistence and paper metrics
+* `evidence.py`, `db/market_recorder.py` and `db/fill_funnel.py` carry request-scoped raw receipt identities into the versioned decision journal.
+* `replay/evidence.py` verifies sealed pairs. `overnight.py` pins the code and policy for each isolated run. See [B3B1](../../docs/phase-b3b1.md).
 
 Treat `runtime/*`, `engine/*`, and `db/*` as the core implementation layers.
 
@@ -153,14 +155,14 @@ Recent NBA paper runs have established the following:
 - positive realized paper PnL has appeared in multi-hour runs,
 - earlier profitable runs were heavily influenced by the `moved_through` fill path,
 - `moved_through` therefore remains a realism-risk path and must not be treated as strong live-quality evidence,
-- when weaker fill paths were disabled, the system still produced at least one real `queue_cleared` entry → exit → realized-PnL lifecycle,
+- when weaker fill paths were disabled, the system still produced at least one historical simulator-reported `queue_cleared` entry → exit → realized-PnL lifecycle,
 - but queue-cleared-only evidence is currently too sparse to justify strong conclusions.
 
 This means:
 
 - current paper profitability must not be treated as proof of live edge,
 - `moved_through` fills should be treated as lower-trust research evidence,
-- `queue_cleared` fills are currently the cleaner validation baseline,
+- Toronto's B1 queue-cleared result depended on inconsistent parsers. Use the corrected book, exact receipts and recorded draw for new investigations,
 - future work should optimize for **higher-trust evidence density**, not merely more paper fills,
 - README language, metrics interpretation, and simulator changes should preserve this distinction explicitly.
 

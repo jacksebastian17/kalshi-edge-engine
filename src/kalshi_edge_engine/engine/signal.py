@@ -13,6 +13,7 @@ from kalshi_edge_engine.engine.orderbook import (
     get_inside_width,
     parse_orderbook,
 )
+from kalshi_edge_engine.evidence import Receipt
 
 # Signal reason codes (required for every decision)
 SPREAD_TOO_SMALL = "SPREAD_TOO_SMALL"
@@ -106,6 +107,8 @@ class Signal:
     net_edge_after_round_trip_fee_no_cents: float | None = None
     universe: str = "NBA"
     fee_profile: FeeProfile | None = LEGACY_FEE_PROFILE
+    receipts: tuple[Receipt, ...] = ()
+    scored_ns: int | None = None
 
 
 def score_signal(

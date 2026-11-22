@@ -17,6 +17,7 @@ from kalshi_edge_engine.engine.orderbook import (
 from kalshi_edge_engine.engine.paper import QuoteIntent, build_quote_intents
 from kalshi_edge_engine.engine.paper_sim import Fill, OrderRequest, RealisticOrderSimulator
 from kalshi_edge_engine.engine.signal import SIGNAL_VALID, Signal
+from kalshi_edge_engine.evidence import EVIDENCE_VERSION, MODEL, receipt_scope, references
 from kalshi_edge_engine.kalshi.client import KalshiClient
 from kalshi_edge_engine.kalshi.market import MarketObservation
 from kalshi_edge_engine.kalshi.read_budget import read_priority
@@ -435,7 +436,13 @@ async def _process_paper_intents(
             best_bid_at_submit_cents: float | None = None
             cross_at_submit_cents: float | None = None
             submission: dict[str, Any] = {
-                "schema_version": 1,
+                "schema_version": EVIDENCE_VERSION,
+                "model": MODEL,
+                "signal_receipts": references(signal.receipts),
+                "signal_decision_ns": signal.scored_ns,
+                "book_receipts": [],
+                "market_receipts": [],
+                "validation_required": resolver is not None,
                 "signal_ts_ms": signal.timestamp_ms,
                 "signal_top_liquidity": signal.top_liquidity,
                 "signal_exit_fee_cents": signal.fee_exit_yes
@@ -448,7 +455,9 @@ async def _process_paper_intents(
                     read_priority("entry"),
                     capture_origin("entry_submission", universe_key, intent.id),
                 ):
-                    orderbook_snapshot = await client.get_orderbook(intent.ticker)
+                    with receipt_scope() as book_refs:
+                        orderbook_snapshot = await client.get_orderbook(intent.ticker)
+                    submission["book_receipts"] = references(book_refs)
                 depth = canonical_book(orderbook_snapshot)
                 parsed_ob = parse_orderbook(depth)
                 bid = parsed_ob.bid_yes if intent.side == "YES" else parsed_ob.bid_no
@@ -475,7 +484,9 @@ async def _process_paper_intents(
                     read_priority("entry"),
                     capture_origin("entry_submission", universe_key, intent.id),
                 ):
-                    market_observation = await resolver.observe_entry_market(intent.ticker)
+                    with receipt_scope() as market_refs:
+                        market_observation = await resolver.observe_entry_market(intent.ticker)
+                    submission["market_receipts"] = references(market_refs)
                 if market_observation is None:
                     continue
             now_ms = int(time.time() * 1000)
@@ -484,6 +495,7 @@ async def _process_paper_intents(
             if market_observation is not None:
                 intent = replace(intent, created_ts_ms=now_ms)
 
+            submission["decision_ns"] = time.time_ns()
             inserted = runtime_state.paper_store.insert_intent(
                 intent,
                 universe=intent.universe,
@@ -528,10 +540,8 @@ async def _process_paper_intents(
                 funnel = store.fill_funnel
                 record_decision = partial(funnel.decision, intent_param.id)
 
-                def unprocessed(reason: str) -> None:
-                    funnel.record_poll(
-                        intent_param.id, {"diagnostics": {"no_candidate_reason": reason}}
-                    )
+                def unprocessed(evidence: dict[str, Any]) -> None:
+                    funnel.record_poll(intent_param.id, {"diagnostics": evidence})
 
                 order_request = OrderRequest(
                     id=intent_param.id,
@@ -550,7 +560,7 @@ async def _process_paper_intents(
                         else 0.0
                     ),
                     may_poll=may_poll if guarded else None,
-                    on_unprocessed_poll=unprocessed,
+                    on_unprocessed_evidence=unprocessed,
                 )
 
                 simulator = RealisticOrderSimulator(
@@ -620,7 +630,17 @@ async def _process_paper_intents(
                     assert resolver is not None
                     poll_id = funnel.record_poll(intent_param.id, runtime_update)
                     try:
-                        observation = await resolver.observe_entry_market(intent_param.ticker)
+                        with receipt_scope() as validation_refs:
+                            observation = await resolver.observe_entry_market(intent_param.ticker)
+                        record_decision(
+                            poll_id,
+                            observation=observation,
+                            validation={
+                                "receipts": references(validation_refs),
+                                "decision_ns": time.time_ns(),
+                                "status": observation.status if observation else None,
+                            },
+                        )
                         return validate_poll(runtime_update, poll_id, observation)
                     except asyncio.CancelledError:
                         record_decision(poll_id, rejection="validation_interrupted")
