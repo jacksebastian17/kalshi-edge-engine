@@ -7,9 +7,9 @@ import os
 import platform
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from importlib.metadata import version
 from pathlib import Path
 
@@ -19,6 +19,7 @@ from websockets.exceptions import InvalidStatus, WebSocketException
 
 from kalshi_edge_engine.kalshi.client import KalshiClient, KalshiClientError
 from kalshi_edge_engine.kalshi.market import read_market_observation
+from tools.capture_builds import approved_capture
 
 from .feed import CHANNELS
 from .journal import FORMAT, MANIFEST, STOP, RecorderError, Writer, exclusive, manifest
@@ -73,8 +74,8 @@ def socket(api: KalshiClient) -> VenueConnection:
     )
 
 
-def active(market: dict, ticker: str) -> bool:
-    now = time.time_ns() // 1_000_000
+def active(market: dict, ticker: str, now_ms: int | None = None) -> bool:
+    now = time.time_ns() // 1_000_000 if now_ms is None else now_ms
     event = market.get("event_ticker")
     observation = read_market_observation(market, ticker, requested_ts_ms=now, observed_ts_ms=now)
     return bool(
@@ -86,12 +87,16 @@ def active(market: dict, ticker: str) -> bool:
     )
 
 
-async def confirm(api: KalshiClient, tickers: list[str]) -> list[dict]:
+async def confirm(
+    api: KalshiClient, tickers: list[str], expected_events: dict[str, str] | None = None
+) -> list[dict]:
     records = []
     for ticker in tickers:
         market = await api.get_market(ticker)
         if not active(market, ticker):
             raise ValueError(f"Selected NBA market is unavailable or inactive: {ticker}")
+        if expected_events is not None and market["event_ticker"] != expected_events[ticker]:
+            raise ValueError(f"Event identity changed during market confirmation: {ticker}")
         records.append(
             {
                 k: market.get(k)
@@ -101,6 +106,21 @@ async def confirm(api: KalshiClient, tickers: list[str]) -> list[dict]:
     return records
 
 
+async def listed_markets(api: KalshiClient) -> AsyncIterator[dict]:
+    cursor = None
+    cursors = set()
+    while True:
+        page = await api.get_markets(series_ticker=SERIES, status="open", limit=200, cursor=cursor)
+        for m in page["markets"]:
+            yield m
+        cursor = page.get("cursor")
+        if not cursor:
+            break
+        if cursor in cursors:
+            raise ValueError("Repeated discovery cursor")
+        cursors.add(cursor)
+
+
 async def select(api: KalshiClient, explicit: list[str] | None, count: int) -> list[dict]:
     if explicit is not None and (
         not 2 <= len(set(explicit)) == len(explicit) <= 4
@@ -108,21 +128,11 @@ async def select(api: KalshiClient, explicit: list[str] | None, count: int) -> l
     ):
         raise ValueError("Specify 2–4 distinct NBA game markets")
     available: dict[str, Decimal] = {}
-    cursor = None
-    cursors = set()
-    while True:
-        page = await api.get_markets(series_ticker=SERIES, status="open", limit=200, cursor=cursor)
-        for m in page["markets"]:
-            ticker = m["ticker"]
-            if active(m, ticker):
-                volume = Decimal(str(m.get("volume_24h_fp") or 0))
-                available[ticker] = volume if volume.is_finite() else Decimal(0)
-        cursor = page.get("cursor")
-        if not cursor:
-            break
-        if cursor in cursors:
-            raise ValueError("Repeated discovery cursor")
-        cursors.add(cursor)
+    async for m in listed_markets(api):
+        ticker = m["ticker"]
+        if active(m, ticker):
+            volume = Decimal(str(m.get("volume_24h_fp") or 0))
+            available[ticker] = volume if volume.is_finite() else Decimal(0)
     tickers = (
         explicit
         if explicit is not None
@@ -133,12 +143,90 @@ async def select(api: KalshiClient, explicit: list[str] | None, count: int) -> l
     return await confirm(api, tickers)
 
 
-async def preflight(path: Path, explicit: list[str] | None, count: int) -> dict:
+async def select_events(api: KalshiClient, count: int, audit: dict) -> list[dict]:
+    audit.update(
+        rule="distinct-nba-events-v1",
+        count=count,
+        started_ns=time.time_ns(),
+        candidates=[],
+        ranking="Active KXNBAGAME contracts with future close. Descending listed 24h volume, then ascending ticker. Missing volume ranks as zero. One per event.",
+    )
+    ranked: dict[str, tuple[Decimal, dict]] = {}
+    async for market in listed_markets(api):
+        observed = time.time_ns()
+        row = {
+            k: market.get(k)
+            for k in ("ticker", "event_ticker", "status", "close_time", "volume_24h_fp")
+        }
+        row["observed_ns"] = observed
+        row["reason"] = "awaiting_rank"
+        audit["candidates"].append(row)
+        ticker = row["ticker"]
+        event = row["event_ticker"]
+        if (
+            not isinstance(ticker, str)
+            or not isinstance(event, str)
+            or not event.startswith(SERIES + "-")
+            or ticker.rpartition("-")[0] != event
+        ):
+            row["reason"] = "outside_series_or_inconsistent_event"
+            continue
+        if row["status"] != "active":
+            row["reason"] = "inactive_status"
+            continue
+        if not active(market, ticker, observed // 1_000_000):
+            row["reason"] = "invalid_or_elapsed_close"
+            continue
+        try:
+            volume = Decimal(str(row["volume_24h_fp"] if row["volume_24h_fp"] is not None else 0))
+        except InvalidOperation:
+            volume = Decimal("NaN")
+        if not volume.is_finite() or volume < 0:
+            row["reason"] = "invalid_reported_volume"
+            continue
+        if ticker in ranked:
+            row["reason"] = "duplicate_listing"
+            if ranked[ticker][0] != volume:
+                raise ValueError(f"Inconsistent volume across discovery pages: {ticker}")
+            continue
+        ranked[ticker] = volume, row
+    selected: dict[str, str] = {}
+    events: set[str] = set()
+    for ticker in sorted(ranked, key=lambda t: (-ranked[t][0], t)):
+        _, row = ranked[ticker]
+        event = row["event_ticker"]
+        if event in events:
+            row["reason"] = "event_already_selected"
+        elif len(selected) == count:
+            row["reason"] = "below_selection_limit"
+        else:
+            selected[ticker] = event
+            events.add(event)
+            row["reason"] = "selected"
+    audit.update(selected=selected, ranked_ns=time.time_ns())
+    if len(selected) < count:
+        raise ValueError(f"Requested {count} distinct active NBA events, found {len(selected)}")
+    return await confirm(api, list(selected), selected)
+
+
+async def preflight(
+    path: Path, explicit: list[str] | None, count: int, *, distinct_events: bool = False
+) -> dict:
     path.parent.mkdir(exist_ok=True)
     path.mkdir()
+    audit: dict = {}
     try:
+        build = build_info()
+        if distinct_events:
+            if explicit is not None or count not in (2, 3, 4):
+                raise ValueError("Distinct-event selection requires a count of 2–4")
+            approved_capture(build)
         async with client() as api:
-            records = await select(api, explicit, count)
+            records = (
+                await select_events(api, count, audit)
+                if distinct_events
+                else await select(api, explicit, count)
+            )
         meta = {
             "format": FORMAT,
             "session": uuid.uuid4().hex,
@@ -148,13 +236,21 @@ async def preflight(path: Path, explicit: list[str] | None, count: int) -> dict:
             "endpoint": WS_URL,
             "series": SERIES,
             "channels": CHANNELS,
-            "build": build_info(),
+            "build": build,
         }
+        if distinct_events:
+            meta["selection"] = audit
         exclusive(path / MANIFEST, meta)
         return meta
     except Exception as exc:
         exclusive(
-            path / "preflight_failure.json", {"error_type": type(exc).__name__, "reason": str(exc)}
+            path / "preflight_failure.json",
+            {
+                "error_type": type(exc).__name__,
+                "reason": str(exc),
+                "selection": audit,
+                "failed_ns": time.time_ns(),
+            },
         )
         raise
 
@@ -233,6 +329,7 @@ async def capture(path: Path, seconds: float) -> str:
     if meta.get("build") != build_info():
         raise ValueError("Pilot build differs from preflight. Prepare a fresh run.")
     markets = meta["markets"]
+    expected_events = meta.get("selection", {}).get("selected")
     writer = Writer(path)
     reason = None
     try:
@@ -242,7 +339,7 @@ async def capture(path: Path, seconds: float) -> str:
         writer.flush(force=True)
         async with client() as api:
             reason = await collect(
-                writer, lambda: socket(api), lambda: confirm(api, markets), seconds
+                writer, lambda: socket(api), lambda: confirm(api, markets, expected_events), seconds
             )
     except asyncio.CancelledError:
         reason = "operator_interrupt"

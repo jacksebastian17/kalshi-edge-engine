@@ -11,12 +11,10 @@ from operator import attrgetter
 from pathlib import Path
 
 from kalshi_edge_engine.engine import orderbook
+from tools.capture_builds import approved_capture, verify_replay_modules
 from tools.microstructure import journal
 from tools.microstructure.feed import TRADE, Feed, cents, fixed
 
-CAPTURE_COMMIT = "cfba2d7773250e0f2e4e3442b1abf9a944cad4b1"
-# SHA-256 of journal.encoded(build) for the verified cfba2d7 pilot modules and versions.
-CAPTURE_BUILD = "90bbee4f819d93ee920b7b1c42015a102ec7c543e1d2fd9bdbfc1b9b3e3f877e"
 REPLAY_ORDERBOOK = "b881e5236da91e72f71af1b36faf9b76a18617f32b15e72487d1849214a44d55"
 FILES = (journal.MANIFEST, journal.SEAL, journal.LOG, journal.HEALTH, journal.BACKUP_HASHES)
 SIDES = ("yes", "no")
@@ -84,6 +82,7 @@ class Tape:
         self.markets = {t: Market() for t in tickers}
         self.mono = [0]  # Journal record number indexes the original receipt clock.
         self.start: int | None = None
+        self.start_wall_ns: int | None = None
         self.end: int | None = None
         self.end_record = 0
         self.flows: dict[Key, list[Flow]] = defaultdict(list)
@@ -106,6 +105,7 @@ def project(path: Path, report: dict) -> Tape:
             tape.mono.append(mono)
             if kind == "started":
                 tape.start = mono
+                tape.start_wall_ns = wall
             if kind == "collection_ended":
                 tape.end, tape.end_record = mono, n
             old_epoch = feed.epoch
@@ -188,14 +188,8 @@ def verified_source(archive: Path) -> tuple[dict, dict, dict]:
     before = source_hashes(archive)
     meta = journal.manifest(archive)
     build = meta.get("build", {})
-    if hashlib.sha256(journal.encoded(build)).hexdigest() != CAPTURE_BUILD:
-        raise ValueError("Capture build does not match the verified Stage 1.1 fingerprint")
-    modules = {
-        p.name: hashlib.sha256(p.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
-        for p in Path(journal.__file__).parent.glob("*.py")
-    }
-    if build["module_sha256"] != modules:
-        raise ValueError("Local canonical replay modules differ from the capture build")
+    approved_capture(build)
+    verify_replay_modules(build)
     parser_bytes = Path(orderbook.__file__).read_bytes().replace(b"\r\n", b"\n")
     if hashlib.sha256(parser_bytes).hexdigest() != REPLAY_ORDERBOOK:
         raise ValueError("Canonical orderbook parser differs from the Stage 2A replay baseline")

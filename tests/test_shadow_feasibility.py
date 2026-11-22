@@ -17,19 +17,21 @@ A, B = "KXNBAGAME-TEST-ATL", "KXNBAGAME-TEST-DET"
 class Case:
     """A miniature sealed tape on a millisecond local receipt clock."""
 
-    def __init__(self):
+    def __init__(self, *, wall_base=10**18, tickers=(A, B)):
         self.rows = []
+        self.wall_base = wall_base
+        self.tickers = tickers
         self.add(0, "started", {"duration_seconds": 121})
         self.add(1, "connected", 1)
         for sid, channel in enumerate(("orderbook_delta", "trade"), 1):
             self.raw(2, {"type": "subscribed", "id": sid, "msg": {"sid": sid, "channel": channel}})
-        self.snapshot(3, 1, A)
-        self.snapshot(4, 2, B)
+        self.snapshot(3, 1, tickers[0])
+        self.snapshot(4, 2, tickers[1])
 
     def add(self, ms, kind, value):
         n = len(self.rows) + 1
         assert not self.rows or ms * 1_000_000 >= self.rows[-1][2]
-        self.rows.append([n, 10**18 + ms * 1_000_000, ms * 1_000_000, kind, value])
+        self.rows.append([n, self.wall_base + ms * 1_000_000, ms * 1_000_000, kind, value])
         return n
 
     def raw(self, ms, packet):
@@ -92,7 +94,7 @@ class Case:
             },
         )
 
-    def seal(self, parent, end=121_000, *, bad_build=False):
+    def seal(self, parent, end=121_000, *, bad_build=False, session_id="fixture"):
         dest = parent / "backup"
         dest.mkdir(parents=True)
         self.add(end, "collection_ended", "duration")
@@ -106,10 +108,13 @@ class Case:
             dest / journal.MANIFEST,
             {
                 "format": journal.FORMAT,
-                "session": "fixture",
+                "session": session_id,
+                "prepared_ns": self.wall_base - 1,
                 "build": {} if bad_build else build,
-                "markets": [A, B],
-                "market_checks": [{"ticker": t, "event_ticker": "KXNBAGAME-TEST"} for t in (A, B)],
+                "markets": self.tickers,
+                "market_checks": [
+                    {"ticker": t, "event_ticker": t.rpartition("-")[0]} for t in self.tickers
+                ],
             },
         )
         data = b"".join(journal.encoded(row) for row in self.rows)

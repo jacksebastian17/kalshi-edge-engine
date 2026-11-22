@@ -16,6 +16,11 @@ def main() -> None:
             group = sub.add_mutually_exclusive_group()
             group.add_argument("--tickers", nargs="+")
             group.add_argument("--count", type=int, choices=(2, 3, 4), default=2)
+            sub.add_argument(
+                "--distinct-events",
+                action="store_true",
+                help="Rank at most one market per NBA event",
+            )
         elif name == "capture":
             sub.add_argument("--minutes", type=int, choices=range(10, 16), default=12)
         elif name == "report":
@@ -32,7 +37,11 @@ def main() -> None:
         from .pilot import capture, preflight
 
         if arg.command == "preflight":
-            result = asyncio.run(preflight(path, arg.tickers, arg.count))
+            if arg.distinct_events and arg.tickers:
+                parser.error("--distinct-events is for ranked selection; use it with --count")
+            result = asyncio.run(
+                preflight(path, arg.tickers, arg.count, distinct_events=arg.distinct_events)
+            )
         else:
             result = asyncio.run(capture(path, arg.minutes * 60))
             code = int(result not in ("duration", "operator_stop", "operator_interrupt"))

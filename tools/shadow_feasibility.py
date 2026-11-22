@@ -9,10 +9,9 @@ from decimal import Decimal
 from operator import attrgetter
 from pathlib import Path
 
+from tools.capture_builds import approved_capture
 from tools.microstructure import journal
 from tools.shadow_tape import (
-    CAPTURE_BUILD,
-    CAPTURE_COMMIT,
     REPLAY_ORDERBOOK,
     SIDES,
     ZERO,
@@ -271,19 +270,61 @@ def flow_totals(tape: Tape) -> dict:
     }
 
 
-def analyze(archive: Path) -> tuple[dict, list[dict]]:
+def market_events(checks: list[dict], tickers: list[str]) -> dict[str, str]:
+    events = {m["ticker"]: m["event_ticker"] for m in checks}
+    if (
+        len(events) != len(checks)
+        or set(events) != set(tickers)
+        or not all(
+            isinstance(t, str)
+            and isinstance(e, str)
+            and e.startswith("KXNBAGAME-")
+            and t.rpartition("-")[0] == e
+            for t, e in events.items()
+        )
+    ):
+        raise ValueError("Invalid or conflicting NBA market/event identity")
+    return events
+
+
+def analyze(archive: Path, *, campaign_context: bool = False) -> tuple[dict, list[dict]]:
     meta, verified, before = verified_source(archive)
     tape = project(archive / journal.LOG, verified)
-    events = {m["ticker"]: m["event_ticker"] for m in meta["market_checks"]}
-    if set(events) != set(tape.markets) or not all(
-        isinstance(t, str) and t for t in events.values()
+    events = market_events(meta["market_checks"], list(tape.markets))
+    if "selection" in meta and (
+        meta["selection"]["selected"] != events or len(set(events.values())) != len(events)
     ):
-        raise ValueError("Missing capture event identity")
+        raise ValueError("Preflight selection differs from confirmed market/event identities")
     episodes, excluded = cohort(tape, events)
+    context = {}
+    if campaign_context:
+        assert tape.start_wall_ns is not None and tape.start is not None and tape.end is not None
+        context = {
+            "campaign_context": {
+                "start_wall_ns": tape.start_wall_ns,
+                "start_mono_ns": tape.start,
+                "end_wall_estimate_ns": tape.start_wall_ns + (tape.end - tape.start),
+                "selection_rule": meta.get("selection", {}).get("rule", "legacy_or_explicit"),
+            }
+        }
+        for episode in episodes:
+            horizon = episode["decision_mono_ns"] + MINUTE
+            first = episode["decision_asof_record"]
+            last = tape.cutoff(horizon)
+            breaks = tape.markets[episode["market"]].breaks
+            ix = bisect_right(breaks, first)
+            episode["window_coverage"] = {
+                "full_horizon": horizon <= tape.end,
+                "first_interruption_record": breaks[ix]
+                if ix < len(breaks) and breaks[ix] <= last
+                else None,
+                "conflict": any(a <= last and b >= first for a, b in tape.suspect_ranges),
+            }
     after_hashes = source_hashes(archive)
     if before != after_hashes:
         raise ValueError("Source changed during analysis")
     return {
+        **context,
         "protocol": PROTOCOL,
         "parameters": {
             "grid_seconds": 60,
@@ -301,14 +342,13 @@ def analyze(archive: Path) -> tuple[dict, list[dict]]:
         "excluded_opportunities": excluded,
         "scheduled_opportunities": len(episodes) + len(excluded),
         "source": {
-            "capture_commit": CAPTURE_COMMIT,
-            "capture_build_sha256": CAPTURE_BUILD,
+            **approved_capture(meta["build"]),
             "capture_build": meta["build"],
             "replay_orderbook_sha256": REPLAY_ORDERBOOK,
             "before_sha256": before,
             "after_sha256": after_hashes,
             "durable_records": verified["durable_records"],
-            "raw_messages": verified["counts"]["messages"],
+            "raw_messages": verified["counts"].get("messages", 0),
             "deltas": verified["deltas_received"],
             "unique_public_trades": verified["unique_public_trades"],
             "segments": verified["segments"],
