@@ -8,7 +8,9 @@ from datetime import UTC, datetime
 from itertools import combinations
 from pathlib import Path
 
+from tools import shadow_markouts
 from tools.capture_builds import approved_capture
+from tools.markout_fees import FeeEvidence
 from tools.microstructure import journal
 from tools.shadow_feasibility import PROTOCOL, analyze, encode, market_events, publish
 
@@ -63,20 +65,25 @@ def campaign_rows(summary: dict, episodes: list[dict]) -> list[dict]:
             observation_date_utc=datetime.fromtimestamp(utc // 10**9, UTC).date().isoformat(),
         )
         if "scenarios" in episode:
-            row["scenarios"] = [
-                {
-                    k: s[k]
-                    for k in (
-                        "delay_ms",
-                        "classification",
-                        "exit",
-                        "exit_record",
-                        "public_execution_support",
-                        "queue_comparison",
-                    )
-                }
-                for s in episode["scenarios"]
-            ]
+            fields: tuple[str, ...] = (
+                "delay_ms",
+                "classification",
+                "exit",
+                "exit_record",
+                "public_execution_support",
+                "queue_comparison",
+            )
+            if "markouts" in row:
+                fields += (
+                    "ambiguous_attribution",
+                    "assumed_arrival_mono_ns",
+                    "arrival_ahead_contracts",
+                    "print_contracts",
+                    "print_receipts",
+                    "ambiguous_group_records",
+                    "boundary_split_pairs",
+                )
+            row["scenarios"] = [{k: s.get(k) for k in fields} for s in episode["scenarios"]]
         else:
             row["role"] = "excluded"
         rows.append(row)
@@ -103,7 +110,13 @@ def usable(row: dict) -> bool:
     )
 
 
-def aggregate(archives: list[Path], *, roster: Path | None = None) -> tuple[dict, list[dict]]:
+def aggregate(
+    archives: list[Path],
+    *,
+    roster: Path | None = None,
+    markouts: bool = False,
+    fees: FeeEvidence | None = None,
+) -> tuple[dict, list[dict]]:
     expected = enrollments(roster)
     if not archives and not expected:
         raise ValueError("Supply at least one sealed backup or a preflight roster")
@@ -111,7 +124,9 @@ def aggregate(archives: list[Path], *, roster: Path | None = None) -> tuple[dict
     journals: dict[str, str] = {}
     rows: list[dict] = []
     for path in archives:
-        summary, episodes = analyze(path.absolute(), campaign_context=True)
+        summary, episodes = analyze(
+            path.absolute(), campaign_context=True, markouts=markouts, fees=fees
+        )
         sid, source, events = summary["session"], summary["source"], summary["event_by_market"]
         hashes = source["before_sha256"]
         if not isinstance(sid, str) or not sid:
@@ -240,6 +255,11 @@ def aggregate(archives: list[Path], *, roster: Path | None = None) -> tuple[dict
         },
     }
     return {
+        **(
+            {"tape_markouts": shadow_markouts.report(rows, total, fees.sha256 if fees else None)}
+            if markouts
+            else {}
+        ),
         "protocol": "b3b2-campaign-v1",
         "episode_protocol": PROTOCOL,
         "assessment": "COVERAGE_MET" if all(g["met"] for g in gates.values()) else "INCONCLUSIVE",
@@ -296,16 +316,30 @@ def main() -> None:
     parser.add_argument("archives", type=Path, nargs="*", help="Verified sealed backup directories")
     parser.add_argument("--roster", type=Path, help="Directory of exact preflight manifest copies")
     parser.add_argument(
+        "--markouts", action="store_true", help="Include Stage 2B2 decision-anchored evidence"
+    )
+    parser.add_argument(
+        "--fee-receipts", type=Path, help="Optional trusted same-clock GET receipt bundle"
+    )
+    parser.add_argument(
+        "--fee-sha256", help="Independently obtained SHA-256 of the fee receipt bundle"
+    )
+    parser.add_argument(
         "--output", type=Path, required=True, help="Fresh campaign results directory"
     )
     args = parser.parse_args()
+    if bool(args.fee_receipts) != bool(args.fee_sha256) or (
+        args.fee_receipts and not args.markouts
+    ):
+        parser.error("Fee evidence requires --markouts, --fee-receipts and --fee-sha256 together")
+    fees = FeeEvidence.read(args.fee_receipts, args.fee_sha256) if args.fee_receipts else None
     output = args.output.resolve()
     protected = [(a.parent if a.name == "backup" else a).resolve() for a in args.archives]
     if args.roster:
         protected.append(args.roster.resolve())
     if output.exists() or any(output.is_relative_to(p) for p in protected):
         parser.error("Choose a fresh output directory outside all inputs")
-    summary, rows = aggregate(args.archives, roster=args.roster)
+    summary, rows = aggregate(args.archives, roster=args.roster, markouts=args.markouts, fees=fees)
     publish(output, summary, rows, detail=True)
     print(encode(summary))
 

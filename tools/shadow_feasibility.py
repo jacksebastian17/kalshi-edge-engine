@@ -9,7 +9,9 @@ from decimal import Decimal
 from operator import attrgetter
 from pathlib import Path
 
+from tools import shadow_markouts
 from tools.capture_builds import approved_capture
+from tools.markout_fees import FeeEvidence
 from tools.microstructure import journal
 from tools.shadow_tape import (
     REPLAY_ORDERBOOK,
@@ -287,15 +289,24 @@ def market_events(checks: list[dict], tickers: list[str]) -> dict[str, str]:
     return events
 
 
-def analyze(archive: Path, *, campaign_context: bool = False) -> tuple[dict, list[dict]]:
+def analyze(
+    archive: Path,
+    *,
+    campaign_context: bool = False,
+    markouts: bool = False,
+    fees: FeeEvidence | None = None,
+) -> tuple[dict, list[dict]]:
     meta, verified, before = verified_source(archive)
-    tape = project(archive / journal.LOG, verified)
+    tape = project(archive / journal.LOG, verified, with_depth=markouts)
     events = market_events(meta["market_checks"], list(tape.markets))
     if "selection" in meta and (
         meta["selection"]["selected"] != events or len(set(events.values())) != len(events)
     ):
         raise ValueError("Preflight selection differs from confirmed market/event identities")
     episodes, excluded = cohort(tape, events)
+    if markouts:
+        for episode in episodes:
+            shadow_markouts.attach(tape, episode, before[journal.LOG], fees)
     context = {}
     if campaign_context:
         assert tape.start_wall_ns is not None and tape.start is not None and tape.end is not None

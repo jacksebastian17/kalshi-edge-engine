@@ -51,6 +51,18 @@ class BookAt:
 
 
 @dataclass(frozen=True, slots=True)
+class DepthReceipt:
+    record: int
+    sid: int
+    seq: int
+    yes_whole_bid: Decimal | None
+    no_whole_bid: Decimal | None
+
+    def whole_bid(self, side: str) -> Decimal | None:
+        return self.yes_whole_bid if side == "yes" else self.no_whole_bid
+
+
+@dataclass(frozen=True, slots=True)
 class Flow:
     record: int
     quantity: Decimal  # Signed change for depth, positive contracts for a public print.
@@ -61,6 +73,11 @@ class Flow:
 class Market:
     history: list[BookAt] = field(default_factory=lambda: [BookAt(0, EMPTY)])
     breaks: list[int] = field(default_factory=list)
+    depth: list[DepthReceipt] = field(default_factory=list)
+
+    def depth_at(self, record: int) -> DepthReceipt | None:
+        i = bisect_right(self.depth, record, key=attrgetter("record"))
+        return self.depth[i - 1] if i else None
 
     def at(self, record: int) -> BookAt:
         return self.history[bisect_right(self.history, record, key=attrgetter("record")) - 1]
@@ -94,7 +111,7 @@ class Tape:
         return min(self.end_record, bisect_right(self.mono, mono) - 1)
 
 
-def project(path: Path, report: dict) -> Tape:
+def project(path: Path, report: dict, *, with_depth: bool = False) -> Tape:
     tape = Tape(report["subscription_markets"])
     feed = Feed(list(tape.markets))
     replay_hash = hashlib.sha256()
@@ -131,6 +148,19 @@ def project(path: Path, report: dict) -> Tape:
             )
             snapshot = feed.snapshot_record.get(ticker) if market else None
             feed.event(kind, value, wall, mono)
+            if (
+                with_depth
+                and market
+                and (stats["deltas"] > deltas or feed.snapshot_record.get(ticker) == n)
+            ):
+                # Same whole-contract capacity per price as canonical Book.whole_bids.
+                ladder = feed.books[ticker]
+                whole = [
+                    max((p for p, q in ladder[s].items() if q >= 1), default=None) for s in SIDES
+                ]
+                market.depth.append(
+                    DepthReceipt(n, packet["sid"], packet["seq"], whole[0], whole[1])
+                )
             if market and stats["deltas"] > deltas:
                 key = (ticker, msg["side"], cents(msg["price_dollars"]))
                 tape.flows[key].append(Flow(n, fixed(msg["delta_fp"], 8)))

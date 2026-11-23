@@ -52,6 +52,8 @@ if ($LASTEXITCODE -ne 0) { throw 'Backup unavailable. Retain the enrolled run an
 
 ## Evaluate the accumulated sessions offline
 
+The Stage 2B2 report adds decision-anchored price observations to this same cohort. Use the offline markout runbook to produce both campaign accounting and per-episode evidence in a fresh directory. [Stage 2B2 runbook](b3b2-stage2b2-markouts.md)
+
 Run this block from the checkout after one or more sessions. It also works in a fresh PowerShell window. It creates a fresh output directory for this analysis pass. Every roster entry participates in denominator accounting, including entries without a backup. A corrupt or mismatched supplied backup stops the analysis.
 
 ```powershell
