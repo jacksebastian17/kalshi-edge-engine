@@ -78,7 +78,8 @@ async def test_same_ticker_receipts_follow_the_request_and_commit_boundary(tmp_p
 
 @pytest.fixture
 async def linked_archive(tmp_path, monkeypatch, request):
-    bridged = getattr(request, "param", None) == "stage2b3"
+    aligned = getattr(request, "param", None) == "aligned"
+    bridged = getattr(request, "param", None) == "stage2b3" or aligned
     ticker, event, series = (
         ("KXNBAGAME-TEST-ATL", "KXNBAGAME-TEST", "KXNBAGAME")
         if bridged
@@ -172,7 +173,9 @@ async def linked_archive(tmp_path, monkeypatch, request):
                     # The client has a MockTransport for every request, including this origin.
                     client.base_url = client.DEFAULT_BASE_URL
                     monkeypatch.setattr(paper_runtime.logger, "disabled", True)
-                    hooks.enter_context(observe(sink, ledger, rec, fees, {ticker: event}))
+                    hooks.enter_context(
+                        observe(sink, ledger, rec, fees, {ticker: event}, track_scanner=aligned)
+                    )
                 signal = await scanner_runtime._score_market(client, ticker, "NBA")
                 with receipt_scope() as cached:
                     await fees.resolve(ticker, for_entry=True)
@@ -391,14 +394,19 @@ async def test_duplicate_keys_in_damaged_snapshot_are_ambiguous(linked_archive):
     assert report["classification"] == "incomplete" and not report["resolved_fills"]
 
 
-@pytest.mark.parametrize("linked_archive", ["stage2b3"], indirect=True)
+@pytest.mark.parametrize("linked_archive", ["stage2b3", "aligned"], indirect=True)
 async def test_real_paper_runtime_keeps_draw_rejections_receipts_and_booking(
-    linked_archive, tmp_path
+    linked_archive, tmp_path, request
 ):
     from tools.paper_bridge import EVENTS
     from tools.paper_link_report import decisions, paper_records
 
     events = [json.loads(x) for x in (tmp_path / EVENTS).read_bytes().splitlines()]
+    if request.node.callspec.params["linked_archive"] == "aligned":
+        visits = [e for e in events if e["kind"] == "scanner_visit"]
+        scores = [e for e in events if e["kind"] == "scanner_score"]
+        assert len(visits) == len(scores) == 1
+        assert visits[0]["ticker"] == scores[0]["ticker"] and scores[0]["reason"] == "SIGNAL_VALID"
     A = "KXNBAGAME-TEST-ATL"
     game = A.rpartition("-")[0]
     rows = decisions(events, {"markets": {A: game}})

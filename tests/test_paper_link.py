@@ -1,6 +1,7 @@
 import hashlib
 import json
 import shutil
+import time
 from decimal import Decimal
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from tools.microstructure import journal
 from tools.paper_bridge import ENROLLMENT, EVENTS, PROTOCOL, SEAL
 from tools.paper_link import enroll
 from tools.paper_link_report import booking_support, campaign_report, decisions
+from tools.paper_selection import ALIGNED
 from tools.research_campaign import aggregate
 from tools.shadow_feasibility import encode
 from tools.shadow_markouts import SECOND
@@ -19,8 +21,11 @@ from tools.shadow_tape import FILES, project, verified_source
 C = "KXNBAGAME-OTHER-BOS"
 
 
-def fixture_session(root, name="b3b2-mock", *, prints=True, gap=False, clock=True, enrolled=1):
-    case = Case(tickers=(A, C))
+def fixture_session(
+    root, name="b3b2-mock", *, prints=True, gap=False, clock=True, enrolled=1, prepared=False
+):
+    wall_base = time.time_ns() + SECOND if prepared else 10**18
+    case = Case(tickers=(A, C), wall_base=wall_base)
     case.delta(59_000, 3, "1")
     if prints:
         case.trade(60_080, 1, "1")
@@ -28,11 +33,16 @@ def fixture_session(root, name="b3b2-mock", *, prints=True, gap=False, clock=Tru
     if not gap:
         case.delta(65_000, 5, "2", price="0.4200")
     tape = root / "tapes" / name
-    backup = case.seal(root / "wire" / name, end=150_000, session_id=name)
+    protocol = ALIGNED if prepared else PROTOCOL
+    session = journal.manifest(tape)["session"] if prepared else name
+    backup = case.seal(root / "wire" / name, end=150_000, session_id=session)
     meta = journal.manifest(backup)
     games = {t: t.rpartition("-")[0] for t in meta["markets"]}
     meta["selection"] = {"selected": games}
-    (backup / journal.MANIFEST).write_bytes(journal.encoded(meta))
+    if prepared:
+        shutil.copyfile(tape / journal.MANIFEST, backup / journal.MANIFEST)
+    else:
+        (backup / journal.MANIFEST).write_bytes(journal.encoded(meta))
     ws_seal = json.loads((backup / journal.SEAL).read_bytes())
     ws_seal["manifest_sha256"] = journal.digest(backup / journal.MANIFEST)
     (backup / journal.SEAL).write_bytes(journal.encoded(ws_seal))
@@ -41,16 +51,18 @@ def fixture_session(root, name="b3b2-mock", *, prints=True, gap=False, clock=Tru
             {n: journal.digest(backup / n) for n in FILES if n != journal.BACKUP_HASHES}
         )
     )
-    tape.mkdir(parents=True)
-    shutil.copyfile(backup / journal.MANIFEST, tape / journal.MANIFEST)
-    directory = enroll(root / "campaign", tape)
+    if not prepared:
+        tape.mkdir(parents=True)
+        shutil.copyfile(backup / journal.MANIFEST, tape / journal.MANIFEST)
+    directory = enroll(root / "campaign", tape, protocol)
     with pytest.raises(FileExistsError):
-        enroll(root / "campaign", tape)
+        enroll(root / "campaign", tape, protocol)
     shutil.copytree(backup, tape / "backup")
     with pytest.raises(ValueError, match="before capture"):
-        enroll(root / "campaign", tape)
+        enroll(root / "campaign", tape, protocol)
     meta = json.loads((directory / ENROLLMENT).read_bytes())
-    meta["enrolled_wall_ns"] = enrolled
+    if not prepared:
+        meta["enrolled_wall_ns"] = enrolled
     (directory / ENROLLMENT).write_bytes(journal.encoded(meta))
     frozen = journal.digest(directory / ENROLLMENT)
     events = []
@@ -65,12 +77,16 @@ def fixture_session(root, name="b3b2-mock", *, prints=True, gap=False, clock=Tru
                 pid=100,
                 origin="producer",
                 mono_ns=mono,
-                wall_ns=10**18 + mono,
+                wall_ns=wall_base + mono,
             )
         )
 
     event("opened", 0, enrollment_sha256=frozen, clock="time.monotonic_ns")
     event("paper_ready", 1, rest_session="fixture-session")
+    if prepared:
+        for i, (ticker, reason) in enumerate(((A, "SIGNAL_VALID"), (C, "LOW_LIQUIDITY"))):
+            event("scanner_visit", 2 + 2 * i, ticker=ticker)
+            event("scanner_score", 3 + 2 * i, ticker=ticker, reason=reason)
     for i, (ticker, side, price, at) in enumerate(
         (
             (A, "yes", "44.25", 60 * SECOND),
@@ -90,7 +106,7 @@ def fixture_session(root, name="b3b2-mock", *, prints=True, gap=False, clock=Tru
             contracts=1,
             direction="buy",
             decision_mono_ns=at,
-            decision_wall_ns=10**18 + at,
+            decision_wall_ns=wall_base + at,
             source_receipts=[],
         )
         event("reject", at, intent_id=str(i), reason="side_disabled")
@@ -102,7 +118,7 @@ def fixture_session(root, name="b3b2-mock", *, prints=True, gap=False, clock=Tru
         reason="duration",
         messages_sha256=journal.digest(backup / journal.LOG),
         manifest_sha256=meta["manifest_sha256"],
-        tape_session=name,
+        tape_session=session,
     )
     if not clock:
         events[-1]["pid"] += 1
@@ -110,7 +126,7 @@ def fixture_session(root, name="b3b2-mock", *, prints=True, gap=False, clock=Tru
     journal.exclusive(
         directory / SEAL,
         {
-            "protocol": PROTOCOL,
+            "protocol": protocol,
             "enrollment_sha256": frozen,
             "events_sha256": journal.digest(directory / EVENTS),
             "records": len(events),

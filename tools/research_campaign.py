@@ -15,6 +15,11 @@ from tools.microstructure import journal
 from tools.shadow_feasibility import PROTOCOL, analyze, encode, market_events, publish
 
 
+def check_cohort(meta: dict) -> None:
+    if meta.get("paper_link_cohort"):
+        raise ValueError("A separately enrolled paper cohort cannot enter the Stage 2B1 sample")
+
+
 def enrollments(roster: Path | None) -> dict[str, dict]:
     expected: dict[str, dict] = {}
     if roster is None:
@@ -24,6 +29,7 @@ def enrollments(roster: Path | None) -> dict[str, dict]:
     for path in sorted(roster.glob("*.json")):
         raw = path.read_bytes()
         meta = json.loads(raw)
+        check_cohort(meta)
         sid = meta["session"]
         tickers = meta["markets"]
         if (
@@ -124,6 +130,7 @@ def aggregate(
     journals: dict[str, str] = {}
     rows: list[dict] = []
     for path in archives:
+        check_cohort(journal.manifest(path))
         summary, episodes = analyze(
             path.absolute(), campaign_context=True, markouts=markouts, fees=fees
         )

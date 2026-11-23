@@ -11,6 +11,11 @@ APPROVED = {
     LEGACY_BUILD: {"capture_commit": "cfba2d7773250e0f2e4e3442b1abf9a944cad4b1"},
     DIVERSE_BUILD: {"capture_release": "b3b2-stage2b1-v1"},
 }
+# Sealed Stage 2B3 producer and the reader tested against both published pilot report hashes.
+PAPER_REPLAY_PAIR = (
+    "6abe4b15b48f706a54f6a9a3da5852f96e8b6dd553deda6f5a6c374fe40a5664",
+    "27c730d320e2c8e04ee571761887ba236fdb9121304b37a58557fcc5bbf227de",
+)
 
 
 def approved_capture(build: dict) -> dict[str, str]:

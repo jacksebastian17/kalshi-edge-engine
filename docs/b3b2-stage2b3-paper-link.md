@@ -2,7 +2,59 @@
 
 Protocol `b3b2-paper-proposals-v1` enrolls the proposals the ordinary paper strategy generates during a manually started session. A proposal enters the sidecar when the real quote builder returns, before side, risk, cooldown and admission checks. Both sides of one builder call share its decision timestamp and retain their original order. Capture includes rejected proposals and proposals outside the subscribed markets. Signals that produce no quote are counted separately. Each run uses a fresh paper ledger and REST recorder under the strict B3B1 profile. The cohort lives in a separate research directory.
 
-## Two-to-four-game pilot
+## Stage 2B3.1 strategy-aligned pilot
+
+The first 12-minute volume-ranked pilot recorded Portland–Philadelphia (POR) and Utah–Los Angeles (UTA). The paper scanner generated 2,106 proposals on 21 other contracts across 15 games. All four admissions were on Milwaukee–Detroit, and the paper ledger booked zero fills. The shared-process clock verified and every signal receipt resolved. Neither selected game produced a proposal. The original report is under `nba-paper-link-01/reports/67948dd2f4cc498f9f5b8de13c011215`.
+
+| | Original Stage 2B3 | Stage 2B3.1 |
+| --- | --- | --- |
+| Cohort | `b3b2-paper-proposals-v1` | `b3b2-paper-strategy-aligned-v1` |
+| Candidate evidence | Active game listing and 24-hour volume | One fresh NBA scanner discovery pass and one fee-resolved scanner score per candidate |
+| Ranking | Descending listed volume, then ascending ticker, one contract per event | Ascending ticker among contracts producing an enabled-side quote, one contract per event |
+| Denominator | All games enrolled under the volume rule | All games enrolled under the strategy rule, including later scanner and proposal misses |
+
+The targeted preflight runs the existing scorer and quote builder with the effective paper policy from the first pilot. A candidate needs verified series fees, an active market with a matching game ID, and at least one generated quote on a configured entry side. The preflight stops at quote generation. Later per-intent selectivity, portfolio limits, cooldowns and admission checks still run in the paper engine. Lexical ordering favors earlier ticker strings. A single pass describes the book at each contract's own receipt time and can select future games.
+
+The frozen audit records the discovery pages, fee and orderbook response bytes and SHA-256 hashes, source receipt numbers (including cached fee inputs), candidate timestamps, proposed sides, selection reasons, eligible ranks, and the effective policy and implementation hashes. A fresh market GET confirms each selected contract. A shortfall or failed confirmation saves the attempted selection and ends preflight. Keep that attempt with the campaign. Once enrolled, selected games stay in the denominator even if a game closes, the scanner misses it, or recording stops early.
+
+### Manually run one 12-minute, two-game paper pilot
+
+Run this preflight once in PowerShell from the project checkout. It uses public GETs and writes a new enrollment under `%USERPROFILE%\kalshi-paper-aligned-research`. It exits before starting the paper engine or WebSocket.
+
+```powershell
+Set-Location 'C:\Users\jacks\kalshi-edge-engine'
+$py = (Resolve-Path '.venv\Scripts\python.exe').Path
+$campaign = 'nba-paper-aligned-01'
+$run = 'b3b2-aligned-' + [guid]::NewGuid().ToString('N')
+$root = Join-Path $env:USERPROFILE "kalshi-paper-aligned-research\$campaign"
+& $py -m tools.paper_link preflight-aligned --campaign $campaign --run $run --count 2
+if ($LASTEXITCODE) { throw "Preflight failed. Inspect preflights\$run.json before any new attempt." }
+$audit = Get-Content -Raw -LiteralPath (Join-Path $root "preflights\$run.json") | ConvertFrom-Json
+$audit.candidates | Select-Object ticker,event_ticker,signal_reason,eligible,rank,reason | Format-Table
+```
+
+Once collection is explicitly authorized, use the same PowerShell session and run name. This command ends after 12 minutes plus shutdown and backup. The ordinary scanner retains its full universe.
+
+```powershell
+& $py -m tools.paper_link collect --aligned --campaign $campaign --run $run --minutes 12
+if ($LASTEXITCODE) { Write-Warning 'Collection incomplete. Retain the enrollment and run the offline report.' }
+```
+
+For status or early stop, use the existing `tools.microstructure status --run` and `stop --run` commands below with the exact aligned run name. To report offline after collection, use the following in the original window.
+
+```powershell
+$out = & $py -m tools.paper_link report --aligned --campaign $campaign
+if ($LASTEXITCODE) { throw 'Offline verification failed' }
+$summary = Get-Content -Raw -LiteralPath (Join-Path $out 'summary.json') | ConvertFrom-Json
+$summary | Select-Object protocol,selected_games,games_without_primary,proposals,linkage,admission | ConvertTo-Json -Depth 4
+$summary.sessions.PSObject.Properties | ForEach-Object {
+    $_.Value | Select-Object clock_mapping,sealed,selected_market_diagnostics | ConvertTo-Json -Depth 6
+}
+```
+
+Each selected ticker has counts for scanner attempts, score errors, signal reasons, valid signals, proposals, admissions and clock-linked proposals. An unsealed session reports observed counts as lower bounds. Inspect `episodes.jsonl` for all individual proposals, including rejections and contracts outside the recording. The targeted campaign has its own reports and contributes zero games to the original 100-game sample.
+
+## Original volume-ranked two-to-four-game pilot
 
 Choose two distinct NBA games for the first 12-minute session. Set the count to three or four before preflight for a larger session. Use the frozen Stage 2B1 distinct-event ranking, record every selected event and review its market identity. An active contract can concern a future game. Quiet events, a second visit to a game, zero paper proposals and zero compatible prints are all reportable results. The scanner keeps its normal universe and strategy. Its proposals can miss the subscribed tickers entirely.
 

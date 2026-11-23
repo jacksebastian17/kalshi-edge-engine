@@ -11,10 +11,12 @@ from pathlib import Path
 from kalshi_edge_engine.db.paper_store import OUTCOME_ON_TIME_MS
 from kalshi_edge_engine.replay.archive import Archive, open_archive
 from kalshi_edge_engine.replay.evidence import FIELDS, evidence_audit
+from tools.capture_builds import PAPER_REPLAY_PAIR
 from tools.markout_fees import FeeEvidence, Receipt
 from tools.microstructure import journal
 from tools.paper_bridge import ENROLLMENT, EVENTS, PROTOCOL, SEAL
 from tools.paper_link_marks import classified_prints, link
+from tools.paper_selection import ALIGNED, fingerprint, verify_plan
 from tools.shadow_feasibility import DELAYS, market_events
 from tools.shadow_markouts import HORIZONS, SECOND
 from tools.shadow_tape import Tape, project, source_hashes, verified_source
@@ -23,7 +25,7 @@ from tools.shadow_tape import Tape, project, source_hashes, verified_source
 def read_events(directory: Path, meta: dict, seal: dict | None) -> list[dict]:
     path = directory / EVENTS
     if seal and (
-        seal["protocol"] != PROTOCOL
+        seal["protocol"] != meta["protocol"]
         or seal["enrollment_sha256"] != journal.digest(directory / ENROLLMENT)
         or seal["events_sha256"] != journal.digest(path)
     ):
@@ -282,16 +284,29 @@ def booking_support(row: dict, tape: Tape) -> None:
         f["public_support_through_local_booking"] = support
 
 
-def session_report(directory: Path, tape_root: Path) -> tuple[dict, list[dict]]:
+def session_report(
+    directory: Path, tape_root: Path, protocol: str = PROTOCOL
+) -> tuple[dict, list[dict]]:
     from tools.paper_link import version_digest
 
     meta = json.loads((directory / ENROLLMENT).read_bytes())
+    builds = meta["code_sha256"], version_digest(protocol)
     if (
-        meta["protocol"] != PROTOCOL
+        meta["protocol"] != protocol
         or directory.name != meta["tape_run"]
-        or meta["code_sha256"] != version_digest()
+        or (builds[0] != builds[1] and not (protocol == PROTOCOL and builds == PAPER_REPLAY_PAIR))
     ):
         raise ValueError("Invalid enrollment identity")
+    plan = None
+    if protocol == ALIGNED:
+        plan = verify_plan(
+            directory.parent.parent,
+            directory.name,
+            meta["tape_session"],
+            meta["markets"],
+            meta["code_sha256"],
+            meta["selection_sha256"],
+        )
     seal_file = directory / SEAL
     seal = json.loads(seal_file.read_bytes()) if seal_file.is_file() else None
     events = read_events(directory, meta, seal)
@@ -322,6 +337,7 @@ def session_report(directory: Path, tape_root: Path) -> tuple[dict, list[dict]]:
             tm["session"] != meta["tape_session"]
             or market_events(tm["market_checks"], tm["markets"]) != meta["markets"]
             or hashes[journal.MANIFEST] != meta["manifest_sha256"]
+            or (plan and tm.get("selection", {}).get("audit_sha256") != meta["selection_sha256"])
         ):
             issue = "tape_session_mismatch"
         else:
@@ -334,6 +350,14 @@ def session_report(directory: Path, tape_root: Path) -> tuple[dict, list[dict]]:
                 tape_path / journal.LOG, verified, with_depth=True, proposal_prices=prices
             )
             mapped = same_clock(events, tape, meta, digest, journal.digest(directory / ENROLLMENT))
+            if plan and mapped:
+                mapped = (
+                    plan["finished_ns"]
+                    <= tm["prepared_ns"]
+                    <= meta["enrolled_wall_ns"]
+                    <= events[0]["wall_ns"]
+                    <= (tape.start_wall_ns or 0)
+                )
             if source_hashes(tape_path) != hashes:
                 raise ValueError("Tape changed during linking")
             issue = "verified_shared_process" if mapped else "unverified_clock"
@@ -348,6 +372,11 @@ def session_report(directory: Path, tape_root: Path) -> tuple[dict, list[dict]]:
             if journal.digest(experiment_file) != seal["experiment_sha256"]:
                 raise ValueError("Paper experiment manifest differs from seal")
             experiment = json.loads(experiment_file.read_bytes())
+            if plan and (
+                experiment["source_sha256"] != plan["runtime"]["source_sha256"]
+                or fingerprint(experiment["policy"]) != plan["runtime"]["policy_sha256"]
+            ):
+                raise ValueError("Captured runtime differs from the frozen selection policy")
             info["paper_runtime"] = {
                 k: experiment[k] for k in ("experiment_id", "source_sha256", "commit", "policy")
             }
@@ -371,16 +400,40 @@ def session_report(directory: Path, tape_root: Path) -> tuple[dict, list[dict]]:
             booking_support(r, tape)
         else:
             r["link_status"] = issue
+    if plan:
+        from kalshi_edge_engine.engine.signal import SIGNAL_VALID
+
+        stages = {}
+        ranks = {r["ticker"]: r["rank"] for r in plan["candidates"] if r["reason"] == "selected"}
+        for ticker, game in meta["markets"].items():
+            observed = [e for e in events if e.get("ticker") == ticker]
+            scores = [e["reason"] for e in observed if e["kind"] == "scanner_score"]
+            proposals = [r for r in rows.values() if r["ticker"] == ticker]
+            stages[ticker] = {
+                "game": game,
+                "preflight_rank": ranks[ticker],
+                "sealed": bool(seal),
+                "scanner_visits": sum(e["kind"] == "scanner_visit" for e in observed),
+                "score_errors": sum(e["kind"] == "scanner_score_error" for e in observed),
+                "signal_reasons": dict(Counter(scores)),
+                "valid_signals": scores.count(SIGNAL_VALID),
+                "proposals": len(proposals),
+                "admitted": sum(r["admission"] == "admitted" for r in proposals),
+                "linked": sum(r["link_status"] == "linked" for r in proposals),
+            }
+        info["selected_market_diagnostics"] = stages
     return info, list(rows.values())
 
 
-def campaign_report(campaign: Path, tape_root: Path | None = None) -> tuple[dict, list[dict]]:
+def campaign_report(
+    campaign: Path, tape_root: Path | None = None, *, protocol: str = PROTOCOL
+) -> tuple[dict, list[dict]]:
     sessions: dict[str, dict] = {}
     games: dict[str, list[str]] = defaultdict(list)
     rows = []
     tape_ids = set()
     for directory in sorted((campaign / "sessions").iterdir()):
-        info, rr = session_report(directory, tape_root or journal.ROOT)
+        info, rr = session_report(directory, tape_root or journal.ROOT, protocol)
         meta = info["enrollment"]
         sid = meta["paper_session"]
         if sid in sessions or meta["tape_session"] in tape_ids:
@@ -460,7 +513,8 @@ def campaign_report(campaign: Path, tape_root: Path | None = None) -> tuple[dict
             counts[marks["horizons"][HORIZONS.index(h)]["status"] if marks else "unlinked"] += 1
         coverage[str(h)] = dict(counts)
     return {
-        "protocol": PROTOCOL,
+        "protocol": protocol,
+        **({"original_sample_games_contributed": 0} if protocol == ALIGNED else {}),
         "sessions": sessions,
         "selected_games": len(games),
         "sessions_by_game": games,
@@ -469,8 +523,16 @@ def campaign_report(campaign: Path, tape_root: Path | None = None) -> tuple[dict
             g: primary[g]["decision_id"] if g in primary else None for g in sorted(games)
         },
         "games_without_primary": sorted(set(games) - set(primary)),
-        "primary_games": {"observed": len(primary), "minimum": 100, "met": len(primary) >= 100},
-        "primary_dates_utc": {"dates": sorted(dates), "minimum": 10, "met": len(dates) >= 10},
+        "primary_games": {
+            "observed": len(primary),
+            "minimum": 100 if protocol == PROTOCOL else None,
+            "met": len(primary) >= 100 if protocol == PROTOCOL else None,
+        },
+        "primary_dates_utc": {
+            "dates": sorted(dates),
+            "minimum": 10 if protocol == PROTOCOL else None,
+            "met": len(dates) >= 10 if protocol == PROTOCOL else None,
+        },
         "proposals": len(rows),
         "linkage": dict(Counter(r["link_status"] for r in rows)),
         "admission": dict(Counter(r["admission"] for r in rows)),

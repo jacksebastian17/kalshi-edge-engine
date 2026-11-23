@@ -78,7 +78,13 @@ class Sidecar:
 
 @contextmanager
 def observe(
-    sink: Sidecar, store: Any, recorder: Any, resolver: Any, markets: dict[str, str]
+    sink: Sidecar,
+    store: Any,
+    recorder: Any,
+    resolver: Any,
+    markets: dict[str, str],
+    *,
+    track_scanner: bool = False,
 ) -> Iterator[None]:
     from kalshi_edge_engine.runtime import paper_runtime as runtime
 
@@ -219,6 +225,28 @@ def observe(
             evaluating.reset(token)
 
     with ExitStack() as stack:
+        if track_scanner:
+            score = scanner_runtime._score_market
+
+            async def score_market(client: Any, ticker: str, universe: str) -> Any:
+                if ticker not in markets:
+                    return await score(client, ticker, universe)
+                sink.write("scanner_visit", ticker=ticker)
+                try:
+                    signal = await score(client, ticker, universe)
+                except Exception as exc:
+                    sink.write("scanner_score_error", ticker=ticker, error_type=type(exc).__name__)
+                    raise
+                sink.write(
+                    "scanner_score",
+                    ticker=ticker,
+                    reason=signal.reason_code,
+                    scored_ns=signal.scored_ns,
+                    source_receipts=references(signal.receipts),
+                )
+                return signal
+
+            stack.enter_context(patch.object(scanner_runtime, "_score_market", score_market))
         for obj, name, wrapper in (
             (runtime.logger, "info", observe_reason(runtime.logger.info)),
             (runtime.logger, "exception", observe_reason(runtime.logger.exception)),
