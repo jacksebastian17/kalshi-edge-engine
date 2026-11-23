@@ -5,7 +5,7 @@ import hashlib
 import json
 import sqlite3
 import time
-from contextlib import closing
+from contextlib import ExitStack, closing
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock
@@ -24,7 +24,6 @@ from kalshi_edge_engine.replay.evidence import evidence_audit
 from kalshi_edge_engine.runtime import (
     config,
     paper_exit_runtime,
-    paper_runtime,
     scanner_runtime,
     state,
 )
@@ -78,7 +77,13 @@ async def test_same_ticker_receipts_follow_the_request_and_commit_boundary(tmp_p
 
 
 @pytest.fixture
-async def linked_archive(tmp_path, monkeypatch):
+async def linked_archive(tmp_path, monkeypatch, request):
+    bridged = getattr(request, "param", None) == "stage2b3"
+    ticker, event, series = (
+        ("KXNBAGAME-TEST-ATL", "KXNBAGAME-TEST", "KXNBAGAME")
+        if bridged
+        else ("GAME", "EVENT", "SERIES")
+    )
     ledger = PaperStore(
         str(tmp_path / "paper_trading.db"), experiment_id=overnight.LINKED_EXPERIMENT
     )
@@ -102,8 +107,8 @@ async def linked_archive(tmp_path, monkeypatch):
                 200,
                 json={
                     "market": {
-                        "ticker": "GAME",
-                        "event_ticker": "EVENT",
+                        "ticker": ticker,
+                        "event_ticker": event,
                         "status": "active",
                         "close_time": "2099-01-01T00:00:00Z",
                     }
@@ -111,13 +116,13 @@ async def linked_archive(tmp_path, monkeypatch):
             )
         if "/events/" in path:
             return httpx.Response(
-                200, json={"event": {"event_ticker": "EVENT", "series_ticker": "SERIES"}}
+                200, json={"event": {"event_ticker": event, "series_ticker": series}}
             )
         return httpx.Response(
             200,
             json={
                 "series": {
-                    "ticker": "SERIES",
+                    "ticker": series,
                     "fee_type": "quadratic_with_maker_fees",
                     "fee_multiplier": 1,
                 }
@@ -157,12 +162,23 @@ async def linked_archive(tmp_path, monkeypatch):
             client.recorder = rec
             fees = MarketFees(client)
             monkeypatch.setattr(state, "market_fees", fees)
-            signal = await scanner_runtime._score_market(client, "GAME", "NBA")
-            with receipt_scope() as cached:
-                await fees.resolve("GAME", for_entry=True)
-            assert [r.sequence for r in cached] == [1, 2, 3] and rec.sequence == 4
-            await paper_runtime._process_paper_intents(signal, client)
-            await asyncio.wait_for(asyncio.gather(*state.paper_simulation_tasks), 4)
+            with ExitStack() as hooks:
+                if bridged:
+                    from kalshi_edge_engine.runtime import paper_runtime
+                    from tools.paper_bridge import Sidecar, observe
+
+                    sink = Sidecar(tmp_path, {"paper_session": "paper-fixture"})
+                    hooks.callback(sink.close)
+                    # The client has a MockTransport for every request, including this origin.
+                    client.base_url = client.DEFAULT_BASE_URL
+                    monkeypatch.setattr(paper_runtime.logger, "disabled", True)
+                    hooks.enter_context(observe(sink, ledger, rec, fees, {ticker: event}))
+                signal = await scanner_runtime._score_market(client, ticker, "NBA")
+                with receipt_scope() as cached:
+                    await fees.resolve(ticker, for_entry=True)
+                assert [r.sequence for r in cached] == [1, 2, 3] and rec.sequence == 4
+                await scanner_runtime._process_paper_intents(signal, client)
+                await asyncio.wait_for(asyncio.gather(*state.paper_simulation_tasks), 4)
             assert ledger.count_fills_total() == 1
             key = ledger.get_recent_fills()[0]["intent_id"]
             seconds, nanos = time.time, time.time_ns
@@ -373,3 +389,34 @@ async def test_duplicate_keys_in_damaged_snapshot_are_ambiguous(linked_archive):
     report = audit(linked_archive)
     assert report["counts"]["duplicate_references"] > 0
     assert report["classification"] == "incomplete" and not report["resolved_fills"]
+
+
+@pytest.mark.parametrize("linked_archive", ["stage2b3"], indirect=True)
+async def test_real_paper_runtime_keeps_draw_rejections_receipts_and_booking(
+    linked_archive, tmp_path
+):
+    from tools.paper_bridge import EVENTS
+    from tools.paper_link_report import decisions, paper_records
+
+    events = [json.loads(x) for x in (tmp_path / EVENTS).read_bytes().splitlines()]
+    A = "KXNBAGAME-TEST-ATL"
+    game = A.rpartition("-")[0]
+    rows = decisions(events, {"markets": {A: game}})
+    assert any(r["admission_reason"] == "side_disabled" for r in rows.values())
+    assert all(r["admission"] != "unknown" for r in rows.values())
+    assert len([r for r in events if r["kind"] == "paper_booking"]) == 1
+    with open_archive(linked_archive) as archive:
+        fees, details = paper_records(archive, events, rows, "fixture-session", "digest")
+    bought = next(r for r in rows.values() if r["admission"] == "admitted")
+    assert bought["paper_ledger"]["status"] in ("FILLED", "EXITED")
+    assert bought["signal_receipt_audit"] == {"references": 4, "unresolved": []}
+    assert (
+        len(bought["paper_ledger"]["polls"]) == 3
+        and len(bought["paper_ledger"]["entry_fills"]) == 1
+    )
+    assert bought["paper_ledger"]["entry_fills"][0]["booking_mono_ns"] is not None
+    assert len(details["booked_lifecycle_exits"]) == 1 and not details["ledger_only_intents"]
+    assert fees.resolve("digest", A, game, bought["decision_mono_ns"]) is not None
+    assert fees.resolve("other", A, game, bought["decision_mono_ns"]) is None
+    # A later public snapshot cannot backfill an earlier missing profile.
+    assert fees.resolve("digest", A, game, events[0]["mono_ns"] - 1) is None

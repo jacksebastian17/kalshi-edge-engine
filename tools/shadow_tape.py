@@ -74,6 +74,10 @@ class Market:
     history: list[BookAt] = field(default_factory=lambda: [BookAt(0, EMPTY)])
     breaks: list[int] = field(default_factory=list)
     depth: list[DepthReceipt] = field(default_factory=list)
+    # Optional Stage 2B3 projection, only for prices actually proposed in this session.
+    queues: dict[tuple[str, Decimal], list[tuple[int, Decimal, Decimal]]] = field(
+        default_factory=dict
+    )
 
     def depth_at(self, record: int) -> DepthReceipt | None:
         i = bisect_right(self.depth, record, key=attrgetter("record"))
@@ -111,8 +115,14 @@ class Tape:
         return min(self.end_record, bisect_right(self.mono, mono) - 1)
 
 
-def project(path: Path, report: dict, *, with_depth: bool = False) -> Tape:
+def project(
+    path: Path, report: dict, *, with_depth: bool = False, proposal_prices: set[Key] | None = None
+) -> Tape:
     tape = Tape(report["subscription_markets"])
+    with_depth = with_depth or bool(proposal_prices)
+    for ticker, side, price in proposal_prices or ():
+        if ticker in tape.markets:
+            tape.markets[ticker].queues[side, price] = []
     feed = Feed(list(tape.markets))
     replay_hash = hashlib.sha256()
     with path.open("rb") as source:
@@ -161,9 +171,23 @@ def project(path: Path, report: dict, *, with_depth: bool = False) -> Tape:
                 market.depth.append(
                     DepthReceipt(n, packet["sid"], packet["seq"], whole[0], whole[1])
                 )
+                if feed.snapshot_record.get(ticker) == n:
+                    for (side, price), history in market.queues.items():
+                        levels = ladder[side]
+                        better = sum((q for p, q in levels.items() if p > price), ZERO)
+                        history.append((n, levels.get(price, ZERO), better))
             if market and stats["deltas"] > deltas:
                 key = (ticker, msg["side"], cents(msg["price_dollars"]))
-                tape.flows[key].append(Flow(n, fixed(msg["delta_fp"], 8)))
+                delta = fixed(msg["delta_fp"], 8)
+                tape.flows[key].append(Flow(n, delta))
+                for (side, price), history in market.queues.items():
+                    if side == key[1] and key[2] >= price:
+                        _, at, better = history[-1]
+                        if key[2] == price:
+                            at += delta
+                        else:
+                            better += delta
+                        history.append((n, at, better))
             new_uncertain = stats.get("unknown_block_status", 0) + stats.get(
                 "unclassified_trade_direction", 0
             )

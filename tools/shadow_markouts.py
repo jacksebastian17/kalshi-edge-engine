@@ -59,10 +59,18 @@ def liquidation(
     }
 
 
-def attach(tape: Tape, row: dict, digest: str, fees: FeeEvidence | None) -> None:
+def attach(
+    tape: Tape,
+    row: dict,
+    digest: str,
+    fees: FeeEvidence | None,
+    *,
+    reference_bid: Decimal | None = None,
+) -> None:
     market = tape.markets[row["market"]]
     anchor, decision, side = row["decision_mono_ns"], row["decision_asof_record"], row["side"]
     entry = row["price_cents"]
+    original_bid = entry if reference_bid is None else reference_bid
     baseline = market.depth_at(decision)
     assert baseline is not None and tape.end is not None
     entry_whole = baseline.whole_bid(side)
@@ -139,7 +147,7 @@ def attach(tape: Tape, row: dict, digest: str, fees: FeeEvidence | None) -> None
             (
                 s.record
                 for s in market.history[first_change:last]
-                if s.quote.bid(side)[0] != entry or not s.quote.passive()
+                if s.quote.bid(side)[0] != original_bid or not s.quote.passive()
             ),
             None,
         )
@@ -170,7 +178,7 @@ def attach(tape: Tape, row: dict, digest: str, fees: FeeEvidence | None) -> None
             first_departure_record=departure,
             after_quote_departure=departure is not None,
             source_relative_to_departure=relation,
-            original_quote_available=bid == entry and quote.passive(),
+            original_quote_available=bid == original_bid and quote.passive(),
             displayed_bid_cents=bid if qty else None,
             displayed_bid_contracts=qty,
             crossed_book=crossed,
