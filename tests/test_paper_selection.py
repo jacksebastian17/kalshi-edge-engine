@@ -28,7 +28,9 @@ NO_FEE = "KXNBAGAME-B-NOFEE"
 OTHER = "KXNBAGAME-Z-OTHER"
 
 
-def mock_preflight(monkeypatch, *, reverse=False, all_quiet=False, late_close=False):
+def mock_preflight(
+    monkeypatch, *, reverse=False, all_quiet=False, late_close=False, activity_api=None
+):
     # Real discovery, budgeted GET client, fee resolver, scorer and quote builder.
     # MockTransport is the only HTTP transport and accepts only the enumerated public routes.
     tickers = [A, B, C, QUIET, NO_FEE, OTHER]
@@ -41,6 +43,8 @@ def mock_preflight(monkeypatch, *, reverse=False, all_quiet=False, late_close=Fa
         assert req.method == "GET"
         path = req.url.path.removeprefix("/trade-api/v2")
         seen.append(path)
+        if activity_api and path in ("/milestones", "/markets/trades"):
+            return activity_api(path, req.url.params)
         if path == "/markets":
             assert req.url.params["series_ticker"] == "KXNBAGAME"
             result = {"markets": list(listings.values()), "cursor": ""}

@@ -9,10 +9,10 @@ import pytest
 
 from tests.test_shadow_feasibility import A, Case
 from tools.microstructure import journal
+from tools.paper_activity import ACTIVE
 from tools.paper_bridge import ENROLLMENT, EVENTS, PROTOCOL, SEAL
 from tools.paper_link import enroll
 from tools.paper_link_report import booking_support, campaign_report, decisions
-from tools.paper_selection import ALIGNED
 from tools.research_campaign import aggregate
 from tools.shadow_feasibility import encode
 from tools.shadow_markouts import SECOND
@@ -33,7 +33,7 @@ def fixture_session(
     if not gap:
         case.delta(65_000, 5, "2", price="0.4200")
     tape = root / "tapes" / name
-    protocol = ALIGNED if prepared else PROTOCOL
+    protocol = journal.manifest(tape)["paper_link_cohort"] if prepared else PROTOCOL
     session = journal.manifest(tape)["session"] if prepared else name
     backup = case.seal(root / "wire" / name, end=150_000, session_id=session)
     meta = journal.manifest(backup)
@@ -108,8 +108,21 @@ def fixture_session(
             decision_mono_ns=at,
             decision_wall_ns=wall_base + at,
             source_receipts=[],
+            **({"side_enabled": side == "yes"} if protocol == ACTIVE else {}),
         )
-        event("reject", at, intent_id=str(i), reason="side_disabled")
+        if protocol == ACTIVE and i not in (1, 2):
+            event("entry_gates_passed", at, intent_id=str(i))
+            if i == 0:
+                event("admission", at, intent_id=str(i), admitted=True, reason=None)
+            else:
+                event("reject", at, intent_id=str(i), reason="max_open_orders")
+        else:
+            event(
+                "reject",
+                at,
+                intent_id=str(i),
+                reason="min_edge" if protocol == ACTIVE and i == 2 else "side_disabled",
+            )
     event(
         "tape_returned",
         151 * SECOND,

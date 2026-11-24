@@ -12,12 +12,15 @@ from pathlib import Path
 
 from tools.capture_builds import approved_capture
 from tools.microstructure import journal
+from tools.paper_activity import ACTIVE, LAUNCH_SECONDS, SECOND
 from tools.paper_bridge import ENROLLMENT, EVENTS, PROTOCOL, SEAL, Sidecar, observe
 from tools.paper_selection import ALIGNED, frozen_runtime, preflight, verify_plan
 from tools.shadow_feasibility import market_events, publish
 
 ROOT = Path.home() / "kalshi-paper-link-research"
 ALIGNED_ROOT = Path.home() / "kalshi-paper-aligned-research"
+ACTIVE_ROOT = Path.home() / "kalshi-paper-entry-active-research"
+TARGETED = (ALIGNED, ACTIVE)
 
 
 def version_digest(protocol: str = PROTOCOL) -> str:
@@ -31,7 +34,8 @@ def version_digest(protocol: str = PROTOCOL) -> str:
         "shadow_markouts",
         "shadow_feasibility",
         "markout_fees",
-        *(("paper_selection",) if protocol == ALIGNED else ()),
+        *(("paper_selection",) if protocol in TARGETED else ()),
+        *(("paper_activity",) if protocol == ACTIVE else ()),
     ):
         body = Path(__file__).with_name(name + ".py").read_bytes().replace(b"\r\n", b"\n")
         digest.update(name.encode() + b"\0" + body + b"\0")
@@ -45,13 +49,19 @@ def enroll(campaign: Path, tape_dir: Path, protocol: str = PROTOCOL) -> Path:
     approved_capture(meta["build"])
     events = market_events(meta["market_checks"], meta["markets"])
     selection = meta.get("selection", {})
-    aligned = protocol == ALIGNED
-    if aligned != (selection.get("rule") == ALIGNED):
+    targeted = protocol in TARGETED
+    if (targeted or selection.get("rule") in TARGETED) and selection.get("rule") != protocol:
         raise ValueError("Selection belongs to a different paper cohort")
     code = version_digest(protocol)
-    if aligned:
+    if targeted:
         verify_plan(
-            campaign, tape_dir.name, meta["session"], events, code, selection["audit_sha256"]
+            campaign,
+            tape_dir.name,
+            meta["session"],
+            events,
+            code,
+            selection["audit_sha256"],
+            protocol,
         )
     if (
         len(set(events.values())) != len(events)
@@ -67,7 +77,7 @@ def enroll(campaign: Path, tape_dir: Path, protocol: str = PROTOCOL) -> Path:
         {
             "protocol": protocol,
             "code_sha256": code,
-            **({"selection_sha256": selection["audit_sha256"]} if aligned else {}),
+            **({"selection_sha256": selection["audit_sha256"]} if targeted else {}),
             "paper_session": uuid.uuid4().hex,
             "enrolled_wall_ns": time.time_ns(),
             "tape_run": tape_dir.name,
@@ -103,7 +113,7 @@ async def collect(directory: Path, tape_dir: Path, minutes: int, protocol: str =
     ):
         raise ValueError("Expected the enrolled, unused preflight and protocol")
     configure_paper_profile()
-    if protocol == ALIGNED:
+    if protocol in TARGETED:
         plan = verify_plan(
             directory.parent.parent,
             tape_dir.name,
@@ -111,7 +121,17 @@ async def collect(directory: Path, tape_dir: Path, minutes: int, protocol: str =
             enrollment["markets"],
             enrollment["code_sha256"],
             enrollment["selection_sha256"],
+            protocol,
         )
+        if (
+            protocol == ACTIVE
+            and not 0
+            <= time.time_ns() - plan["activity_cutoff_s"] * SECOND
+            <= LAUNCH_SECONDS * SECOND
+        ):
+            raise ValueError(
+                "The active-cohort preflight launch window has elapsed or its clock is invalid"
+            )
         if plan["runtime"] != frozen_runtime():
             raise ValueError("Scanner policy or source changed after selection")
     paper = directory / "paper"
@@ -150,7 +170,8 @@ async def collect(directory: Path, tape_dir: Path, minutes: int, protocol: str =
                 rec,
                 state.market_fees,
                 enrollment["markets"],
-                track_scanner=protocol == ALIGNED,
+                track_scanner=protocol in TARGETED,
+                track_selectivity=protocol == ACTIVE,
             ):
                 # No HTTP server is exposed. Only normal local paper/scanner lifecycle calls.
                 began = time.monotonic_ns()
@@ -213,14 +234,18 @@ async def collect(directory: Path, tape_dir: Path, minutes: int, protocol: str =
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("preflight-aligned", "enroll", "collect", "report"):
+    for name in ("preflight-aligned", "preflight-active", "enroll", "collect", "report"):
         p = commands.add_parser(name)
         p.add_argument("--campaign", required=True)
-        if name == "preflight-aligned":
+        if name.startswith("preflight-"):
             p.add_argument("--count", type=int, choices=(2, 3, 4), default=2)
         else:
-            p.add_argument(
+            cohort = p.add_mutually_exclusive_group()
+            cohort.add_argument(
                 "--aligned", action="store_true", help="Use only the strategy-aligned cohort"
+            )
+            cohort.add_argument(
+                "--active", action="store_true", help="Use only the entry-selective active cohort"
             )
         if name != "report":
             p.add_argument("--run", required=True)
@@ -229,9 +254,13 @@ def main() -> None:
     args = parser.parse_args()
     if not re.fullmatch(r"[a-zA-Z0-9_-]{1,72}", args.campaign):
         parser.error("Invalid campaign name")
-    aligned = args.command == "preflight-aligned" or args.aligned
-    protocol = ALIGNED if aligned else PROTOCOL
-    campaign = (ALIGNED_ROOT if aligned else ROOT) / args.campaign
+    if args.command == "preflight-active" or getattr(args, "active", False):
+        protocol, root = ACTIVE, ACTIVE_ROOT
+    elif args.command == "preflight-aligned" or getattr(args, "aligned", False):
+        protocol, root = ALIGNED, ALIGNED_ROOT
+    else:
+        protocol, root = PROTOCOL, ROOT
+    campaign = root / args.campaign
     if campaign.resolve() != campaign:
         parser.error("Expected an unlinked research directory")
     if args.command == "report":
@@ -245,9 +274,9 @@ def main() -> None:
         print(output)
     else:
         tape = journal.run_path(args.run)
-        if args.command == "preflight-aligned":
+        if args.command.startswith("preflight-"):
             configure_paper_profile()
-            asyncio.run(preflight(campaign, tape, args.count, version_digest(protocol)))
+            asyncio.run(preflight(campaign, tape, args.count, version_digest(protocol), protocol))
             print(enroll(campaign, tape, protocol))
         elif args.command == "enroll":
             print(enroll(campaign, tape, protocol))

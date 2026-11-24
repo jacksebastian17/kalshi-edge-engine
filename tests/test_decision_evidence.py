@@ -78,7 +78,8 @@ async def test_same_ticker_receipts_follow_the_request_and_commit_boundary(tmp_p
 
 @pytest.fixture
 async def linked_archive(tmp_path, monkeypatch, request):
-    aligned = getattr(request, "param", None) == "aligned"
+    active = getattr(request, "param", None) == "active"
+    aligned = getattr(request, "param", None) == "aligned" or active
     bridged = getattr(request, "param", None) == "stage2b3" or aligned
     ticker, event, series = (
         ("KXNBAGAME-TEST-ATL", "KXNBAGAME-TEST", "KXNBAGAME")
@@ -174,7 +175,15 @@ async def linked_archive(tmp_path, monkeypatch, request):
                     client.base_url = client.DEFAULT_BASE_URL
                     monkeypatch.setattr(paper_runtime.logger, "disabled", True)
                     hooks.enter_context(
-                        observe(sink, ledger, rec, fees, {ticker: event}, track_scanner=aligned)
+                        observe(
+                            sink,
+                            ledger,
+                            rec,
+                            fees,
+                            {ticker: event},
+                            track_scanner=aligned,
+                            track_selectivity=active,
+                        )
                     )
                 signal = await scanner_runtime._score_market(client, ticker, "NBA")
                 with receipt_scope() as cached:
@@ -394,7 +403,7 @@ async def test_duplicate_keys_in_damaged_snapshot_are_ambiguous(linked_archive):
     assert report["classification"] == "incomplete" and not report["resolved_fills"]
 
 
-@pytest.mark.parametrize("linked_archive", ["stage2b3", "aligned"], indirect=True)
+@pytest.mark.parametrize("linked_archive", ["stage2b3", "aligned", "active"], indirect=True)
 async def test_real_paper_runtime_keeps_draw_rejections_receipts_and_booking(
     linked_archive, tmp_path, request
 ):
@@ -402,7 +411,7 @@ async def test_real_paper_runtime_keeps_draw_rejections_receipts_and_booking(
     from tools.paper_link_report import decisions, paper_records
 
     events = [json.loads(x) for x in (tmp_path / EVENTS).read_bytes().splitlines()]
-    if request.node.callspec.params["linked_archive"] == "aligned":
+    if request.node.callspec.params["linked_archive"] in ("active", "aligned"):
         visits = [e for e in events if e["kind"] == "scanner_visit"]
         scores = [e for e in events if e["kind"] == "scanner_score"]
         assert len(visits) == len(scores) == 1
@@ -416,6 +425,22 @@ async def test_real_paper_runtime_keeps_draw_rejections_receipts_and_booking(
     with open_archive(linked_archive) as archive:
         fees, details = paper_records(archive, events, rows, "fixture-session", "digest")
     bought = next(r for r in rows.values() if r["admission"] == "admitted")
+    if request.node.callspec.params["linked_archive"] == "active":
+        from tools.paper_activity import ACTIVE
+        from tools.paper_link_report import proposal_stages
+
+        active_rows = decisions(events, {"markets": {A: game}, "protocol": ACTIVE})
+        for key, entry in active_rows.items():
+            entry["paper_ledger"] = rows[key]["paper_ledger"]
+        totals = proposal_stages(list(active_rows.values()), True)
+        assert (
+            totals["enabled_side"]
+            == totals["deterministic_pass"]
+            == totals["paper_admissions"]
+            == totals["paper_entry_bookings"]
+            == 1
+        )
+        assert totals["static_rejections"] == {"side_disabled": 1}
     assert bought["paper_ledger"]["status"] in ("FILLED", "EXITED")
     assert bought["signal_receipt_audit"] == {"references": 4, "unresolved": []}
     assert (

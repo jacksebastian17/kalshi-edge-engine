@@ -11,9 +11,10 @@ from pathlib import Path
 from kalshi_edge_engine.db.paper_store import OUTCOME_ON_TIME_MS
 from kalshi_edge_engine.replay.archive import Archive, open_archive
 from kalshi_edge_engine.replay.evidence import FIELDS, evidence_audit
-from tools.capture_builds import PAPER_REPLAY_PAIR
+from tools.capture_builds import PAPER_REPLAY_BUILDS
 from tools.markout_fees import FeeEvidence, Receipt
 from tools.microstructure import journal
+from tools.paper_activity import ACTIVE, STATIC_REJECTIONS
 from tools.paper_bridge import ENROLLMENT, EVENTS, PROTOCOL, SEAL
 from tools.paper_link_marks import classified_prints, link
 from tools.paper_selection import ALIGNED, fingerprint, verify_plan
@@ -97,8 +98,16 @@ def decisions(events: list[dict], meta: dict) -> dict[str, dict]:
                 "entry_marks_by_anchor": {},
                 "predecision_30s": None,
             }
+            if meta.get("protocol") == ACTIVE:
+                rows[intent].update(deterministic_eligible=None, static_rejection=None)
+        elif e["kind"] == "entry_gates_passed" and meta.get("protocol") == ACTIVE:
+            if not intent or intent not in rows:
+                raise ValueError("Unmatched deterministic gate record")
+            rows[intent]["deterministic_eligible"] = True
         elif e["kind"] in ("admission", "reject") and intent:
             r = rows[intent]
+            if meta.get("protocol") == ACTIVE and e["reason"] in STATIC_REJECTIONS:
+                r.update(deterministic_eligible=False, static_rejection=e["reason"])
             r["admission_events"].append(
                 {k: e[k] for k in ("n", "kind", "reason", "wall_ns", "mono_ns")}
             )
@@ -290,15 +299,16 @@ def session_report(
     from tools.paper_link import version_digest
 
     meta = json.loads((directory / ENROLLMENT).read_bytes())
-    builds = meta["code_sha256"], version_digest(protocol)
+    producer, reader = meta["code_sha256"], version_digest(protocol)
+    old, compatible = PAPER_REPLAY_BUILDS.get(protocol, (set(), ""))
     if (
         meta["protocol"] != protocol
         or directory.name != meta["tape_run"]
-        or (builds[0] != builds[1] and not (protocol == PROTOCOL and builds == PAPER_REPLAY_PAIR))
+        or (producer != reader and not (producer in old and reader == compatible))
     ):
         raise ValueError("Invalid enrollment identity")
     plan = None
-    if protocol == ALIGNED:
+    if protocol in (ALIGNED, ACTIVE):
         plan = verify_plan(
             directory.parent.parent,
             directory.name,
@@ -306,6 +316,7 @@ def session_report(
             meta["markets"],
             meta["code_sha256"],
             meta["selection_sha256"],
+            protocol,
         )
     seal_file = directory / SEAL
     seal = json.loads(seal_file.read_bytes()) if seal_file.is_file() else None
@@ -421,8 +432,32 @@ def session_report(
                 "admitted": sum(r["admission"] == "admitted" for r in proposals),
                 "linked": sum(r["link_status"] == "linked" for r in proposals),
             }
+            if protocol == ACTIVE:
+                stages[ticker].update(proposal_stages(proposals, info["paper_archive"] is not None))
         info["selected_market_diagnostics"] = stages
+        if protocol == ACTIVE:
+            info["all_proposal_stages"] = proposal_stages(
+                list(rows.values()), info["paper_archive"] is not None
+            )
     return info, list(rows.values())
+
+
+def proposal_stages(rows: list[dict], ledger_verified: bool) -> dict:
+    return {
+        "generated": len(rows),
+        "enabled_side": sum(r.get("side_enabled") is True for r in rows),
+        "deterministic_pass": sum(r["deterministic_eligible"] is True for r in rows),
+        "static_rejections": dict(
+            Counter(r["static_rejection"] for r in rows if r["static_rejection"])
+        ),
+        "deterministic_unknown": sum(r["deterministic_eligible"] is None for r in rows),
+        "paper_admissions": sum(r["admission"] == "admitted" for r in rows),
+        "paper_entry_bookings": sum(
+            len((r["paper_ledger"] or {}).get("entry_fills", [])) for r in rows
+        )
+        if ledger_verified
+        else None,
+    }
 
 
 def campaign_report(
@@ -432,7 +467,46 @@ def campaign_report(
     games: dict[str, list[str]] = defaultdict(list)
     rows = []
     tape_ids = set()
-    for directory in sorted((campaign / "sessions").iterdir()):
+    attempts = {}
+    if protocol == ACTIVE:
+        plans = campaign / "preflights"
+        for marker in sorted(plans.glob("*.started.json")):
+            run = marker.name.removesuffix(".started.json")
+            path = plans / (run + ".json")
+            record = json.loads((path if path.exists() else marker).read_bytes())
+            if record["rule"] != ACTIVE or record["run"] != run:
+                raise ValueError("Invalid active-cohort preflight identity")
+            candidates = record.get("candidates", [])
+            progress = path.with_suffix(".progress.jsonl")
+            if not path.exists() and progress.is_file():
+                with progress.open("rb") as prefix:
+                    candidates = [
+                        json.loads(line)["candidate"] for line in prefix if line.endswith(b"\n")
+                    ]
+            attempts[run] = {
+                "status": record.get("status", "interrupted"),
+                "failure": record.get("failure"),
+                "selected": record.get("selected", {}),
+                "candidate_reasons": dict(
+                    Counter(r.get("reason", "unfinished") for r in candidates)
+                ),
+                "contracts_evaluated": len(candidates),
+                "quote_generating_contracts": sum(bool(r["proposals"]) for r in candidates),
+                "enabled_side_contracts": sum(
+                    any(p["side_enabled"] for p in r["proposals"]) for r in candidates
+                ),
+                "deterministically_eligible_contracts": sum(
+                    any(p["deterministic_eligible"] for p in r["proposals"]) for r in candidates
+                ),
+                "recently_active_in_window_contracts": sum(
+                    r["eligible"] and r.get("activity", {}).get("status") == "recent_print"
+                    for r in candidates
+                ),
+                "enrolled": (campaign / "sessions" / run / ENROLLMENT).is_file(),
+                "audit_sha256": journal.digest(path) if path.exists() else None,
+            }
+    session_dir = campaign / "sessions"
+    for directory in sorted(session_dir.iterdir() if session_dir.exists() else ()):
         info, rr = session_report(directory, tape_root or journal.ROOT, protocol)
         meta = info["enrollment"]
         sid = meta["paper_session"]
@@ -443,7 +517,7 @@ def campaign_report(
         for game in sorted(set(meta["markets"].values())):
             games[game].append(sid)
         rows.extend(rr)
-    if not sessions:
+    if not sessions and not attempts:
         raise ValueError("No prospective enrollments")
     rows.sort(
         key=lambda r: (
@@ -514,7 +588,8 @@ def campaign_report(
         coverage[str(h)] = dict(counts)
     return {
         "protocol": protocol,
-        **({"original_sample_games_contributed": 0} if protocol == ALIGNED else {}),
+        **({"original_sample_games_contributed": 0} if protocol != PROTOCOL else {}),
+        **({"preflight_attempts": attempts} if protocol == ACTIVE else {}),
         "sessions": sessions,
         "selected_games": len(games),
         "sessions_by_game": games,

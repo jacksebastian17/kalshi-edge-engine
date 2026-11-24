@@ -1,17 +1,31 @@
 """One prospective, read-only scanner pass for the separate strategy-aligned paper cohort."""
 
+import asyncio
 import base64
 import hashlib
 import json
+import os
 import time
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
+from typing import BinaryIO
 from unittest.mock import patch
 
 from kalshi_edge_engine.evidence import Receipt, receipt_scope
 from kalshi_edge_engine.kalshi.client import KalshiClient, KalshiClientError
 from tools.capture_builds import approved_capture
 from tools.microstructure import journal
+from tools.paper_activity import (
+    ACTIVE,
+    SECOND,
+    START_LAG_SECONDS,
+    START_LEAD_SECONDS,
+    TRADE_SECONDS,
+    entry_check,
+    qualify_market,
+    verify_activity,
+)
 
 ALIGNED = "b3b2-paper-strategy-aligned-v1"
 # Canonical journal encoding of the effective B3B1 policy in the first sealed Stage 2B3 pilot.
@@ -90,7 +104,7 @@ def rank(candidates: list[dict], count: int) -> dict[str, str]:
     return selected
 
 
-async def scan(api: KalshiClient, audit: dict) -> list[dict]:
+async def scan(api: KalshiClient, audit: dict, progress: BinaryIO | None = None) -> list[dict]:
     from kalshi_edge_engine.engine.paper import build_quote_intents
     from kalshi_edge_engine.engine.signal import SIGNAL_VALID
     from kalshi_edge_engine.runtime import config, scanner_runtime, state
@@ -98,6 +112,8 @@ async def scan(api: KalshiClient, audit: dict) -> list[dict]:
     from tools.microstructure import pilot
 
     rows = audit["candidates"]
+    active = audit["rule"] == ACTIVE
+    schedules: dict = {}
     receipts = SelectionReceipts(audit["session"], audit["receipts"])
     cfg = config.get_effective_paper_config("NBA")
     with (
@@ -107,9 +123,12 @@ async def scan(api: KalshiClient, audit: dict) -> list[dict]:
         with receipt_scope() as discovery:
             tickers, owners, _, _ = await scanner_runtime._discover_enabled_universe_markets(api)
         audit["discovery_receipts"] = [r.sequence for r in discovery]
+        if active:
+            audit["discovered"] = sorted(tickers)
         if not discovery:
             raise ValueError("Expected fresh scanner discovery receipts")
-        for ticker in sorted(tickers):
+
+        async def evaluate(ticker: str) -> None:
             row = {
                 "ticker": ticker,
                 "eligible": False,
@@ -121,7 +140,7 @@ async def scan(api: KalshiClient, audit: dict) -> list[dict]:
             rows.append(row)
             if owners[ticker] != "NBA" or not ticker.startswith(pilot.SERIES + "-"):
                 row["reason"] = "outside_nba_game_series"
-                continue
+                return
             first = len(receipts.rows)
             try:
                 signal = await scanner_runtime._score_market(api, ticker, "NBA")
@@ -131,7 +150,7 @@ async def scan(api: KalshiClient, audit: dict) -> list[dict]:
                     error_type=type(exc).__name__,
                     source_receipts=[r["number"] for r in receipts.rows[first:]],
                 )
-                continue
+                return
             row.update(
                 scored_ns=signal.scored_ns,
                 signal_reason=signal.reason_code,
@@ -140,11 +159,11 @@ async def scan(api: KalshiClient, audit: dict) -> list[dict]:
             fee = signal.fee_profile
             if fee is None or not fee.series_aware:
                 row["reason"] = "fee_unavailable"
-                continue
+                return
             row.update(fee=fee.audit(), event_ticker=fee.event_ticker)
             if fee.series_ticker != pilot.SERIES or fee.event_ticker != ticker.rpartition("-")[0]:
                 row["reason"] = "inconsistent_event"
-                continue
+                return
             # Bind the exact market and book that supplied this score, including cached fee refs.
             sources = {
                 receipts.rows[r.sequence - 1]["path"]: receipts.rows[r.sequence - 1]
@@ -153,17 +172,18 @@ async def scan(api: KalshiClient, audit: dict) -> list[dict]:
             m = sources.get("/markets/" + ticker)
             if not m or "/markets/" + ticker + "/orderbook" not in sources:
                 row["reason"] = "missing_source_receipts"
-                continue
+                return
             payload = json.loads(base64.b64decode(m["body_b64"]))
             market = payload.get("market", payload)
             if not pilot.active(market, ticker) or market.get("event_ticker") != fee.event_ticker:
                 row["reason"] = "inactive_or_inconsistent_market"
-                continue
+                return
             if cfg.require_signal_valid_only and signal.reason_code != SIGNAL_VALID:
                 row["reason"] = "signal_not_valid"
-                continue
-            proposals = [
-                {
+                return
+            proposals = []
+            for i in build_quote_intents(signal):
+                proposal = {
                     "side": i.side,
                     "price_cents": i.quote_price_cents,
                     "contracts": i.size_contracts,
@@ -171,13 +191,27 @@ async def scan(api: KalshiClient, audit: dict) -> list[dict]:
                     if i.side == "YES"
                     else cfg.allow_no_entries,
                 }
-                for i in build_quote_intents(signal)
-            ]
+                if active:
+                    proposal.update(await entry_check(signal, i, api))
+                proposals.append(proposal)
             row.update(
                 proposals=proposals,
                 eligible=any(p["side_enabled"] for p in proposals),
                 reason="no_enabled_proposal" if proposals else "no_proposal",
             )
+            if active:
+                await qualify_market(api, row, audit["activity_cutoff_s"], schedules)
+
+        checkpoint = 0
+        for ticker in sorted(tickers):
+            await evaluate(ticker)
+            if progress is not None:
+                progress.write(
+                    journal.encoded({"candidate": rows[-1], "receipts": receipts.rows[checkpoint:]})
+                )
+                progress.flush()
+                os.fsync(progress.fileno())
+                checkpoint = len(receipts.rows)
         selected = rank(rows, audit["count"])
         audit.update(selected=selected, ranked_ns=time.time_ns())
         if len(selected) != audit["count"]:
@@ -193,7 +227,9 @@ def plan_path(campaign: Path, tape_name: str) -> Path:
     return campaign / "preflights" / (tape_name + ".json")
 
 
-async def preflight(campaign: Path, tape: Path, count: int, code_sha: str) -> None:
+async def preflight(
+    campaign: Path, tape: Path, count: int, code_sha: str, protocol: str = ALIGNED
+) -> None:
     from tools.microstructure import pilot
 
     if count not in (2, 3, 4) or tape.resolve() != tape or campaign.resolve() != campaign:
@@ -204,7 +240,7 @@ async def preflight(campaign: Path, tape: Path, count: int, code_sha: str) -> No
     plan.parent.mkdir(parents=True, exist_ok=True)
     tape.mkdir(parents=True)
     audit: dict = {
-        "rule": ALIGNED,
+        "rule": protocol,
         "count": count,
         "session": uuid.uuid4().hex,
         "run": tape.name,
@@ -213,13 +249,31 @@ async def preflight(campaign: Path, tape: Path, count: int, code_sha: str) -> No
         "receipts": [],
         "candidates": [],
     }
+    if protocol == ACTIVE:
+        audit.update(
+            activity_cutoff_s=audit["started_ns"] // SECOND,
+            trade_lookback_s=TRADE_SECONDS,
+            before_start_s=START_LEAD_SECONDS,
+            after_start_s=START_LAG_SECONDS,
+        )
+        journal.exclusive(
+            plan.with_suffix(".started.json"),
+            {k: audit[k] for k in ("rule", "run", "session", "started_ns", "code_sha256", "count")},
+        )
     try:
         audit["runtime"] = frozen_runtime()
         build = pilot.build_info()
         approved_capture(build)
         async with pilot.client() as api:
-            checks = await scan(api, audit)
-    except Exception as exc:
+            with (
+                plan.with_suffix(".progress.jsonl").open("xb")
+                if protocol == ACTIVE
+                else nullcontext()
+            ) as progress:
+                checks = await scan(api, audit, progress)
+        if protocol == ACTIVE:
+            verify_activity(audit)
+    except (Exception, asyncio.CancelledError) as exc:
         audit.update(status="failed", failure=str(exc), finished_ns=time.time_ns())
         journal.exclusive(plan, audit)
         raise
@@ -237,9 +291,9 @@ async def preflight(campaign: Path, tape: Path, count: int, code_sha: str) -> No
             "series": pilot.SERIES,
             "channels": pilot.CHANNELS,
             "build": build,
-            "paper_link_cohort": ALIGNED,
+            "paper_link_cohort": protocol,
             "selection": {
-                "rule": ALIGNED,
+                "rule": protocol,
                 "selected": audit["selected"],
                 "audit_sha256": journal.digest(plan),
             },
@@ -248,14 +302,20 @@ async def preflight(campaign: Path, tape: Path, count: int, code_sha: str) -> No
 
 
 def verify_plan(
-    campaign: Path, run: str, session: str, markets: dict, code: str, digest: str
+    campaign: Path,
+    run: str,
+    session: str,
+    markets: dict,
+    code: str,
+    digest: str,
+    protocol: str = ALIGNED,
 ) -> dict:
     path = plan_path(campaign, run)
     raw = path.read_bytes()
     plan: dict = json.loads(raw)
     if (
         hashlib.sha256(raw).hexdigest() != digest
-        or plan["rule"] != ALIGNED
+        or plan["rule"] != protocol
         or plan["status"] != "frozen"
         or plan["run"] != run
         or plan["session"] != session
@@ -266,6 +326,8 @@ def verify_plan(
         or len(markets) != plan["count"]
     ):
         raise ValueError("Invalid frozen strategy selection")
+    if protocol == ACTIVE:
+        verify_activity(plan)
     ranked = [dict(r) for r in plan["candidates"]]
     if rank(ranked, plan["count"]) != markets or ranked != plan["candidates"]:
         raise ValueError("Frozen selection differs from the prospective ranking rule")

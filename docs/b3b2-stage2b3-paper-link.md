@@ -2,6 +2,60 @@
 
 Protocol `b3b2-paper-proposals-v1` enrolls the proposals the ordinary paper strategy generates during a manually started session. A proposal enters the sidecar when the real quote builder returns, before side, risk, cooldown and admission checks. Both sides of one builder call share its decision timestamp and retain their original order. Capture includes rejected proposals and proposals outside the subscribed markets. Signals that produce no quote are counted separately. Each run uses a fresh paper ledger and REST recorder under the strict B3B1 profile. The cohort lives in a separate research directory.
 
+## Stage 2B3.2 entry-selective, recently active pilot
+
+The first Stage 2B3.1 pilot linked 280 of 3,704 proposals. All 140 linked YES proposals failed the minimum capturable-edge check. All 140 linked NO proposals had a disabled side. The six paper admissions were outside the recording, and the ledger booked zero entry fills. Of the 280 linked five-second decision marks, 10 were fresh, 266 stale and four beyond capture end. The two selected games were scheduled for November 25 during a November 23 Pacific recording. The published evidence is under `nba-paper-aligned-01/reports/9eca63bfc06e482193e71a745c389977`.
+
+### Frozen sampling rule
+
+`b3b2-paper-entry-active-v1` has a dedicated campaign root, `%USERPROFILE%\kalshi-paper-entry-active-research`. It contributes zero games to the original 100-game sample. The earlier volume and enabled-side cohorts keep their own protocols.
+
+1. Freeze a common cutoff at the whole UTC second at which the supervised preflight begins. Discover the ordinary scanner universe and score each NBA game contract once using the frozen B3B1 fee resolver, signal scorer and quote builder. Each candidate retains its own score time and response receipts.
+2. Evaluate each generated quote through the deterministic portion of the existing entry function. Check the configured side first. On YES only, both the capturable-edge and intended-quote metrics must exist, capturable edge must meet its minimum, and the intended quote must meet the minimum absolute distance from 50 cents. Both sides must meet the top-liquidity and net-edge minima. Equality passes. The pinned NBA policy enables YES, disables NO, and sets the four numerical minima to 3 cents, 8 cents, 200 contracts and 3 cents respectively. Preflight reads the frozen configuration. Its isolated store stops evaluation at the first portfolio query, before any order, admission, random draw or booking.
+3. For a game with a passing quote, request its basketball-game milestone. Require a unique Sports milestone linked to that exact event and a timezone-qualified start time. The cutoff must fall between one hour before and three hours after scheduled start, inclusive, and before the supplied end time if present. Missing, ambiguous, or paginated schedule evidence excludes the candidate. This measures proximity to scheduled play. Actual game state is unknown. [Kalshi milestone fields](https://docs.kalshi.com/api-reference/milestone/get-milestones)
+4. For each qualifying contract in that window, request one page of up to 100 public non-block prints for that ticker in the preceding five minutes. Require a returned print with the exact ticker, a trade ID, explicitly false block flag, positive fixed-point quantity and exchange timestamp in `[cutoff − 300s, cutoff)`. A complete empty response, an unavailable response and a page without verifiable evidence have distinct exclusions. A qualifying print establishes presence only. It provides no estimate of fill probability or subsequent book freshness. [Kalshi public trade fields](https://docs.kalshi.com/api-reference/market/get-trades)
+5. Rank qualifying tickers in ascending lexical order, keep one contract per event, and select the requested count. Reconfirm those contracts and freeze the inputs, audit and enrollment before recording. A shortfall or failed confirmation ends the attempt. Request collection within ten minutes of the cutoff. Retain expired enrollments, later quiet games and every out-of-subscription proposal. All gates, windows and ranking rules are prespecified. Subsequent prints, markouts and bookings do not participate.
+
+The permanent preflight audit includes the frozen policy, code hashes, rankings, all candidate reasons, per-side gate results, source response bytes, schedule and trade query parameters, timestamps, and exact receipt numbers. Failed attempts remain in the campaign report. If the process terminates abruptly, the start marker and flushed candidate records identify the observed prefix. Preserve the full campaign directory with the tape.
+
+### Supervise one 12-minute, two-game pilot
+
+Run the public-GET preflight from the repository checkout. Review both selected rows before collection. If the requested games are unavailable, retain the attempt and report it with the same campaign name.
+
+```powershell
+Set-Location 'C:\Users\jacks\kalshi-edge-engine'
+$py = (Resolve-Path '.venv\Scripts\python.exe').Path
+$campaign = 'nba-paper-entry-active-01'
+$run = 'b3b2-entry-active-' + [guid]::NewGuid().ToString('N')
+$root = Join-Path $env:USERPROFILE "kalshi-paper-entry-active-research\$campaign"
+& $py -m tools.paper_link preflight-active --campaign $campaign --run $run --count 2
+if ($LASTEXITCODE) { throw "Preflight incomplete. Retain $run and run the offline report." }
+$plan = Get-Content -Raw -LiteralPath (Join-Path $root "preflights\$run.json") | ConvertFrom-Json
+$plan.candidates | Select-Object ticker,rank,reason,proposals,schedule,activity | ConvertTo-Json -Depth 5
+```
+
+Once the operator authorizes the recording, run this command in the same PowerShell window. The scanner retains its normal universe, portfolio, cooldown, risk and admission checks.
+
+```powershell
+& $py -m tools.paper_link collect --active --campaign $campaign --run $run --minutes 12
+if ($LASTEXITCODE) { Write-Warning "Retain $run and inspect the offline report." }
+```
+
+For status or graceful early stop, use the Stage 1 `status --run` and `stop --run` commands below with the exact run name. Report offline after collection, or after a failed preflight.
+
+```powershell
+$out = & $py -m tools.paper_link report --active --campaign $campaign
+if ($LASTEXITCODE) { throw 'Offline verification failed' }
+$s = Get-Content -Raw -LiteralPath (Join-Path $out 'summary.json') | ConvertFrom-Json
+$s.preflight_attempts | ConvertTo-Json -Depth 6
+$s.sessions.PSObject.Properties | ForEach-Object {
+    $_.Value | Select-Object sealed,clock_mapping,all_proposal_stages,selected_market_diagnostics | ConvertTo-Json -Depth 6
+}
+$s.decision_mark_coverage.'5' | ConvertTo-Json
+```
+
+The report counts generated quotes, enabled sides, observed deterministic passes, paper admissions and verified ledger entry bookings. It gives the same counts for each selected contract, including zero-proposal games. A dynamic rejection can follow a deterministic pass. An interrupted decision with no observed gate result has unknown eligibility. Missing ledger evidence leaves bookings null. `episodes.jsonl` includes every generated proposal. The two-second depth-age limit applies at every markout horizon.
+
 ## Stage 2B3.1 strategy-aligned pilot
 
 The first 12-minute volume-ranked pilot recorded Portland–Philadelphia (POR) and Utah–Los Angeles (UTA). The paper scanner generated 2,106 proposals on 21 other contracts across 15 games. All four admissions were on Milwaukee–Detroit, and the paper ledger booked zero fills. The shared-process clock verified and every signal receipt resolved. Neither selected game produced a proposal. The original report is under `nba-paper-link-01/reports/67948dd2f4cc498f9f5b8de13c011215`.
